@@ -1,0 +1,25 @@
+# StockTrak Bot Dependencies
+# Install with: pip install -r requirements.txt
+
+# Browser automation
+playwright>=1.40.0
+
+# Market data
+yfinance>=0.2.36
+
+# Data analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Scheduling
+schedule>=1.2.0
+
+# Timezone handling
+pytz>=2023.3
+
+# HTTP requests (backup for market data)
+requests>=2.31.0
+
+# For development/testing (optional)
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
