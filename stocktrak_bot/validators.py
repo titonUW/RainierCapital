@@ -1,0 +1,445 @@
+"""
+Pre-Trade Validation for StockTrak Bot
+Ensures all competition rules are followed before executing trades.
+"""
+
+import logging
+from datetime import datetime
+from typing import Dict, Tuple, Optional, List
+
+from config import (
+    PROHIBITED_TICKERS, PROHIBITED_SUFFIXES, SAFETY_BUFFER_PRICE,
+    MIN_PRICE_AT_BUY, MAX_SINGLE_POSITION_PCT, MIN_HOLDINGS,
+    MAX_TRADES_TOTAL, HARD_STOP_TRADES, MIN_HOLD_TRADING_DAYS,
+    CORE_POSITIONS, SATELLITE_BUCKETS, MAX_PER_BUCKET, MIN_BUCKETS,
+    EVENT_FREEZE_DATES, REGIME_PARAMS, get_bucket_for_ticker
+)
+from utils import is_trading_day, get_trading_days_between
+
+logger = logging.getLogger('stocktrak_bot.validators')
+
+
+def is_prohibited(ticker: str) -> bool:
+    """
+    Check if a ticker is prohibited (leveraged, inverse, crypto ETFs, OTC, foreign)
+
+    Args:
+        ticker: Stock ticker symbol
+
+    Returns:
+        True if prohibited, False if allowed
+    """
+    if not ticker:
+        return True
+
+    ticker_upper = ticker.upper().strip()
+
+    # Check explicit prohibition list
+    if ticker_upper in PROHIBITED_TICKERS:
+        logger.warning(f"PROHIBITED: {ticker} is in prohibited list")
+        return True
+
+    # Check prohibited suffixes (OTC/Foreign)
+    for suffix in PROHIBITED_SUFFIXES:
+        if suffix in ticker_upper:
+            logger.warning(f"PROHIBITED: {ticker} has prohibited suffix {suffix}")
+            return True
+
+    return False
+
+
+def validate_price(ticker: str, price: float, is_buy: bool = True) -> Tuple[bool, str]:
+    """
+    Validate price meets competition requirements
+
+    Args:
+        ticker: Stock ticker symbol
+        price: Current price
+        is_buy: True if checking for buy, False for sell
+
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    if price is None:
+        return False, "Price is None"
+
+    if is_buy:
+        # For buys, use safety buffer (SAFETY_BUFFER_PRICE = $6)
+        if price < SAFETY_BUFFER_PRICE:
+            return False, f"Price ${price:.2f} below safety buffer ${SAFETY_BUFFER_PRICE:.2f}"
+    else:
+        # For existing positions, warn if approaching $5 limit
+        if price < MIN_PRICE_AT_BUY:
+            return False, f"Price ${price:.2f} below minimum ${MIN_PRICE_AT_BUY:.2f} - MUST SELL"
+        elif price < 5.50:
+            return True, f"WARNING: Price ${price:.2f} approaching $5 limit"
+
+    return True, "Price OK"
+
+
+def validate_position_size(
+    ticker: str,
+    shares: int,
+    price: float,
+    portfolio_value: float,
+    existing_positions: Dict
+) -> Tuple[bool, str]:
+    """
+    Validate position size meets 25% max rule
+
+    Args:
+        ticker: Stock ticker to buy
+        shares: Number of shares to buy
+        price: Current price per share
+        portfolio_value: Total portfolio value
+        existing_positions: Dict of current positions
+
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    new_position_value = shares * price
+
+    # Check if this purchase would exceed 25% of portfolio
+    max_position_value = portfolio_value * MAX_SINGLE_POSITION_PCT
+
+    if ticker in existing_positions:
+        # Adding to existing position
+        existing_value = existing_positions[ticker].get('value', 0)
+        total_value = existing_value + new_position_value
+        if total_value > max_position_value:
+            return False, f"Position ${total_value:,.2f} would exceed 25% limit (${max_position_value:,.2f})"
+    else:
+        if new_position_value > max_position_value:
+            return False, f"Position ${new_position_value:,.2f} exceeds 25% limit (${max_position_value:,.2f})"
+
+    return True, "Position size OK"
+
+
+def validate_trade_count(trades_used: int, is_new_buy: bool = True) -> Tuple[bool, str]:
+    """
+    Validate we haven't exceeded trade limits
+
+    Args:
+        trades_used: Number of trades already used
+        is_new_buy: True if this is a new buy (uses soft cap), False for sells
+
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    # Hard limit - no trades allowed
+    if trades_used >= MAX_TRADES_TOTAL:
+        return False, f"HARD STOP: {trades_used}/{MAX_TRADES_TOTAL} trades used - NO MORE TRADES"
+
+    # Soft limit for buys - emergency exits only
+    if is_new_buy and trades_used >= HARD_STOP_TRADES:
+        return False, f"SOFT STOP: {trades_used}/{HARD_STOP_TRADES} trades - only emergency exits allowed"
+
+    remaining = MAX_TRADES_TOTAL - trades_used
+    return True, f"Trades OK ({trades_used} used, {remaining} remaining)"
+
+
+def validate_holding_period(position: Dict, current_date=None) -> Tuple[bool, str]:
+    """
+    Validate T+2 holding period has passed
+
+    Args:
+        position: Position dict with 'entry_date'
+        current_date: Date to check against (defaults to today)
+
+    Returns:
+        Tuple of (can_sell, reason)
+    """
+    if current_date is None:
+        current_date = datetime.now().date()
+
+    entry_date_str = position.get('entry_date')
+    if not entry_date_str:
+        return False, "No entry date recorded"
+
+    if isinstance(entry_date_str, str):
+        entry_date = datetime.fromisoformat(entry_date_str).date()
+    else:
+        entry_date = entry_date_str
+
+    # Count trading days since entry
+    trading_days = get_trading_days_between(entry_date, current_date)
+
+    if trading_days < MIN_HOLD_TRADING_DAYS:
+        return False, f"Holding period not met: {trading_days}/{MIN_HOLD_TRADING_DAYS} trading days"
+
+    return True, f"Holding period met ({trading_days} trading days)"
+
+
+def validate_min_holdings(
+    current_holdings: Dict,
+    ticker_to_sell: Optional[str] = None
+) -> Tuple[bool, str]:
+    """
+    Validate minimum holdings requirement (must hold at least 4 securities)
+
+    Args:
+        current_holdings: Dict of current positions
+        ticker_to_sell: Ticker we want to sell (if any)
+
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    current_count = len(current_holdings)
+
+    if ticker_to_sell:
+        # Check if selling would drop below minimum
+        if current_count <= MIN_HOLDINGS:
+            return False, f"Cannot sell: would drop below {MIN_HOLDINGS} minimum holdings"
+    else:
+        if current_count < MIN_HOLDINGS:
+            return False, f"Warning: currently {current_count} holdings, need {MIN_HOLDINGS} minimum"
+
+    return True, f"Holdings OK ({current_count} securities)"
+
+
+def validate_bucket_limits(
+    ticker: str,
+    current_positions: Dict
+) -> Tuple[bool, str]:
+    """
+    Validate bucket diversification limits (max 2 per bucket)
+
+    Args:
+        ticker: Ticker to add
+        current_positions: Dict of current positions
+
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    # Core positions don't have bucket limits
+    if ticker in CORE_POSITIONS:
+        return True, "Core position - no bucket limit"
+
+    bucket = get_bucket_for_ticker(ticker)
+    if not bucket:
+        return True, "Ticker not in any bucket"
+
+    # Count existing positions in this bucket
+    bucket_count = 0
+    for pos_ticker in current_positions.keys():
+        if pos_ticker in CORE_POSITIONS:
+            continue
+        if get_bucket_for_ticker(pos_ticker) == bucket:
+            bucket_count += 1
+
+    if bucket_count >= MAX_PER_BUCKET:
+        return False, f"Bucket {bucket} already has {bucket_count}/{MAX_PER_BUCKET} positions"
+
+    return True, f"Bucket {bucket} OK ({bucket_count}/{MAX_PER_BUCKET})"
+
+
+def validate_event_freeze(current_datetime=None) -> Tuple[bool, str]:
+    """
+    Check if we're in an event freeze period (no new buys)
+
+    Args:
+        current_datetime: Datetime to check (defaults to now)
+
+    Returns:
+        Tuple of (can_trade, reason)
+    """
+    if current_datetime is None:
+        current_datetime = datetime.now()
+
+    current_date = current_datetime.date()
+
+    if current_date in EVENT_FREEZE_DATES:
+        return False, f"EVENT FREEZE: {current_date} is a freeze date (FOMC)"
+
+    return True, "No event freeze"
+
+
+def validate_weekly_cap(
+    week_replacements: int,
+    vix_level: float
+) -> Tuple[bool, str]:
+    """
+    Validate weekly replacement cap based on VIX regime
+
+    Args:
+        week_replacements: Replacements made this week
+        vix_level: Current VIX level
+
+    Returns:
+        Tuple of (can_replace, reason)
+    """
+    regime = get_vix_regime(vix_level)
+    weekly_cap = REGIME_PARAMS[regime]['weekly_replacement_cap']
+
+    if week_replacements >= weekly_cap:
+        return False, f"Weekly cap reached: {week_replacements}/{weekly_cap} ({regime} regime)"
+
+    return True, f"Weekly cap OK ({week_replacements}/{weekly_cap})"
+
+
+def get_vix_regime(vix_level: float) -> str:
+    """Determine VIX regime from level"""
+    if vix_level < 20:
+        return 'NORMAL'
+    elif vix_level <= 30:
+        return 'CAUTION'
+    else:
+        return 'SHOCK'
+
+
+def get_market_regime(voo_price: float, voo_sma200: float) -> str:
+    """Determine market regime from VOO price vs SMA200"""
+    if voo_sma200 is None:
+        return 'RISK_ON'  # Default to risk-on if no SMA data
+
+    if voo_price > voo_sma200:
+        return 'RISK_ON'
+    else:
+        return 'RISK_OFF'
+
+
+def can_buy(
+    ticker: str,
+    price: float,
+    shares: int,
+    portfolio_value: float,
+    trades_used: int,
+    week_replacements: int,
+    vix_level: float,
+    current_positions: Dict,
+    market_data: Dict
+) -> Tuple[bool, Dict[str, Tuple[bool, str]]]:
+    """
+    Complete buy validation - all checks must pass
+
+    Args:
+        ticker: Ticker to buy
+        price: Current price
+        shares: Shares to buy
+        portfolio_value: Total portfolio value
+        trades_used: Trades already used
+        week_replacements: Replacements this week
+        vix_level: Current VIX
+        current_positions: Current holdings
+        market_data: Full market data dict
+
+    Returns:
+        Tuple of (all_passed, detailed_results)
+    """
+    checks = {}
+
+    # Basic validations
+    checks['prohibited'] = (not is_prohibited(ticker),
+                            "Not prohibited" if not is_prohibited(ticker) else "PROHIBITED")
+    checks['price'] = validate_price(ticker, price, is_buy=True)
+    checks['position_size'] = validate_position_size(ticker, shares, price, portfolio_value, current_positions)
+    checks['trade_count'] = validate_trade_count(trades_used, is_new_buy=True)
+    checks['bucket_limits'] = validate_bucket_limits(ticker, current_positions)
+    checks['event_freeze'] = validate_event_freeze()
+    checks['weekly_cap'] = validate_weekly_cap(week_replacements, vix_level)
+
+    # Trend validation
+    ticker_data = market_data.get(ticker, {})
+    if ticker_data:
+        is_uptrend = validate_uptrend(ticker_data)
+        checks['uptrend'] = is_uptrend
+
+    all_passed = all(check[0] for check in checks.values())
+
+    return all_passed, checks
+
+
+def can_sell(
+    ticker: str,
+    position: Dict,
+    current_holdings: Dict,
+    trades_used: int
+) -> Tuple[bool, Dict[str, Tuple[bool, str]]]:
+    """
+    Complete sell validation
+
+    Args:
+        ticker: Ticker to sell
+        position: Position data
+        current_holdings: All current holdings
+        trades_used: Trades already used
+
+    Returns:
+        Tuple of (all_passed, detailed_results)
+    """
+    checks = {}
+
+    checks['holding_period'] = validate_holding_period(position)
+    checks['min_holdings'] = validate_min_holdings(current_holdings, ticker)
+    checks['trade_count'] = validate_trade_count(trades_used, is_new_buy=False)
+
+    all_passed = all(check[0] for check in checks.values())
+
+    return all_passed, checks
+
+
+def validate_uptrend(ticker_data: Dict) -> Tuple[bool, str]:
+    """
+    Validate uptrend: Close > SMA50 AND SMA50 > SMA200
+
+    Args:
+        ticker_data: Dict with 'price', 'sma50', 'sma200' or 'sma100'
+
+    Returns:
+        Tuple of (is_uptrend, reason)
+    """
+    price = ticker_data.get('price')
+    sma50 = ticker_data.get('sma50')
+    sma200 = ticker_data.get('sma200') or ticker_data.get('sma100')
+
+    if not all([price, sma50, sma200]):
+        return False, "Missing SMA data for trend validation"
+
+    if price > sma50 and sma50 > sma200:
+        return True, f"Uptrend confirmed: ${price:.2f} > SMA50 (${sma50:.2f}) > SMA200 (${sma200:.2f})"
+    else:
+        return False, f"Not uptrend: ${price:.2f}, SMA50=${sma50:.2f}, SMA200=${sma200:.2f}"
+
+
+def validate_double7_low(ticker_data: Dict) -> Tuple[bool, str]:
+    """
+    Validate Double-7 Low: Today's close is lowest of past 7 days
+
+    Args:
+        ticker_data: Dict with 'price' and 'closes_7d'
+
+    Returns:
+        Tuple of (is_double7_low, reason)
+    """
+    price = ticker_data.get('price')
+    closes_7d = ticker_data.get('closes_7d', [])
+
+    if not price or len(closes_7d) < 7:
+        return False, "Insufficient data for Double-7 check"
+
+    if price <= min(closes_7d):
+        return True, f"Double-7 Low: ${price:.2f} is 7-day low"
+    else:
+        return False, f"Not Double-7 Low: ${price:.2f} > min({min(closes_7d):.2f})"
+
+
+def validate_double7_high(ticker_data: Dict) -> Tuple[bool, str]:
+    """
+    Validate Double-7 High: Today's close is highest of past 7 days
+
+    Args:
+        ticker_data: Dict with 'price' and 'closes_7d'
+
+    Returns:
+        Tuple of (is_double7_high, reason)
+    """
+    price = ticker_data.get('price')
+    closes_7d = ticker_data.get('closes_7d', [])
+
+    if not price or len(closes_7d) < 7:
+        return False, "Insufficient data for Double-7 check"
+
+    if price >= max(closes_7d):
+        return True, f"Double-7 High: ${price:.2f} is 7-day high"
+    else:
+        return False, f"Not Double-7 High: ${price:.2f} < max({max(closes_7d):.2f})"
