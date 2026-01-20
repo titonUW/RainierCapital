@@ -20,6 +20,9 @@ pytz>=2023.3
 # HTTP requests (backup for market data)
 requests>=2.31.0
 
+# GUI (tkinter is built into Python, no pip install needed)
+# On Linux, if tkinter is missing: sudo apt install python3-tk
+
 # For development/testing (optional)
 # pytest>=7.0.0
 # pytest-cov>=4.0.0
