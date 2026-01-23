@@ -23,6 +23,77 @@ from utils import parse_currency, parse_number, log_trade
 logger = logging.getLogger('stocktrak_bot.browser')
 
 
+def dismiss_stocktrak_overlays(page) -> None:
+    """
+    Dismiss any popups/modals that block interaction.
+
+    Handles:
+    - Robinhood promo modal (btn-dont-show-again)
+    - Site tours (Intro.js, Shepherd.js)
+    - Generic modals with close buttons
+    """
+    logger.debug("Checking for popups to dismiss...")
+
+    for attempt in range(3):
+        # 1) Robinhood promo modal - use the actual IDs from StockTrak
+        promo_selectors = [
+            "#btn-dont-show-again",           # Exact ID from inspection
+            "#btn-remindlater",               # Alternative button
+            "a:has-text(\"Don't Show Again\")",  # It's an <a>, not <button>
+            "a:has-text(\"Remind Me Later\")",
+            "#OverlayModalPopup .close",      # Modal close button
+            "[aria-label='Close']",
+            ".modal .close",
+            "button.close",
+        ]
+
+        for sel in promo_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=800):
+                    loc.click(timeout=1500)
+                    logger.info(f"Dismissed popup using: {sel}")
+                    time.sleep(0.5)
+            except:
+                pass
+
+        # 2) Tour / walkthrough overlays (common patterns)
+        tour_selectors = [
+            "button:has-text('Skip')",
+            "button:has-text('Skip Tour')",
+            "button:has-text('No Thanks')",
+            "button:has-text('Got it')",
+            "button:has-text('Close')",
+            "a:has-text('Skip')",
+            "a:has-text('No Thanks')",
+            ".introjs-skipbutton",            # Intro.js
+            ".shepherd-cancel-icon",          # Shepherd.js
+            ".shepherd-button-secondary",
+            ".tour-skip",
+            ".walkthrough-skip",
+        ]
+
+        for sel in tour_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=800):
+                    loc.click(timeout=1500)
+                    logger.info(f"Dismissed tour using: {sel}")
+                    time.sleep(0.5)
+            except:
+                pass
+
+        # 3) ESC key closes many modals
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+        except:
+            pass
+
+        # Brief pause between attempts
+        time.sleep(0.5)
+
+
 class StockTrakBot:
     """
     Browser automation for StockTrak trading platform.
@@ -69,7 +140,10 @@ class StockTrakBot:
         )
 
         self.page = self.context.new_page()
-        self.page.set_default_timeout(DEFAULT_TIMEOUT)
+
+        # Increase timeouts - StockTrak can be slow
+        self.page.set_default_timeout(90000)  # 90 seconds
+        self.page.set_default_navigation_timeout(90000)
 
         logger.info("Browser started successfully")
 
@@ -152,6 +226,15 @@ class StockTrakBot:
 
             self._screenshot('after_login')
 
+            # CRITICAL: Dismiss any popups that appear after login
+            # (Robinhood promos, site tours, etc.)
+            logger.info("Checking for post-login popups...")
+            dismiss_stocktrak_overlays(self.page)
+            time.sleep(1)
+            dismiss_stocktrak_overlays(self.page)  # Second pass for delayed popups
+
+            self._screenshot('after_popup_dismiss')
+
             # Check for success indicators
             success_indicators = [
                 'portfolio', 'dashboard', 'home', 'account',
@@ -200,6 +283,9 @@ class StockTrakBot:
             Portfolio value as float, or None if not found
         """
         try:
+            # Dismiss any popups first
+            dismiss_stocktrak_overlays(self.page)
+
             # Try common portfolio URLs
             portfolio_urls = [
                 f"{self.base_url}/portfolio",
@@ -276,6 +362,9 @@ class StockTrakBot:
         holdings = {}
 
         try:
+            # Dismiss any popups first
+            dismiss_stocktrak_overlays(self.page)
+
             # Navigate to holdings
             holdings_urls = [
                 f"{self.base_url}/portfolio/holdings",
@@ -386,6 +475,9 @@ class StockTrakBot:
             Number of trades executed
         """
         try:
+            # Dismiss any popups first
+            dismiss_stocktrak_overlays(self.page)
+
             # Navigate to transaction history
             transaction_urls = [
                 f"{self.base_url}/portfolio/transactions",
@@ -468,6 +560,9 @@ class StockTrakBot:
         logger.info(f"Placing BUY order: {shares} {ticker} @ ${limit_price:.2f}")
 
         try:
+            # Dismiss any popups first
+            dismiss_stocktrak_overlays(self.page)
+
             # Navigate to trade page
             trade_urls = [
                 f"{self.base_url}/trading/stocks",
@@ -670,6 +765,9 @@ class StockTrakBot:
         logger.info(f"Placing SELL order: {shares} {ticker} @ ${limit_price:.2f}")
 
         try:
+            # Dismiss any popups first
+            dismiss_stocktrak_overlays(self.page)
+
             # Navigate to trade page
             self.page.goto(f"{self.base_url}/trading/stocks")
             self.page.wait_for_load_state('networkidle')
