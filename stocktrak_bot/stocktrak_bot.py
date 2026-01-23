@@ -36,24 +36,35 @@ def dismiss_stocktrak_overlays(page) -> None:
 
     for attempt in range(3):
         # 1) Robinhood promo modal - use the actual IDs from StockTrak
+        #    IMPORTANT: Also includes "Ok" button and X close button
         promo_selectors = [
             "#btn-dont-show-again",           # Exact ID from inspection
             "#btn-remindlater",               # Alternative button
+            "#OverlayModalPopup button.ok",   # Ok button at bottom
+            "#OverlayModalPopup .ok",         # Ok button variant
+            "button:has-text('Ok')",          # Generic Ok button
+            "button:has-text('OK')",          # Uppercase variant
+            ".modal button:has-text('Ok')",   # Ok in any modal
             "a:has-text(\"Don't Show Again\")",  # It's an <a>, not <button>
             "a:has-text(\"Remind Me Later\")",
             "#OverlayModalPopup .close",      # Modal close button
+            ".modal-close",                   # Generic modal close
+            "button[aria-label='Close']",
             "[aria-label='Close']",
             ".modal .close",
             "button.close",
+            ".close-button",
+            "button:has-text('×')",           # X button
+            "a:has-text('×')",
         ]
 
         for sel in promo_selectors:
             try:
                 loc = page.locator(sel).first
-                if loc.is_visible(timeout=800):
-                    loc.click(timeout=1500)
+                if loc.is_visible(timeout=500):
+                    loc.click(timeout=1000)
                     logger.info(f"Dismissed popup using: {sel}")
-                    time.sleep(0.5)
+                    time.sleep(0.3)
             except:
                 pass
 
@@ -76,22 +87,22 @@ def dismiss_stocktrak_overlays(page) -> None:
         for sel in tour_selectors:
             try:
                 loc = page.locator(sel).first
-                if loc.is_visible(timeout=800):
-                    loc.click(timeout=1500)
+                if loc.is_visible(timeout=500):
+                    loc.click(timeout=1000)
                     logger.info(f"Dismissed tour using: {sel}")
-                    time.sleep(0.5)
+                    time.sleep(0.3)
             except:
                 pass
 
         # 3) ESC key closes many modals
         try:
             page.keyboard.press("Escape")
-            time.sleep(0.3)
+            time.sleep(0.2)
         except:
             pass
 
         # Brief pause between attempts
-        time.sleep(0.5)
+        time.sleep(0.3)
 
 
 class StockTrakBot:
@@ -159,8 +170,13 @@ class StockTrakBot:
         try:
             # Navigate to login page
             self.page.goto(STOCKTRAK_LOGIN_URL)
-            self.page.wait_for_load_state('networkidle')
+            self.page.wait_for_load_state('domcontentloaded')
             time.sleep(2)
+
+            # CRITICAL: Dismiss any popups that appear on login page
+            logger.info("Dismissing any popups on login page...")
+            dismiss_stocktrak_overlays(self.page)
+            time.sleep(1)
 
             # Screenshot for debugging
             self._screenshot('login_page')
@@ -220,18 +236,27 @@ class StockTrakBot:
                 self._screenshot('login_error_submit')
                 return False
 
-            # Wait for navigation
-            self.page.wait_for_load_state('networkidle')
-            time.sleep(3)
+            # Wait for navigation - use domcontentloaded (faster than networkidle)
+            logger.info("Waiting for page to load after login...")
+            self.page.wait_for_load_state('domcontentloaded')
+            time.sleep(2)
+
+            # CRITICAL: Dismiss popups IMMEDIATELY after page loads
+            logger.info("Dismissing post-login popups (pass 1)...")
+            dismiss_stocktrak_overlays(self.page)
 
             self._screenshot('after_login')
 
-            # CRITICAL: Dismiss any popups that appear after login
-            # (Robinhood promos, site tours, etc.)
-            logger.info("Checking for post-login popups...")
+            # Wait a bit more for delayed popups
+            time.sleep(2)
+
+            # Second pass for any delayed popups
+            logger.info("Dismissing post-login popups (pass 2)...")
             dismiss_stocktrak_overlays(self.page)
             time.sleep(1)
-            dismiss_stocktrak_overlays(self.page)  # Second pass for delayed popups
+
+            # Third pass just to be sure
+            dismiss_stocktrak_overlays(self.page)
 
             self._screenshot('after_popup_dismiss')
 
