@@ -1,6 +1,11 @@
 """
 Pre-Trade Validation for StockTrak Bot
 Ensures all competition rules are followed before executing trades.
+
+UPDATED (Perfection Patch):
+- Structural 1/N diversification: exactly 1 satellite per bucket
+- 8 buckets × 5% = 40% satellite allocation
+- No position exceeds 25% at buy (max is 20% core, 5% satellite)
 """
 
 import logging
@@ -202,7 +207,12 @@ def validate_bucket_limits(
     current_positions: Dict
 ) -> Tuple[bool, str]:
     """
-    Validate bucket diversification limits (max 2 per bucket)
+    Validate bucket diversification limits (structural 1/N: exactly 1 per bucket)
+
+    UPDATED (Perfection Patch):
+    - MAX_PER_BUCKET = 1 (structural 1/N diversification)
+    - 8 buckets × 1 position each = 8 satellites
+    - This ensures diversification across independent themes
 
     Args:
         ticker: Ticker to add
@@ -228,9 +238,9 @@ def validate_bucket_limits(
             bucket_count += 1
 
     if bucket_count >= MAX_PER_BUCKET:
-        return False, f"Bucket {bucket} already has {bucket_count}/{MAX_PER_BUCKET} positions"
+        return False, f"Bucket {bucket} filled (1/N: exactly 1 per bucket)"
 
-    return True, f"Bucket {bucket} OK ({bucket_count}/{MAX_PER_BUCKET})"
+    return True, f"Bucket {bucket} empty (1/N structural diversification)"
 
 
 def validate_event_freeze(current_datetime=None) -> Tuple[bool, str]:

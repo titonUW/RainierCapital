@@ -1,8 +1,13 @@
 """
 Satellite Selection Scoring System for StockTrak Bot
 
-Implements cross-sectional momentum scoring with volatility penalty
-to rank satellite candidates for the portfolio.
+Implements parameter-free lexicographic ranking (DeMiguel et al. 1/N approach).
+No tunable weights - reduces estimation error and model risk.
+
+Ranking method (parameter-free):
+  1. Primary rank: RelR21 (relative 21-day return vs VOO) - descending
+  2. Tie-break #1: RelR63 (relative 63-day return vs VOO) - descending
+  3. Tie-break #2: VOL21 (21-day volatility) - ascending (lower is better)
 """
 
 import logging
@@ -11,6 +16,7 @@ from dataclasses import dataclass
 
 from config import (
     SATELLITE_BUCKETS, CORE_POSITIONS, MAX_PER_BUCKET,
+    VOLATILITY_KILL_SWITCH_THRESHOLD, BUCKET_ETFS,
     get_bucket_for_ticker, get_all_satellite_tickers
 )
 from validators import (
@@ -23,30 +29,49 @@ logger = logging.getLogger('stocktrak_bot.scoring')
 
 @dataclass
 class ScoredCandidate:
-    """Scored satellite candidate"""
+    """
+    Scored satellite candidate using parameter-free ranking.
+
+    No 'score' field with tunable weights - instead use rel_r21, rel_r63, vol_21
+    for lexicographic sorting (DeMiguel-consistent approach).
+    """
     ticker: str
     bucket: str
-    score: float
-    rel_mom_21: float
-    rel_mom_63: float
-    vol_penalty: float
+    rel_r21: float       # Relative 21-day return vs VOO (primary rank)
+    rel_r63: float       # Relative 63-day return vs VOO (tie-break #1)
+    vol_21: float        # 21-day volatility (tie-break #2, lower is better)
     price: float
     is_qualified: bool
+    is_etf: bool = False  # True if ticker is an ETF (for volatility kill-switch)
     disqualification_reason: Optional[str] = None
 
+    @property
+    def rank_key(self) -> Tuple[float, float, float]:
+        """
+        Lexicographic sort key for parameter-free ranking.
+        Returns tuple for sorting: (-rel_r21, -rel_r63, vol_21)
+        Negative values for descending sort on first two, ascending on volatility.
+        """
+        return (-self.rel_r21, -self.rel_r63, self.vol_21)
 
-def calculate_score(ticker: str, market_data: Dict) -> Optional[ScoredCandidate]:
+
+def is_bucket_etf(ticker: str, bucket: str) -> bool:
+    """Check if ticker is an ETF within its bucket (for volatility kill-switch)."""
+    if not bucket or bucket == "UNKNOWN":
+        return False
+    etfs = BUCKET_ETFS.get(bucket, [])
+    return ticker in etfs
+
+
+def calculate_candidate_metrics(ticker: str, market_data: Dict) -> Optional[ScoredCandidate]:
     """
-    Calculate cross-sectional momentum score with volatility penalty.
+    Calculate parameter-free ranking metrics for a satellite candidate.
 
-    SCORE = RelMom21 + (RelMom63 * 0.5) - (VolPenalty * 2)
-
-    Where:
-    - RelMom21 = ticker's 21-day return - VOO's 21-day return
-    - RelMom63 = ticker's 63-day return - VOO's 63-day return
-    - VolPenalty = ticker's 21-day volatility - VOO's 21-day volatility
-
-    Higher score = better candidate.
+    NO TUNABLE WEIGHTS - follows DeMiguel et al. 1/N methodology.
+    Uses lexicographic ranking:
+      1. RelR21 (relative 21-day return vs VOO) - descending
+      2. RelR63 (relative 63-day return vs VOO) - descending
+      3. VOL21 (21-day volatility) - ascending
 
     Args:
         ticker: Stock ticker symbol
@@ -69,20 +94,16 @@ def calculate_score(ticker: str, market_data: Dict) -> Optional[ScoredCandidate]
 
     voo_ret_21d = voo_data.get('return_21d')
     voo_ret_63d = voo_data.get('return_63d')
-    voo_vol_21d = voo_data.get('volatility_21d')
 
     # Check for missing data
-    if None in [ticker_ret_21d, voo_ret_21d, ticker_vol_21d, voo_vol_21d]:
+    if None in [ticker_ret_21d, voo_ret_21d, ticker_vol_21d]:
         logger.warning(f"Missing return/volatility data for {ticker}")
         return None
 
-    # Calculate relative metrics
-    rel_mom_21 = ticker_ret_21d - voo_ret_21d
-    rel_mom_63 = (ticker_ret_63d - voo_ret_63d) if ticker_ret_63d and voo_ret_63d else 0
-    vol_penalty = ticker_vol_21d - voo_vol_21d
-
-    # Calculate score
-    score = rel_mom_21 + (rel_mom_63 * 0.5) - (vol_penalty * 2)
+    # Calculate relative metrics (no weights applied - parameter-free)
+    rel_r21 = ticker_ret_21d - voo_ret_21d
+    rel_r63 = (ticker_ret_63d - voo_ret_63d) if ticker_ret_63d and voo_ret_63d else 0.0
+    vol_21 = ticker_vol_21d  # Raw volatility (not relative)
 
     # Check qualification criteria
     is_qualified = True
@@ -107,70 +128,181 @@ def calculate_score(ticker: str, market_data: Dict) -> Optional[ScoredCandidate]
         disqualification_reason = uptrend_reason
 
     bucket = get_bucket_for_ticker(ticker)
+    is_etf = is_bucket_etf(ticker, bucket)
 
     return ScoredCandidate(
         ticker=ticker,
         bucket=bucket or "UNKNOWN",
-        score=score,
-        rel_mom_21=rel_mom_21,
-        rel_mom_63=rel_mom_63,
-        vol_penalty=vol_penalty,
+        rel_r21=rel_r21,
+        rel_r63=rel_r63,
+        vol_21=vol_21,
         price=price,
         is_qualified=is_qualified,
+        is_etf=is_etf,
         disqualification_reason=disqualification_reason
     )
 
 
+# Backward compatibility alias
+def calculate_score(ticker: str, market_data: Dict) -> Optional[ScoredCandidate]:
+    """Backward compatibility wrapper for calculate_candidate_metrics."""
+    return calculate_candidate_metrics(ticker, market_data)
+
+
 def score_all_satellites(market_data: Dict) -> List[ScoredCandidate]:
     """
-    Score all satellite candidates.
+    Rank all satellite candidates using parameter-free lexicographic sorting.
+
+    Sorting order (DeMiguel-consistent):
+      1. RelR21 descending (higher relative momentum = better)
+      2. RelR63 descending (tie-break)
+      3. VOL21 ascending (lower volatility = better)
 
     Args:
         market_data: Dict containing market data for all tickers
 
     Returns:
-        List of ScoredCandidate objects, sorted by score descending
+        List of ScoredCandidate objects, sorted by rank_key
     """
     candidates = []
     all_satellites = get_all_satellite_tickers()
 
     for ticker in all_satellites:
-        scored = calculate_score(ticker, market_data)
+        scored = calculate_candidate_metrics(ticker, market_data)
         if scored:
             candidates.append(scored)
         else:
-            logger.debug(f"Could not score {ticker}")
+            logger.debug(f"Could not rank {ticker}")
 
-    # Sort by score descending
-    candidates.sort(key=lambda x: x.score, reverse=True)
+    # Lexicographic sort using rank_key (parameter-free)
+    candidates.sort(key=lambda x: x.rank_key)
 
     return candidates
 
 
-def get_top_candidates(
-    market_data: Dict,
-    n: int = 12,
-    require_qualified: bool = True
-) -> List[ScoredCandidate]:
+def apply_volatility_kill_switch(
+    candidate: ScoredCandidate,
+    all_candidates: List[ScoredCandidate]
+) -> Optional[ScoredCandidate]:
     """
-    Get top N scoring candidates.
+    Apply volatility kill-switch: if single-name satellite has VOL21 > threshold,
+    replace with the best ETF in that bucket.
+
+    This is a risk control, not a forecasted weight scheme (DeMiguel-consistent).
+
+    Args:
+        candidate: The selected candidate
+        all_candidates: All scored candidates for finding ETF replacement
+
+    Returns:
+        Original candidate if OK, or ETF replacement if kill-switch triggered
+    """
+    # Only apply to non-ETF (single-name stocks)
+    if candidate.is_etf:
+        return candidate
+
+    # Check if volatility exceeds threshold
+    if candidate.vol_21 <= VOLATILITY_KILL_SWITCH_THRESHOLD:
+        return candidate
+
+    # Find best ETF in same bucket
+    bucket = candidate.bucket
+    bucket_etfs = [c for c in all_candidates
+                   if c.bucket == bucket and c.is_etf and c.is_qualified]
+
+    if bucket_etfs:
+        # Sort by rank_key and pick best
+        bucket_etfs.sort(key=lambda x: x.rank_key)
+        replacement = bucket_etfs[0]
+        logger.info(f"VOLATILITY KILL-SWITCH: Replacing {candidate.ticker} "
+                   f"(VOL21={candidate.vol_21:.4f}) with {replacement.ticker} "
+                   f"(VOL21={replacement.vol_21:.4f})")
+        return replacement
+
+    # No ETF available, keep original with warning
+    logger.warning(f"VOLATILITY WARNING: {candidate.ticker} has high volatility "
+                  f"(VOL21={candidate.vol_21:.4f}) but no ETF replacement available")
+    return candidate
+
+
+def get_best_per_bucket(
+    market_data: Dict,
+    require_qualified: bool = True,
+    apply_vol_killswitch: bool = True
+) -> Dict[str, ScoredCandidate]:
+    """
+    Get the best candidate from each bucket (structural 1/N diversification).
+
+    This is the core DeMiguel-aligned selection: instead of picking top N globally,
+    we pick exactly 1 from each bucket to ensure structural diversification.
 
     Args:
         market_data: Market data dict
-        n: Number of candidates to return
+        require_qualified: If True, only consider qualified candidates
+        apply_vol_killswitch: If True, apply volatility kill-switch for single names
+
+    Returns:
+        Dict mapping bucket name to best candidate
+    """
+    all_candidates = score_all_satellites(market_data)
+
+    if require_qualified:
+        candidates = [c for c in all_candidates if c.is_qualified]
+    else:
+        candidates = all_candidates
+
+    best_per_bucket = {}
+
+    for bucket_name in SATELLITE_BUCKETS.keys():
+        # Get all candidates in this bucket
+        bucket_candidates = [c for c in candidates if c.bucket == bucket_name]
+
+        if not bucket_candidates:
+            logger.warning(f"No qualified candidates in bucket {bucket_name}")
+            continue
+
+        # Sort by rank_key (parameter-free lexicographic)
+        bucket_candidates.sort(key=lambda x: x.rank_key)
+        best = bucket_candidates[0]
+
+        # Apply volatility kill-switch if enabled
+        if apply_vol_killswitch:
+            best = apply_volatility_kill_switch(best, candidates)
+
+        best_per_bucket[bucket_name] = best
+        logger.debug(f"Best in {bucket_name}: {best.ticker} "
+                    f"(RelR21={best.rel_r21:.4f}, RelR63={best.rel_r63:.4f}, "
+                    f"VOL21={best.vol_21:.4f})")
+
+    return best_per_bucket
+
+
+def get_top_candidates(
+    market_data: Dict,
+    n: int = 8,
+    require_qualified: bool = True
+) -> List[ScoredCandidate]:
+    """
+    Get top candidates using structural 1/N bucket selection.
+
+    CHANGED: Instead of picking top N globally, picks 1 from each bucket
+    to ensure structural diversification across themes.
+
+    Args:
+        market_data: Market data dict
+        n: Maximum candidates to return (default 8 = number of buckets)
         require_qualified: If True, only return qualified candidates
 
     Returns:
-        List of top N ScoredCandidate objects
+        List of top candidates (1 per bucket, up to n total)
     """
-    all_scored = score_all_satellites(market_data)
+    best_per_bucket = get_best_per_bucket(market_data, require_qualified)
 
-    if require_qualified:
-        qualified = [c for c in all_scored if c.is_qualified]
-    else:
-        qualified = all_scored
+    # Convert to list and sort by rank_key
+    candidates = list(best_per_bucket.values())
+    candidates.sort(key=lambda x: x.rank_key)
 
-    return qualified[:n]
+    return candidates[:n]
 
 
 def get_double7_buy_candidates(
@@ -181,13 +313,15 @@ def get_double7_buy_candidates(
     """
     Get candidates that meet all buy criteria including Double-7 Low.
 
+    UPDATED for structural 1/N: Uses bucket-based selection instead of global top 12.
+
     Entry conditions (ALL must be TRUE):
     - Price >= $6
     - Not prohibited
     - Uptrend (Close > SMA50 > SMA200)
     - Double-7 Low (today's close is 7-day low)
-    - In top 12 scores
-    - Bucket has space (< 2 positions from same bucket)
+    - Is best candidate in its bucket (1/N structural)
+    - Bucket is empty (exactly 1 per bucket rule)
 
     Args:
         market_data: Market data dict
@@ -197,13 +331,12 @@ def get_double7_buy_candidates(
     Returns:
         List of candidates meeting all criteria
     """
-    # Get top 12 qualified candidates
-    top_12 = get_top_candidates(market_data, n=12, require_qualified=True)
-    top_12_tickers = {c.ticker for c in top_12}
+    # Get best candidate per bucket (structural 1/N)
+    best_per_bucket = get_best_per_bucket(market_data, require_qualified=True)
 
     buy_candidates = []
 
-    for candidate in top_12:
+    for bucket, candidate in best_per_bucket.items():
         ticker = candidate.ticker
         ticker_data = market_data.get(ticker, {})
 
@@ -212,16 +345,20 @@ def get_double7_buy_candidates(
         if not double7_valid:
             continue
 
-        # Check bucket limits
-        bucket = candidate.bucket
+        # Check bucket is empty (exactly 1 per bucket rule)
         bucket_count = count_bucket_positions(bucket, current_positions)
         if bucket_count >= MAX_PER_BUCKET:
-            logger.debug(f"{ticker}: Bucket {bucket} full ({bucket_count}/{MAX_PER_BUCKET})")
+            logger.debug(f"{ticker}: Bucket {bucket} already filled ({bucket_count}/{MAX_PER_BUCKET})")
+            continue
+
+        # Check we don't already hold this ticker
+        if ticker in current_positions:
+            logger.debug(f"{ticker}: Already held")
             continue
 
         buy_candidates.append(candidate)
 
-    logger.info(f"Found {len(buy_candidates)} Double-7 buy candidates")
+    logger.info(f"Found {len(buy_candidates)} Double-7 buy candidates (1/N bucket selection)")
     return buy_candidates
 
 
@@ -309,21 +446,21 @@ def select_replacement_satellite(
     market_data: Dict,
     current_positions: Dict,
     vix_level: float,
-    exclude_tickers: List[str] = None
+    exclude_tickers: List[str] = None,
+    for_bucket: str = None
 ) -> Optional[ScoredCandidate]:
     """
     Select the best replacement satellite when one needs to be replaced.
 
-    Considers:
-    - Top 12 scoring requirement
-    - Bucket diversification
-    - Regime-based constraints
+    UPDATED for structural 1/N: Prioritizes filling empty buckets to maintain
+    diversification across all 8 themes.
 
     Args:
         market_data: Market data dict
         current_positions: Current portfolio positions
         vix_level: Current VIX level
         exclude_tickers: Tickers to exclude (e.g., just sold)
+        for_bucket: If specified, only consider candidates from this bucket
 
     Returns:
         Best replacement candidate or None
@@ -340,66 +477,107 @@ def select_replacement_satellite(
         logger.info(f"Already at max satellites ({current_satellites}/{max_satellites}) for {regime} regime")
         return None
 
-    # Get candidates
-    top_candidates = get_top_candidates(market_data, n=12, require_qualified=True)
+    # Get best per bucket
+    best_per_bucket = get_best_per_bucket(market_data, require_qualified=True)
 
-    for candidate in top_candidates:
-        ticker = candidate.ticker
+    # If specific bucket requested, try that first
+    if for_bucket and for_bucket in best_per_bucket:
+        candidate = best_per_bucket[for_bucket]
+        if candidate.ticker not in exclude_tickers and candidate.ticker not in current_positions:
+            bucket_count = count_bucket_positions(for_bucket, current_positions)
+            if bucket_count < MAX_PER_BUCKET:
+                logger.info(f"Selected replacement for {for_bucket}: {candidate.ticker} "
+                           f"(RelR21={candidate.rel_r21:.4f})")
+                return candidate
 
-        # Skip excluded
-        if ticker in exclude_tickers:
+    # Find empty buckets first (maintain structural diversification)
+    filled_buckets = set(get_represented_buckets(current_positions))
+    empty_buckets = [b for b in SATELLITE_BUCKETS.keys() if b not in filled_buckets]
+
+    # Prioritize filling empty buckets
+    for bucket in empty_buckets:
+        if bucket not in best_per_bucket:
             continue
 
-        # Skip already held
-        if ticker in current_positions:
+        candidate = best_per_bucket[bucket]
+        if candidate.ticker in exclude_tickers or candidate.ticker in current_positions:
             continue
 
-        # Check bucket space
-        bucket = candidate.bucket
-        bucket_count = count_bucket_positions(bucket, current_positions)
-        if bucket_count >= MAX_PER_BUCKET:
-            continue
-
-        logger.info(f"Selected replacement: {ticker} (score={candidate.score:.4f}, bucket={bucket})")
+        logger.info(f"Selected replacement (filling empty bucket {bucket}): {candidate.ticker} "
+                   f"(RelR21={candidate.rel_r21:.4f})")
         return candidate
 
-    logger.warning("No suitable replacement found")
+    # If H_MATERIALS bucket (DMAT only) fails eligibility, use strongest RelR21 from any bucket
+    if 'H_MATERIALS' in empty_buckets and 'H_MATERIALS' not in best_per_bucket:
+        # Find best candidate from any bucket with space
+        all_candidates = list(best_per_bucket.values())
+        all_candidates.sort(key=lambda x: x.rank_key)
+
+        for candidate in all_candidates:
+            if candidate.ticker in exclude_tickers or candidate.ticker in current_positions:
+                continue
+            bucket_count = count_bucket_positions(candidate.bucket, current_positions)
+            if bucket_count < MAX_PER_BUCKET:
+                logger.info(f"Selected replacement (MATERIALS fallback): {candidate.ticker} "
+                           f"(RelR21={candidate.rel_r21:.4f}, bucket={candidate.bucket})")
+                return candidate
+
+    logger.warning("No suitable replacement found - all buckets filled or no qualified candidates")
     return None
 
 
 def print_scoring_report(market_data: Dict, current_positions: Dict = None):
     """
-    Print a detailed scoring report for all satellites.
+    Print a detailed ranking report for all satellites.
+
+    UPDATED: Shows parameter-free ranking metrics (no weighted score).
 
     Args:
         market_data: Market data dict
         current_positions: Current positions (optional)
     """
-    all_scored = score_all_satellites(market_data)
+    all_ranked = score_all_satellites(market_data)
+    best_per_bucket = get_best_per_bucket(market_data, require_qualified=True)
+    best_tickers = {c.ticker for c in best_per_bucket.values()}
 
-    print("\n" + "=" * 80)
-    print("SATELLITE SCORING REPORT")
-    print("=" * 80)
-    print(f"{'Rank':<5} {'Ticker':<8} {'Bucket':<12} {'Score':>10} {'RelMom21':>10} "
-          f"{'RelMom63':>10} {'VolPen':>10} {'Price':>10} {'Status':<15}")
-    print("-" * 80)
+    print("\n" + "=" * 95)
+    print("SATELLITE RANKING REPORT (Parameter-Free 1/N)")
+    print("=" * 95)
+    print(f"{'Rank':<5} {'Ticker':<8} {'Bucket':<12} {'RelR21':>10} {'RelR63':>10} "
+          f"{'VOL21':>10} {'Price':>10} {'ETF':>5} {'Status':<18}")
+    print("-" * 95)
 
-    for i, candidate in enumerate(all_scored, 1):
-        status = "QUALIFIED" if candidate.is_qualified else candidate.disqualification_reason[:15]
+    for i, candidate in enumerate(all_ranked, 1):
+        status = "QUALIFIED" if candidate.is_qualified else candidate.disqualification_reason[:18] if candidate.disqualification_reason else "N/A"
         if current_positions and candidate.ticker in current_positions:
             status = "HELD"
+        elif candidate.ticker in best_tickers:
+            status = "BEST-IN-BUCKET"
 
-        print(f"{i:<5} {candidate.ticker:<8} {candidate.bucket:<12} {candidate.score:>10.4f} "
-              f"{candidate.rel_mom_21:>10.4f} {candidate.rel_mom_63:>10.4f} "
-              f"{candidate.vol_penalty:>10.4f} {candidate.price:>10.2f} {status:<15}")
+        etf_flag = "Y" if candidate.is_etf else "N"
 
-    print("=" * 80)
+        # Highlight if volatility exceeds kill-switch threshold
+        vol_str = f"{candidate.vol_21:>10.4f}"
+        if candidate.vol_21 > VOLATILITY_KILL_SWITCH_THRESHOLD and not candidate.is_etf:
+            vol_str = f"{candidate.vol_21:>9.4f}*"  # Asterisk for high vol
 
-    # Top 12 summary
-    top_12 = get_top_candidates(market_data, n=12, require_qualified=True)
-    print(f"\nTOP 12 QUALIFIED: {[c.ticker for c in top_12]}")
+        print(f"{i:<5} {candidate.ticker:<8} {candidate.bucket:<12} {candidate.rel_r21:>10.4f} "
+              f"{candidate.rel_r63:>10.4f} {vol_str:>10} {candidate.price:>10.2f} "
+              f"{etf_flag:>5} {status:<18}")
 
-    # Bucket distribution
+    print("=" * 95)
+    print("* = Volatility exceeds kill-switch threshold (6%)")
+
+    # Best per bucket summary (structural 1/N)
+    print(f"\nBEST PER BUCKET (Structural 1/N):")
+    for bucket, candidate in sorted(best_per_bucket.items()):
+        held_flag = " [HELD]" if current_positions and candidate.ticker in current_positions else ""
+        print(f"  {bucket}: {candidate.ticker} (RelR21={candidate.rel_r21:.4f}){held_flag}")
+
+    # Bucket distribution for current positions
     if current_positions:
         buckets = get_represented_buckets(current_positions)
-        print(f"REPRESENTED BUCKETS: {buckets}")
+        missing = [b for b in SATELLITE_BUCKETS.keys() if b not in buckets]
+        print(f"\nCURRENT BUCKETS: {buckets}")
+        if missing:
+            print(f"MISSING BUCKETS: {missing}")

@@ -6,6 +6,11 @@ Contains the main trading logic executed daily at 3:55 PM ET:
 - Position evaluation
 - Entry/exit decisions
 - Order execution
+
+UPDATED (Perfection Patch):
+- Friday-only discretionary rotations (DeMiguel-consistent turnover reduction)
+- Daily trades are risk exits only (stop-loss, trend break, price violation)
+- Structural 1/N diversification across 8 thematic buckets
 """
 
 import logging
@@ -24,7 +29,7 @@ from state_manager import StateManager, sync_state_with_stocktrak
 from scoring import (
     get_top_candidates, get_double7_buy_candidates,
     get_double7_sell_candidates, select_replacement_satellite,
-    print_scoring_report
+    print_scoring_report, get_best_per_bucket
 )
 from validators import (
     get_vix_regime, get_market_regime, validate_holding_period,
@@ -138,6 +143,11 @@ def execute_daily_routine():
             bot.close()
 
 
+def is_friday() -> bool:
+    """Check if today is Friday (day for discretionary rotations)."""
+    return datetime.now().weekday() == 4  # Monday=0, Friday=4
+
+
 def execute_normal_mode(
     bot: StockTrakBot,
     state: StateManager,
@@ -148,21 +158,30 @@ def execute_normal_mode(
     """
     Normal trading mode (RISK_ON regime).
 
-    1. Check for stop-losses
-    2. Check for profit-taking (Double-7 High)
-    3. Check for new entry opportunities (Double-7 Low)
+    UPDATED (Perfection Patch - DeMiguel-consistent turnover reduction):
+    - Daily: Only risk exits (stop-loss, trend break, price violation)
+    - Friday only: Discretionary rotations (profit-taking, new entries, stale money)
+
+    This "set and forget" approach aligns with the 1/N paper's spirit and
+    improves rubric #4 (Cost & Efficiency).
     """
     logger.info("Executing NORMAL mode (Risk-On)...")
 
     positions = state.get_positions()
     vix_regime = get_vix_regime(vix_level)
     regime_params = REGIME_PARAMS[vix_regime]
+    friday = is_friday()
+
+    if friday:
+        logger.info("FRIDAY - Discretionary rotations ENABLED")
+    else:
+        logger.info("NON-FRIDAY - Risk exits only (no discretionary rotations)")
 
     sells_executed = []
     buys_executed = []
 
-    # ===== STEP 1: Evaluate existing positions for exits =====
-    logger.info("Evaluating positions for exits...")
+    # ===== STEP 1: Evaluate existing positions for RISK EXITS (daily) =====
+    logger.info("Evaluating positions for risk exits...")
 
     for ticker, position in positions.items():
         # Skip core positions (rarely sell)
@@ -185,34 +204,40 @@ def execute_normal_mode(
             logger.debug(f"{ticker}: {hold_reason}")
             continue
 
-        # Check for sell triggers
+        # Check for RISK EXIT triggers (these happen daily)
         sell_reason = None
+        is_risk_exit = False
 
-        # 1. Price violation risk (approaching $5)
+        # 1. Price violation risk (approaching $5) - RISK EXIT
         if current_price < 5.50:
             sell_reason = "PRICE_VIOLATION_RISK"
+            is_risk_exit = True
 
-        # 2. Stop-loss
+        # 2. Stop-loss - RISK EXIT
         stop_loss = regime_params['stop_loss_pct']
         if pnl_pct <= -stop_loss:
             sell_reason = f"STOP_LOSS_{stop_loss*100:.0f}PCT"
+            is_risk_exit = True
 
-        # 3. Trend break
+        # 3. Trend break (price < SMA50 with negative P&L) - RISK EXIT
         sma50 = ticker_data.get('sma50', 0)
         if current_price < sma50 and pnl_pct < 0:
             sell_reason = "TREND_BREAK"
+            is_risk_exit = True
 
-        # 4. Stale money (held 15+ days with <2% gain)
-        entry_date_str = position.get('entry_date')
-        if entry_date_str:
-            from utils import get_trading_days_between
-            entry_date = datetime.fromisoformat(entry_date_str).date()
-            days_held = get_trading_days_between(entry_date, datetime.now().date())
-            if days_held >= 15 and pnl_pct < 0.02:
-                sell_reason = "STALE_MONEY"
+        # 4. Stale money (held 15+ days with <2% gain) - FRIDAY ONLY
+        if friday and not sell_reason:
+            entry_date_str = position.get('entry_date')
+            if entry_date_str:
+                from utils import get_trading_days_between
+                entry_date = datetime.fromisoformat(entry_date_str).date()
+                days_held = get_trading_days_between(entry_date, datetime.now().date())
+                if days_held >= 15 and pnl_pct < 0.02:
+                    sell_reason = "STALE_MONEY"
+                    is_risk_exit = False  # Discretionary, not risk
 
-        # Execute sell if triggered
-        if sell_reason:
+        # Execute sell if triggered (risk exits daily, stale money Friday only)
+        if sell_reason and (is_risk_exit or friday):
             # Validate trade count
             trade_valid, _ = validate_trade_count(state.get_trades_used(), is_new_buy=False)
             if not trade_valid:
@@ -223,76 +248,111 @@ def execute_normal_mode(
             success, msg = bot.place_sell_order(ticker, shares, limit_price)
 
             if success:
-                logger.info(f"SELL {ticker}: {shares} shares @ ${limit_price:.2f} ({sell_reason})")
+                exit_type = "RISK EXIT" if is_risk_exit else "DISCRETIONARY"
+                logger.info(f"SELL [{exit_type}] {ticker}: {shares} shares @ ${limit_price:.2f} ({sell_reason})")
                 state.log_trade(ticker, 'SELL', shares, limit_price, sell_reason)
                 state.increment_trade_count()
                 state.remove_position(ticker)
-                sells_executed.append(ticker)
+                sells_executed.append((ticker, position.get('bucket')))
                 time.sleep(3)
 
-    # ===== STEP 2: Check for profit-taking opportunities (Double-7 High) =====
-    logger.info("Checking for profit-taking opportunities...")
+    # ===== STEP 2: Check for profit-taking (FRIDAY ONLY) =====
+    if friday:
+        logger.info("Checking for profit-taking opportunities (Friday discretionary)...")
 
-    double7_highs = get_double7_sell_candidates(market_data, positions)
-    for ticker, reason in double7_highs:
-        if ticker in sells_executed:
-            continue
+        double7_highs = get_double7_sell_candidates(market_data, positions)
+        for ticker, reason in double7_highs:
+            if any(t == ticker for t, _ in sells_executed):
+                continue
 
-        # Validate we can sell
-        position = positions.get(ticker, {})
-        can_sell_result, checks = can_sell(ticker, position, positions, state.get_trades_used())
-        if not can_sell_result:
-            logger.debug(f"{ticker}: Cannot sell - {checks}")
-            continue
+            # Validate we can sell
+            position = positions.get(ticker, {})
+            can_sell_result, checks = can_sell(ticker, position, positions, state.get_trades_used())
+            if not can_sell_result:
+                logger.debug(f"{ticker}: Cannot sell - {checks}")
+                continue
 
-        # This is optional profit-taking, only do if we have trade budget
-        if state.get_trades_used() >= HARD_STOP_TRADES:
-            logger.info("Skipping optional profit-taking - at trade limit")
-            break
+            # This is optional profit-taking, only do if we have trade budget
+            if state.get_trades_used() >= HARD_STOP_TRADES:
+                logger.info("Skipping optional profit-taking - at trade limit")
+                break
 
-        ticker_data = market_data.get(ticker, {})
-        current_price = ticker_data.get('price', 0)
-        shares = position.get('shares', 0)
-        limit_price = calculate_limit_price(current_price, is_buy=False)
+            ticker_data = market_data.get(ticker, {})
+            current_price = ticker_data.get('price', 0)
+            shares = position.get('shares', 0)
+            limit_price = calculate_limit_price(current_price, is_buy=False)
 
-        success, msg = bot.place_sell_order(ticker, shares, limit_price)
-        if success:
-            logger.info(f"PROFIT TAKE {ticker}: {shares} shares @ ${limit_price:.2f}")
-            state.log_trade(ticker, 'SELL', shares, limit_price, 'PROFIT_TAKE')
-            state.increment_trade_count()
-            state.increment_week_replacements()
-            state.remove_position(ticker)
-            sells_executed.append(ticker)
-            time.sleep(3)
+            success, msg = bot.place_sell_order(ticker, shares, limit_price)
+            if success:
+                logger.info(f"PROFIT TAKE [DISCRETIONARY] {ticker}: {shares} shares @ ${limit_price:.2f}")
+                state.log_trade(ticker, 'SELL', shares, limit_price, 'PROFIT_TAKE')
+                state.increment_trade_count()
+                state.increment_week_replacements()
+                state.remove_position(ticker)
+                sells_executed.append((ticker, position.get('bucket')))
+                time.sleep(3)
+    else:
+        logger.info("Skipping profit-taking (non-Friday)")
 
-    # ===== STEP 3: Look for new entry opportunities =====
-    logger.info("Looking for new entry opportunities...")
+    # ===== STEP 3: Look for new entry opportunities (FRIDAY ONLY for discretionary) =====
+    # Exception: If a risk exit created an empty bucket, we can replace to maintain min holdings
 
     # Check event freeze
     if datetime.now().date() in EVENT_FREEZE_DATES:
         logger.info("EVENT FREEZE - no new positions today")
         return
 
+    # Update positions after sells
+    positions = state.get_positions()
+    current_satellites = sum(1 for t in positions if t not in CORE_POSITIONS)
+
+    # Determine if we need emergency replacement (to maintain structural diversification)
+    buckets_sold = [bucket for _, bucket in sells_executed if bucket]
+    need_emergency_replacement = len(positions) < 4  # Below min holdings
+
+    if friday:
+        logger.info("Looking for new entry opportunities (Friday discretionary)...")
+    elif need_emergency_replacement:
+        logger.info("Looking for emergency replacement (maintain min holdings)...")
+    else:
+        logger.info("Skipping new entries (non-Friday, no emergency)")
+        logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys (non-Friday)")
+        return
+
     # Check if we should buy (have room and budget)
     max_satellites = regime_params['max_satellites']
-    current_satellites = sum(1 for t in positions if t not in CORE_POSITIONS)
     weekly_cap = regime_params['weekly_replacement_cap']
     week_replacements = state.get_week_replacements()
 
     if current_satellites >= max_satellites:
         logger.info(f"At max satellites ({current_satellites}/{max_satellites}) for {vix_regime} regime")
+        logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys")
         return
 
-    if week_replacements >= weekly_cap:
+    if friday and week_replacements >= weekly_cap:
         logger.info(f"At weekly cap ({week_replacements}/{weekly_cap})")
+        logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys")
         return
 
     if state.get_trades_used() >= HARD_STOP_TRADES:
         logger.info("At trade limit - no new buys")
+        logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys")
         return
 
-    # Get Double-7 Low candidates
-    buy_candidates = get_double7_buy_candidates(market_data, positions, vix_level)
+    # Get candidates - prioritize replacing sold buckets to maintain 1/N structure
+    if friday:
+        buy_candidates = get_double7_buy_candidates(market_data, positions, vix_level)
+    else:
+        # Emergency replacement only - try to fill the buckets we just sold
+        buy_candidates = []
+        for sold_bucket in buckets_sold:
+            replacement = select_replacement_satellite(
+                market_data, positions, vix_level,
+                exclude_tickers=[t for t, _ in sells_executed],
+                for_bucket=sold_bucket
+            )
+            if replacement:
+                buy_candidates.append(replacement)
 
     for candidate in buy_candidates:
         ticker = candidate.ticker
@@ -323,8 +383,9 @@ def execute_normal_mode(
         success, msg = bot.place_buy_order(ticker, shares, limit_price)
 
         if success:
-            logger.info(f"BUY {ticker}: {shares} shares @ ${limit_price:.2f}")
-            state.log_trade(ticker, 'BUY', shares, limit_price, 'DOUBLE7_ENTRY')
+            entry_type = "DISCRETIONARY" if friday else "EMERGENCY"
+            logger.info(f"BUY [{entry_type}] {ticker}: {shares} shares @ ${limit_price:.2f}")
+            state.log_trade(ticker, 'BUY', shares, limit_price, 'DOUBLE7_ENTRY' if friday else 'EMERGENCY_REPLACE')
             state.increment_trade_count()
             state.add_position(ticker, shares, limit_price, bucket=candidate.bucket)
             buys_executed.append(ticker)
@@ -336,7 +397,9 @@ def execute_normal_mode(
                 break
             if state.get_trades_used() >= HARD_STOP_TRADES:
                 break
-            if week_replacements >= weekly_cap:
+            if friday and week_replacements >= weekly_cap:
+                break
+            if not friday and len(positions) >= 4:  # Emergency replacement complete
                 break
 
     logger.info(f"Session summary: {len(sells_executed)} sells, {len(buys_executed)} buys")
