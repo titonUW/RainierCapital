@@ -92,42 +92,59 @@ ENABLE_DISCORD_ALERTS = False
 DISCORD_WEBHOOK_URL = ""
 
 # =============================================================================
-# PORTFOLIO ALLOCATION
+# PORTFOLIO ALLOCATION (1/N Strategy - DeMiguel et al.)
 # =============================================================================
-# Core Holdings (always maintain these) - 60% total
+# Core Holdings - 60% total (equal-weighted 1/N within core sleeve)
 CORE_POSITIONS = {
-    'VOO': 0.35,  # Vanguard S&P 500 - 35%
-    'VTI': 0.15,  # Vanguard Total Market - 15%
-    'VEA': 0.10,  # Vanguard Developed Markets - 10%
+    'VOO': 0.20,  # Vanguard S&P 500 - 20%
+    'VTI': 0.20,  # Vanguard Total Market - 20%
+    'VEA': 0.20,  # Vanguard Developed Markets - 20%
 }
 
-# Satellite Buckets (pick 8 positions, ~5% each) - 40% total
+# Satellite Buckets (8 buckets × 1 position each = 40% total)
+# Structural diversification: exactly 1 slot per bucket (1/N across themes)
 SATELLITE_BUCKETS = {
-    'A_SPACE': ['RKLB', 'PL', 'ASTS', 'LUNR', 'UFO', 'ROKT'],
-    'B_DEFENSE': ['ITA', 'PPA', 'XAR', 'LMT', 'NOC', 'RTX', 'GD', 'KTOS', 'AVAV'],
-    'C_SEMIS': ['SMH', 'SOXX', 'ASML', 'AMAT', 'LRCX', 'KLAC'],
+    'A_SPACE': ['ROKT', 'UFO', 'RKLB', 'PL', 'ASTS', 'LUNR', 'ONDS', 'RDW'],
+    'B_DEFENSE': ['PPA', 'ITA', 'XAR', 'JEDI', 'LMT', 'NOC', 'RTX', 'GD', 'KTOS', 'AVAV'],
+    'C_SEMIS': ['SMH', 'SOXX', 'ASML', 'AMAT', 'LRCX', 'KLAC', 'TER', 'ENTG'],
     'D_BIOTECH': ['XBI', 'IDNA', 'CRSP', 'NTLA', 'BEAM'],
-    'E_NUCLEAR': ['URA', 'URNM', 'NLR', 'CCJ'],
+    'E_NUCLEAR': ['URNM', 'URA', 'NLR', 'CCJ'],
     'F_ENERGY': ['XLE', 'XOP', 'XOM', 'CVX'],
-    'G_METALS': ['XME', 'COPX', 'PICK', 'FCX', 'SCCO'],
+    'G_METALS': ['COPX', 'XME', 'PICK', 'FCX', 'SCCO'],
     'H_MATERIALS': ['DMAT'],
 }
 
-# Day-1 satellite lineup (pre-selected based on macro analysis)
+# ETFs per bucket (for volatility kill-switch fallback)
+BUCKET_ETFS = {
+    'A_SPACE': ['ROKT', 'UFO'],
+    'B_DEFENSE': ['PPA', 'ITA', 'XAR'],
+    'C_SEMIS': ['SMH', 'SOXX'],
+    'D_BIOTECH': ['XBI', 'IDNA'],
+    'E_NUCLEAR': ['URNM', 'URA', 'NLR'],
+    'F_ENERGY': ['XLE', 'XOP'],
+    'G_METALS': ['COPX', 'XME', 'PICK'],
+    'H_MATERIALS': ['DMAT'],
+}
+
+# Day-1 satellite lineup (1 per bucket - structural diversification)
 DAY1_SATELLITES = [
-    ('SMH', 'C_SEMIS'),
-    ('ITA', 'B_DEFENSE'),
-    ('URA', 'E_NUCLEAR'),
-    ('COPX', 'G_METALS'),
-    ('XLE', 'F_ENERGY'),
-    ('RKLB', 'A_SPACE'),
-    ('XBI', 'D_BIOTECH'),
-    ('LMT', 'B_DEFENSE'),
+    ('ROKT', 'A_SPACE'),      # Space ETF
+    ('PPA', 'B_DEFENSE'),     # Defense ETF
+    ('SMH', 'C_SEMIS'),       # Semiconductors ETF
+    ('XBI', 'D_BIOTECH'),     # Biotech ETF
+    ('URNM', 'E_NUCLEAR'),    # Nuclear ETF
+    ('XLE', 'F_ENERGY'),      # Energy ETF
+    ('COPX', 'G_METALS'),     # Metals ETF
+    ('DMAT', 'H_MATERIALS'),  # Materials ETF
 ]
 
-SATELLITE_POSITION_SIZE = 0.05  # 5% per satellite
-MAX_PER_BUCKET = 2              # Max 2 satellites from same bucket
-MIN_BUCKETS = 3                 # Must have at least 3 different buckets
+SATELLITE_POSITION_SIZE = 0.05  # 5% per satellite (8 × 5% = 40%)
+MAX_PER_BUCKET = 1              # Exactly 1 satellite per bucket (structural 1/N)
+MIN_BUCKETS = 8                 # Must have all 8 buckets represented
+
+# Volatility kill-switch threshold (DeMiguel-consistent risk control)
+# If single-name satellite VOL21 > 6% daily stdev, replace with bucket ETF
+VOLATILITY_KILL_SWITCH_THRESHOLD = 0.06
 
 # =============================================================================
 # VIX REGIME PARAMETERS
