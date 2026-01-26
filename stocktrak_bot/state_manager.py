@@ -260,6 +260,49 @@ class StateManager:
         today = datetime.now().date().isoformat()
         return self.state.get('last_execution_date') == today
 
+    def already_submitted_today(self, ticker: str, action: str, shares: int, price: float) -> bool:
+        """
+        Check if an identical order was already submitted today.
+
+        This prevents duplicate orders if the bot crashes and restarts.
+
+        Args:
+            ticker: Stock symbol
+            action: 'BUY' or 'SELL'
+            shares: Number of shares
+            price: Limit price
+
+        Returns:
+            True if a matching order was already submitted today
+        """
+        today = datetime.now().date().isoformat()
+        trade_log = self.state.get('trade_log', [])
+
+        for trade in trade_log:
+            # Check if trade is from today
+            trade_date = trade.get('timestamp', '')[:10]  # YYYY-MM-DD
+            if trade_date != today:
+                continue
+
+            # Check if it's the same order
+            if (trade.get('ticker') == ticker and
+                trade.get('action') == action and
+                trade.get('shares') == shares and
+                abs(trade.get('price', 0) - price) < 0.01):  # Price tolerance
+                return True
+
+        return False
+
+    def get_orders_submitted_today(self) -> List[Dict]:
+        """Get all orders submitted today for idempotency checking"""
+        today = datetime.now().date().isoformat()
+        trade_log = self.state.get('trade_log', [])
+
+        return [
+            trade for trade in trade_log
+            if trade.get('timestamp', '')[:10] == today
+        ]
+
     def log_error(self, error_msg: str):
         """Log an error occurrence"""
         self.state['error_count'] += 1

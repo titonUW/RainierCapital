@@ -15,12 +15,14 @@ from datetime import datetime
 
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 
+import config
 from config import (
     STOCKTRAK_URL, STOCKTRAK_LOGIN_URL, STOCKTRAK_USERNAME, STOCKTRAK_PASSWORD,
     HEADLESS_MODE, SLOW_MO, DEFAULT_TIMEOUT, ORDER_SUBMISSION_WAIT,
     SCREENSHOT_ON_ERROR, SCREENSHOT_ON_TRADE
 )
 from utils import parse_currency, parse_number, log_trade
+from state_manager import StateManager
 
 logger = logging.getLogger('stocktrak_bot.browser')
 
@@ -965,6 +967,27 @@ class StockTrakBot:
         logger.info(f"Placing BUY order: {shares} {ticker} @ ${limit_price:.2f}" +
                    (" [DRY RUN]" if dry_run else ""))
 
+        # IDEMPOTENCY CHECK: Prevent duplicate orders on restart
+        state = StateManager()
+        if state.already_submitted_today(ticker, 'BUY', shares, limit_price):
+            logger.warning(f"DUPLICATE ORDER BLOCKED: BUY {shares} {ticker} @ ${limit_price:.2f} already submitted today")
+            return False, "Duplicate order blocked - already submitted today"
+
+        # SAFE MODE GUARDS
+        if config.SAFE_MODE:
+            # Check whitelist
+            if ticker.upper() not in config.SAFE_MODE_ETF_WHITELIST:
+                logger.warning(f"SAFE MODE: {ticker} not in ETF whitelist - blocking order")
+                return False, f"Safe mode: {ticker} not in ETF whitelist"
+            # Enforce max shares
+            if shares > config.SAFE_MODE_MAX_SHARES:
+                logger.warning(f"SAFE MODE: Reducing shares from {shares} to {config.SAFE_MODE_MAX_SHARES}")
+                shares = config.SAFE_MODE_MAX_SHARES
+
+        # Check global DRY_RUN_MODE (overrides function parameter)
+        if config.DRY_RUN_MODE:
+            dry_run = True
+
         try:
             # Dismiss any popups first
             dismiss_stocktrak_overlays(self.page)
@@ -1178,6 +1201,27 @@ class StockTrakBot:
         logger.info(f"Placing SELL order: {shares} {ticker} @ ${limit_price:.2f}" +
                    (" [DRY RUN]" if dry_run else ""))
 
+        # IDEMPOTENCY CHECK: Prevent duplicate orders on restart
+        state = StateManager()
+        if state.already_submitted_today(ticker, 'SELL', shares, limit_price):
+            logger.warning(f"DUPLICATE ORDER BLOCKED: SELL {shares} {ticker} @ ${limit_price:.2f} already submitted today")
+            return False, "Duplicate order blocked - already submitted today"
+
+        # SAFE MODE GUARDS
+        if config.SAFE_MODE:
+            # Check whitelist
+            if ticker.upper() not in config.SAFE_MODE_ETF_WHITELIST:
+                logger.warning(f"SAFE MODE: {ticker} not in ETF whitelist - blocking sell order")
+                return False, f"Safe mode: {ticker} not in ETF whitelist"
+            # Enforce max shares
+            if shares > config.SAFE_MODE_MAX_SHARES:
+                logger.warning(f"SAFE MODE: Reducing shares from {shares} to {config.SAFE_MODE_MAX_SHARES}")
+                shares = config.SAFE_MODE_MAX_SHARES
+
+        # Check global DRY_RUN_MODE (overrides function parameter)
+        if config.DRY_RUN_MODE:
+            dry_run = True
+
         try:
             # Dismiss any popups first
             dismiss_stocktrak_overlays(self.page)
@@ -1374,27 +1418,37 @@ class StockTrakBot:
             logger.error(f"Error placing sell order: {e}. Screenshot: {screenshot_path}")
             return False, f"{e}. Screenshot: {screenshot_path}"
 
-    def _try_fill(self, selectors: List[str], value: str) -> bool:
-        """Try multiple selectors to fill a form field"""
+    def _try_fill(self, selectors: List[str], value: str, timeout: int = 2000) -> bool:
+        """
+        Try multiple selectors to fill a form field.
+
+        Uses wait_for() pattern for reliability instead of count() > 0.
+        """
         for selector in selectors:
             try:
-                if self.page.locator(selector).count() > 0:
-                    self.page.fill(selector, value)
-                    logger.debug(f"Filled '{value}' with selector: {selector}")
-                    return True
+                loc = self.page.locator(selector).first
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.fill(value)
+                logger.debug(f"Filled '{value}' with selector: {selector}")
+                return True
             except Exception as e:
                 logger.debug(f"Fill failed with {selector}: {e}")
                 continue
         return False
 
-    def _try_click(self, selectors: List[str]) -> bool:
-        """Try multiple selectors to click an element"""
+    def _try_click(self, selectors: List[str], timeout: int = 2000) -> bool:
+        """
+        Try multiple selectors to click an element.
+
+        Uses wait_for() pattern for reliability instead of count() > 0.
+        """
         for selector in selectors:
             try:
-                if self.page.locator(selector).count() > 0:
-                    self.page.click(selector)
-                    logger.debug(f"Clicked with selector: {selector}")
-                    return True
+                loc = self.page.locator(selector).first
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.click()
+                logger.debug(f"Clicked with selector: {selector}")
+                return True
             except Exception as e:
                 logger.debug(f"Click failed with {selector}: {e}")
                 continue

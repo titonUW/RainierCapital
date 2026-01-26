@@ -220,3 +220,23 @@ def get_bucket_for_ticker(ticker):
         if ticker in bucket_tickers:
             return bucket_name
     return None
+
+
+# =============================================================================
+# RUNTIME MODE FLAGS (Set by CLI, not directly)
+# =============================================================================
+DRY_RUN_MODE = False    # If True, never submit orders (test mode)
+SAFE_MODE = False       # If True, max 5 shares, ETFs only, fail on any error
+SAFE_MODE_MAX_SHARES = 5
+SAFE_MODE_ETF_WHITELIST = [
+    'VOO', 'VTI', 'VEA',  # Core ETFs
+    'ROKT', 'UFO',        # Space ETFs
+    'PPA', 'ITA', 'XAR',  # Defense ETFs
+    'SMH', 'SOXX',        # Semiconductor ETFs
+    'XBI', 'IDNA',        # Biotech ETFs
+    'URNM', 'URA', 'NLR', # Nuclear ETFs
+    'XLE', 'XOP',         # Energy ETFs
+    'COPX', 'XME', 'PICK', # Metals ETFs
+    'DMAT',               # Materials ETF
+    'SPY', 'QQQ', 'IWM',  # Additional liquid ETFs
+]
