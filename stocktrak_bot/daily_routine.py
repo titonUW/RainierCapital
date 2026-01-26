@@ -497,11 +497,10 @@ def execute_day1_build():
         market_data = collector.get_all_data()
         print_market_summary(market_data)
 
-        # Get portfolio value
+        # Get portfolio value - FAIL CLOSED, no assumptions
         portfolio_value = bot.get_portfolio_value()
         if portfolio_value is None:
-            portfolio_value = 1000000  # Assume $1M starting capital
-            logger.warning(f"Could not get portfolio value, assuming ${portfolio_value:,.0f}")
+            raise Exception("CRITICAL: Could not get portfolio value. Cannot proceed with Day-1 setup.")
 
         logger.info(f"Starting capital: {format_currency(portfolio_value)}")
 
