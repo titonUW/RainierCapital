@@ -3,6 +3,8 @@ StockTrak Browser Automation for Trading Bot
 
 Uses Playwright to automate interactions with app.stocktrak.com
 for portfolio management and trade execution.
+
+UPDATED: Robust popup handling, page verification, and error recovery.
 """
 
 import logging
@@ -22,87 +24,220 @@ from utils import parse_currency, parse_number, log_trade
 
 logger = logging.getLogger('stocktrak_bot.browser')
 
+# Ensure logs directory exists
+SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
-def dismiss_stocktrak_overlays(page) -> None:
+
+def dismiss_stocktrak_overlays(page, max_attempts: int = 5) -> int:
     """
-    Dismiss any popups/modals that block interaction.
+    Aggressively dismiss ALL popups/modals that block interaction.
 
     Handles:
-    - Robinhood promo modal (btn-dont-show-again)
-    - Site tours (Intro.js, Shepherd.js)
-    - Generic modals with close buttons
+    - Robinhood promo modal
+    - Site tours (multiple steps)
+    - Cookie notices
+    - Any modal/overlay with close buttons
+
+    Args:
+        page: Playwright page object
+        max_attempts: Maximum number of dismiss cycles
+
+    Returns:
+        Number of popups dismissed
     """
-    logger.debug("Checking for popups to dismiss...")
+    dismissed_count = 0
 
-    for attempt in range(3):
-        # 1) Robinhood promo modal - use the actual IDs from StockTrak
-        #    IMPORTANT: Also includes "Ok" button and X close button
-        promo_selectors = [
-            "#btn-dont-show-again",           # Exact ID from inspection
-            "#btn-remindlater",               # Alternative button
-            "#OverlayModalPopup button.ok",   # Ok button at bottom
-            "#OverlayModalPopup .ok",         # Ok button variant
-            "button:has-text('Ok')",          # Generic Ok button
-            "button:has-text('OK')",          # Uppercase variant
-            ".modal button:has-text('Ok')",   # Ok in any modal
-            "a:has-text(\"Don't Show Again\")",  # It's an <a>, not <button>
-            "a:has-text(\"Remind Me Later\")",
-            "#OverlayModalPopup .close",      # Modal close button
-            ".modal-close",                   # Generic modal close
-            "button[aria-label='Close']",
-            "[aria-label='Close']",
-            ".modal .close",
-            "button.close",
-            ".close-button",
-            "button:has-text('×')",           # X button
-            "a:has-text('×')",
-        ]
+    # All known selectors for StockTrak popups
+    all_dismiss_selectors = [
+        # Robinhood promo modal (exact IDs from inspection)
+        "#btn-dont-show-again",
+        "#btn-remindlater",
+        "#OverlayModalPopup button",
+        "#OverlayModalPopup a.button",
 
-        for sel in promo_selectors:
+        # Generic Ok/Close buttons
+        "button:has-text('Ok')",
+        "button:has-text('OK')",
+        "button:has-text('Close')",
+        "button:has-text('Done')",
+        "button:has-text('Got it')",
+        "button:has-text('Dismiss')",
+        "a:has-text('Ok')",
+        "a:has-text('OK')",
+        "a:has-text('Close')",
+        "a:has-text(\"Don't Show Again\")",
+        "a:has-text(\"Remind Me Later\")",
+
+        # Site tour selectors
+        "button:has-text('Skip')",
+        "button:has-text('Skip Tour')",
+        "button:has-text('Skip tour')",
+        "button:has-text('End Tour')",
+        "button:has-text('End tour')",
+        "button:has-text('No Thanks')",
+        "button:has-text('No thanks')",
+        "button:has-text('Maybe Later')",
+        "button:has-text('Next')",  # Click through tour if Skip not available
+        "a:has-text('Skip')",
+        "a:has-text('Skip Tour')",
+        "a:has-text('No Thanks')",
+
+        # Tour library specific (Intro.js, Shepherd.js, Hopscotch)
+        ".introjs-skipbutton",
+        ".introjs-donebutton",
+        ".introjs-button.introjs-skipbutton",
+        ".shepherd-cancel-icon",
+        ".shepherd-button-secondary",
+        ".shepherd-button:has-text('Skip')",
+        ".shepherd-button:has-text('Exit')",
+        ".hopscotch-bubble-close",
+        ".hopscotch-cta:has-text('Skip')",
+        ".tour-skip",
+        ".tour-close",
+        ".tour-end",
+        ".walkthrough-skip",
+        ".walkthrough-close",
+
+        # Generic modal close buttons
+        ".modal .close",
+        ".modal-close",
+        ".modal .btn-close",
+        ".modal [aria-label='Close']",
+        "button[aria-label='Close']",
+        "button[aria-label='close']",
+        "[aria-label='Close']",
+        "[aria-label='close']",
+        "button.close",
+        "button.close-button",
+        ".close-button",
+        ".btn-close",
+        "button:has-text('×')",
+        "a:has-text('×')",
+        ".modal button.btn-secondary",
+
+        # Overlay/backdrop clicks (last resort)
+        ".modal-backdrop",
+        ".overlay-close",
+    ]
+
+    for attempt in range(max_attempts):
+        found_any = False
+
+        for sel in all_dismiss_selectors:
             try:
                 loc = page.locator(sel).first
-                if loc.is_visible(timeout=500):
-                    loc.click(timeout=1000)
-                    logger.info(f"Dismissed popup using: {sel}")
-                    time.sleep(0.3)
+                if loc.is_visible(timeout=300):
+                    try:
+                        loc.click(timeout=800)
+                        dismissed_count += 1
+                        found_any = True
+                        logger.info(f"Dismissed popup #{dismissed_count} using: {sel}")
+                        time.sleep(0.3)
+                    except Exception as click_err:
+                        logger.debug(f"Click failed for {sel}: {click_err}")
             except:
                 pass
 
-        # 2) Tour / walkthrough overlays (common patterns)
-        tour_selectors = [
-            "button:has-text('Skip')",
-            "button:has-text('Skip Tour')",
-            "button:has-text('No Thanks')",
-            "button:has-text('Got it')",
-            "button:has-text('Close')",
-            "a:has-text('Skip')",
-            "a:has-text('No Thanks')",
-            ".introjs-skipbutton",            # Intro.js
-            ".shepherd-cancel-icon",          # Shepherd.js
-            ".shepherd-button-secondary",
-            ".tour-skip",
-            ".walkthrough-skip",
-        ]
-
-        for sel in tour_selectors:
-            try:
-                loc = page.locator(sel).first
-                if loc.is_visible(timeout=500):
-                    loc.click(timeout=1000)
-                    logger.info(f"Dismissed tour using: {sel}")
-                    time.sleep(0.3)
-            except:
-                pass
-
-        # 3) ESC key closes many modals
+        # Try ESC key
         try:
             page.keyboard.press("Escape")
             time.sleep(0.2)
         except:
             pass
 
-        # Brief pause between attempts
+        # Try clicking outside modals (on body)
+        try:
+            # Click at top-left corner which is usually safe
+            page.mouse.click(10, 10)
+            time.sleep(0.2)
+        except:
+            pass
+
+        # If we found and dismissed something, do another pass
+        # If nothing found, we're done
+        if not found_any:
+            break
+
         time.sleep(0.3)
+
+    if dismissed_count > 0:
+        logger.info(f"Total popups dismissed: {dismissed_count}")
+
+    return dismissed_count
+
+
+def verify_page_ready(page, expected_url_contains: str = None, required_element: str = None) -> Tuple[bool, str]:
+    """
+    Verify the page is loaded correctly and ready for interaction.
+
+    Args:
+        page: Playwright page object
+        expected_url_contains: String that should be in the URL
+        required_element: CSS selector of element that must be visible
+
+    Returns:
+        Tuple of (is_ready, status_message)
+    """
+    try:
+        # Check URL
+        current_url = page.url
+        if expected_url_contains and expected_url_contains.lower() not in current_url.lower():
+            return False, f"Wrong URL: expected '{expected_url_contains}' in '{current_url}'"
+
+        # Check for blocking overlays
+        blocking_selectors = [
+            ".modal.show",
+            ".modal[style*='display: block']",
+            "#OverlayModalPopup:visible",
+            ".introjs-overlay",
+            ".shepherd-modal-overlay",
+            ".tour-backdrop",
+        ]
+
+        for sel in blocking_selectors:
+            try:
+                if page.locator(sel).first.is_visible(timeout=200):
+                    return False, f"Blocking overlay detected: {sel}"
+            except:
+                pass
+
+        # Check required element if specified
+        if required_element:
+            try:
+                if not page.locator(required_element).first.is_visible(timeout=2000):
+                    return False, f"Required element not visible: {required_element}"
+            except:
+                return False, f"Required element not found: {required_element}"
+
+        return True, "Page ready"
+
+    except Exception as e:
+        return False, f"Verification error: {e}"
+
+
+def take_debug_screenshot(page, name: str) -> str:
+    """
+    Take a screenshot and return the full path.
+
+    Args:
+        page: Playwright page object
+        name: Base name for the screenshot
+
+    Returns:
+        Full path to the screenshot file
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{name}_{timestamp}.png"
+    filepath = os.path.join(SCREENSHOT_DIR, filename)
+
+    try:
+        page.screenshot(path=filepath)
+        logger.info(f"Screenshot saved: {filepath}")
+        return filepath
+    except Exception as e:
+        logger.error(f"Screenshot failed: {e}")
+        return ""
 
 
 class StockTrakBot:
@@ -175,11 +310,11 @@ class StockTrakBot:
 
             # CRITICAL: Dismiss any popups that appear on login page
             logger.info("Dismissing any popups on login page...")
-            dismiss_stocktrak_overlays(self.page)
+            dismiss_stocktrak_overlays(self.page, max_attempts=5)
             time.sleep(1)
 
             # Screenshot for debugging
-            self._screenshot('login_page')
+            screenshot_path = take_debug_screenshot(self.page, 'login_page')
 
             # Try common login form selectors
             username_selectors = [
@@ -217,14 +352,16 @@ class StockTrakBot:
             username_filled = self._try_fill(username_selectors, self.username)
             if not username_filled:
                 logger.error("Could not find username field")
-                self._screenshot('login_error_username')
+                screenshot_path = take_debug_screenshot(self.page, 'login_error_username')
+                logger.error(f"ERROR screenshot: {screenshot_path}")
                 return False
 
             # Fill password
             password_filled = self._try_fill(password_selectors, self.password)
             if not password_filled:
                 logger.error("Could not find password field")
-                self._screenshot('login_error_password')
+                screenshot_path = take_debug_screenshot(self.page, 'login_error_password')
+                logger.error(f"ERROR screenshot: {screenshot_path}")
                 return False
 
             time.sleep(0.5)
@@ -233,7 +370,8 @@ class StockTrakBot:
             submitted = self._try_click(submit_selectors)
             if not submitted:
                 logger.error("Could not find submit button")
-                self._screenshot('login_error_submit')
+                screenshot_path = take_debug_screenshot(self.page, 'login_error_submit')
+                logger.error(f"ERROR screenshot: {screenshot_path}")
                 return False
 
             # Wait for navigation - use domcontentloaded (faster than networkidle)
@@ -241,24 +379,36 @@ class StockTrakBot:
             self.page.wait_for_load_state('domcontentloaded')
             time.sleep(2)
 
-            # CRITICAL: Dismiss popups IMMEDIATELY after page loads
-            logger.info("Dismissing post-login popups (pass 1)...")
-            dismiss_stocktrak_overlays(self.page)
+            # CRITICAL: Clear ALL popups with aggressive loop
+            logger.info("=== CLEARING ALL POPUPS (this may take a moment) ===")
+            total_dismissed = 0
 
-            self._screenshot('after_login')
+            for pass_num in range(5):  # Up to 5 passes
+                logger.info(f"Popup clearing pass {pass_num + 1}/5...")
+                dismissed = dismiss_stocktrak_overlays(self.page, max_attempts=3)
+                total_dismissed += dismissed
+                take_debug_screenshot(self.page, f'after_popup_pass_{pass_num + 1}')
+                time.sleep(1)
 
-            # Wait a bit more for delayed popups
-            time.sleep(2)
+                # If no popups found in this pass, we might be done
+                if dismissed == 0:
+                    # But wait a bit and try once more in case of delayed popups
+                    time.sleep(2)
+                    final_check = dismiss_stocktrak_overlays(self.page, max_attempts=2)
+                    total_dismissed += final_check
+                    if final_check == 0:
+                        logger.info("No more popups detected")
+                        break
 
-            # Second pass for any delayed popups
-            logger.info("Dismissing post-login popups (pass 2)...")
-            dismiss_stocktrak_overlays(self.page)
-            time.sleep(1)
+            logger.info(f"=== TOTAL POPUPS DISMISSED: {total_dismissed} ===")
+            take_debug_screenshot(self.page, 'after_all_popups_cleared')
 
-            # Third pass just to be sure
-            dismiss_stocktrak_overlays(self.page)
-
-            self._screenshot('after_popup_dismiss')
+            # Verify page is ready
+            is_ready, status = verify_page_ready(self.page, expected_url_contains='dashboard')
+            if not is_ready:
+                logger.warning(f"Page verification: {status}")
+                # Try one more aggressive popup clear
+                dismiss_stocktrak_overlays(self.page, max_attempts=5)
 
             # Check for success indicators
             success_indicators = [
@@ -293,11 +443,142 @@ class StockTrakBot:
                 return True
 
             logger.warning("Login status uncertain - check screenshots")
+            screenshot_path = take_debug_screenshot(self.page, 'login_uncertain')
+            logger.warning(f"Uncertain state screenshot: {screenshot_path}")
             return False
 
         except Exception as e:
             logger.error(f"Login exception: {e}")
-            self._screenshot('login_exception')
+            screenshot_path = take_debug_screenshot(self.page, 'login_exception')
+            logger.error(f"EXCEPTION screenshot: {screenshot_path}")
+            return False
+
+    def verify_ready_for_trading(self) -> Tuple[bool, str]:
+        """
+        Verify the bot is ready to execute trades.
+        Should be called after login and before any trading operations.
+
+        This performs:
+        1. Popup/overlay clearance
+        2. URL verification
+        3. Key element accessibility check
+        4. Screenshot for verification
+
+        Returns:
+            Tuple of (is_ready, status_message)
+        """
+        logger.info("=== VERIFYING READY FOR TRADING ===")
+        errors = []
+
+        try:
+            # Step 1: Clear any remaining popups
+            logger.info("Step 1: Clearing any remaining popups...")
+            dismissed = dismiss_stocktrak_overlays(self.page, max_attempts=5)
+            if dismissed > 0:
+                logger.info(f"Cleared {dismissed} popup(s)")
+                time.sleep(1)
+                # Try again in case more appeared
+                dismiss_stocktrak_overlays(self.page, max_attempts=3)
+
+            # Step 2: Verify URL
+            logger.info("Step 2: Verifying URL...")
+            current_url = self.page.url.lower()
+            if 'login' in current_url:
+                errors.append("Still on login page - not authenticated")
+            elif not any(x in current_url for x in ['dashboard', 'portfolio', 'trading', 'account']):
+                errors.append(f"Unexpected URL: {current_url}")
+
+            # Step 3: Check for blocking overlays
+            logger.info("Step 3: Checking for blocking overlays...")
+            blocking_selectors = [
+                "#OverlayModalPopup",
+                ".modal.show",
+                ".modal[style*='display: block']",
+                ".introjs-overlay",
+                ".shepherd-modal-overlay",
+                ".introjs-helperLayer",
+            ]
+
+            for sel in blocking_selectors:
+                try:
+                    if self.page.locator(sel).first.is_visible(timeout=500):
+                        errors.append(f"Blocking overlay still visible: {sel}")
+                        # Try to dismiss it
+                        dismiss_stocktrak_overlays(self.page, max_attempts=3)
+                except:
+                    pass
+
+            # Step 4: Check key navigation elements are accessible
+            logger.info("Step 4: Checking navigation elements...")
+            nav_selectors = [
+                "a:has-text('Portfolio')",
+                "a:has-text('Trading')",
+                "a:has-text('Dashboard')",
+                "[href*='portfolio']",
+                "[href*='trading']",
+            ]
+
+            nav_found = False
+            for sel in nav_selectors:
+                try:
+                    if self.page.locator(sel).first.is_visible(timeout=1000):
+                        nav_found = True
+                        logger.info(f"Navigation element found: {sel}")
+                        break
+                except:
+                    pass
+
+            if not nav_found:
+                errors.append("No navigation elements found - page may not be fully loaded")
+
+            # Step 5: Take verification screenshot
+            logger.info("Step 5: Taking verification screenshot...")
+            screenshot_path = take_debug_screenshot(self.page, 'verification_complete')
+
+            # Report results
+            if errors:
+                error_msg = "; ".join(errors)
+                logger.error(f"VERIFICATION FAILED: {error_msg}")
+                logger.error(f"Verification screenshot: {screenshot_path}")
+                return False, error_msg
+            else:
+                logger.info("=== VERIFICATION PASSED - READY FOR TRADING ===")
+                logger.info(f"Verification screenshot: {screenshot_path}")
+                return True, "Ready for trading"
+
+        except Exception as e:
+            screenshot_path = take_debug_screenshot(self.page, 'verification_exception')
+            error_msg = f"Verification exception: {e}"
+            logger.error(error_msg)
+            logger.error(f"Exception screenshot: {screenshot_path}")
+            return False, error_msg
+
+    def ensure_page_ready(self) -> bool:
+        """
+        Ensure the current page is ready for interaction.
+        Clears popups and verifies page state.
+
+        Returns:
+            True if page is ready, False otherwise
+        """
+        try:
+            # Clear popups
+            dismiss_stocktrak_overlays(self.page, max_attempts=3)
+            time.sleep(0.5)
+
+            # Quick verification
+            is_ready, status = verify_page_ready(self.page)
+            if not is_ready:
+                logger.warning(f"Page not ready: {status}")
+                # Try one more popup clear
+                dismiss_stocktrak_overlays(self.page, max_attempts=3)
+                time.sleep(0.5)
+                is_ready, status = verify_page_ready(self.page)
+
+            return is_ready
+
+        except Exception as e:
+            logger.error(f"ensure_page_ready error: {e}")
             return False
 
     def get_portfolio_value(self) -> Optional[float]:
@@ -308,8 +589,8 @@ class StockTrakBot:
             Portfolio value as float, or None if not found
         """
         try:
-            # Dismiss any popups first
-            dismiss_stocktrak_overlays(self.page)
+            # Ensure page is ready
+            self.ensure_page_ready()
 
             # Try common portfolio URLs
             portfolio_urls = [
@@ -323,7 +604,10 @@ class StockTrakBot:
             for url in portfolio_urls:
                 try:
                     self.page.goto(url)
-                    self.page.wait_for_load_state('networkidle')
+                    self.page.wait_for_load_state('domcontentloaded')
+                    time.sleep(1)
+                    # Clear any popups that appear on navigation
+                    dismiss_stocktrak_overlays(self.page, max_attempts=3)
                     if 'portfolio' in self.page.url.lower() or 'dashboard' in self.page.url.lower():
                         break
                 except:
@@ -387,8 +671,8 @@ class StockTrakBot:
         holdings = {}
 
         try:
-            # Dismiss any popups first
-            dismiss_stocktrak_overlays(self.page)
+            # Ensure page is ready
+            self.ensure_page_ready()
 
             # Navigate to holdings
             holdings_urls = [
@@ -983,26 +1267,80 @@ class StockTrakBot:
 
 
 def test_login():
-    """Test function to verify login works"""
+    """Test function to verify login works with full verification"""
     logging.basicConfig(level=logging.INFO)
+
+    print("\n" + "="*60)
+    print("STOCKTRAK BOT - LOGIN AND VERIFICATION TEST")
+    print("="*60)
+    print(f"Screenshot directory: {SCREENSHOT_DIR}")
+    print("="*60 + "\n")
 
     bot = StockTrakBot(headless=False)
     bot.start_browser()
 
     try:
-        if bot.login():
-            print("LOGIN SUCCESS!")
-            value = bot.get_portfolio_value()
-            print(f"Portfolio value: ${value:,.2f}" if value else "Could not get portfolio value")
+        # Step 1: Login
+        print("\n[STEP 1] Attempting login...")
+        if not bot.login():
+            print("❌ LOGIN FAILED!")
+            print(f"Check screenshots in: {SCREENSHOT_DIR}")
+            input("Press Enter to close browser...")
+            return
 
-            holdings = bot.get_current_holdings()
-            print(f"Holdings: {holdings}")
+        print("✓ Login successful!")
 
-            trades = bot.get_transaction_count()
-            print(f"Trade count: {trades}")
+        # Step 2: Verify ready for trading
+        print("\n[STEP 2] Verifying ready for trading...")
+        is_ready, status = bot.verify_ready_for_trading()
+
+        if not is_ready:
+            print(f"❌ VERIFICATION FAILED: {status}")
+            print(f"Check screenshots in: {SCREENSHOT_DIR}")
+            print("\nAttempting recovery...")
+
+            # Try one more time to clear popups
+            dismiss_stocktrak_overlays(bot.page, max_attempts=10)
+            time.sleep(2)
+
+            is_ready, status = bot.verify_ready_for_trading()
+            if not is_ready:
+                print(f"❌ Recovery failed: {status}")
+                input("Press Enter to close browser...")
+                return
+
+        print("✓ Verification passed!")
+
+        # Step 3: Get portfolio info
+        print("\n[STEP 3] Fetching portfolio information...")
+
+        value = bot.get_portfolio_value()
+        if value:
+            print(f"✓ Portfolio value: ${value:,.2f}")
         else:
-            print("LOGIN FAILED!")
+            print("⚠ Could not get portfolio value")
 
+        holdings = bot.get_current_holdings()
+        if holdings:
+            print(f"✓ Holdings ({len(holdings)} positions): {list(holdings.keys())}")
+        else:
+            print("⚠ Could not get holdings")
+
+        trades = bot.get_transaction_count()
+        print(f"✓ Trade count: {trades}")
+
+        # Summary
+        print("\n" + "="*60)
+        print("TEST COMPLETE - ALL SYSTEMS GO!")
+        print("="*60)
+        print(f"Screenshots saved in: {SCREENSHOT_DIR}")
+
+        input("\nPress Enter to close browser...")
+
+    except Exception as e:
+        print(f"\n❌ UNEXPECTED ERROR: {e}")
+        screenshot_path = take_debug_screenshot(bot.page, 'test_exception')
+        print(f"Exception screenshot: {screenshot_path}")
         input("Press Enter to close browser...")
 
     finally:
