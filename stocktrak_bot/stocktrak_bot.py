@@ -956,8 +956,8 @@ class StockTrakBot:
         """
         Navigate to canonical trade page and robustly extract capital from KPI strip.
 
-        Uses regex to find all currency values in the KPI header region,
-        since labels may not be in the same text block as values.
+        Uses regex to find money values (with or without $) in the page text.
+        The $ sign is often rendered via CSS, not in DOM text.
 
         Args:
             ticker: Any valid ticker to navigate to the trade page (default VOO)
@@ -985,104 +985,54 @@ class StockTrakBot:
         screenshot_path = take_debug_screenshot(self.page, f'trade_kpis_{ticker}')
         logger.info(f"Trade KPIs screenshot: {screenshot_path}")
 
-        # Extract currency values using regex from the page
-        # Target the header/KPI region - typically the top portion of the page
         try:
-            # Try to get text from a top container/header region
-            # StockTrak KPI strip is usually in header or top section
-            kpi_selectors = [
-                'header',
-                '.kpi-strip',
-                '.header-stats',
-                '.portfolio-stats',
-                'div[class*="header"]',
-                'div[class*="kpi"]',
-                'div[class*="stats"]',
-                'nav + div',  # First div after nav
-            ]
+            # Get ALL text from the page body
+            body_text = self.page.locator('body').inner_text()
+            logger.debug(f"Body text length: {len(body_text)}")
 
-            kpi_text = ""
-            for sel in kpi_selectors:
-                try:
-                    elem = self.page.locator(sel).first
-                    if elem.is_visible(timeout=1000):
-                        kpi_text = elem.text_content() or ""
-                        if "$" in kpi_text:
-                            logger.debug(f"Found KPI text using selector: {sel}")
-                            break
-                except:
-                    continue
+            # Regex that matches money values WITH OR WITHOUT $
+            # Matches: $500,315.16 OR 500,315.16
+            # Pattern: optional $, optional whitespace, 1-3 digits, then groups of comma+3 digits, then decimal+2 digits
+            money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})+\.\d{2})'
+            matches = re.findall(money_pattern, body_text)
 
-            # If no KPI container found, get all text from upper portion of page
-            if not kpi_text or "$" not in kpi_text:
-                # Get full page text and focus on first portion (header area)
-                full_text = self.page.content()
-                # Extract text content more cleanly
-                body_text = self.page.locator('body').text_content() or ""
-                # Take first 2000 chars which should include KPI strip
-                kpi_text = body_text[:2000]
-                logger.debug("Using page body text for KPI extraction")
+            logger.info(f"Raw money matches: {matches[:20]}")  # Log first 20 matches
 
-            # Use regex to find all currency values like $500,315.16
-            currency_pattern = r'\$[\d,]+\.\d{2}'
-            matches = re.findall(currency_pattern, kpi_text)
-
-            # Parse and filter the values
-            parsed_values = []
+            # Parse and filter to CAPITAL-SIZED values only (>= $100,000)
+            # This filters out stock prices, order totals, etc.
+            capital_values = []
             for match in matches:
-                # Remove $ and commas, convert to float
-                clean = match.replace('$', '').replace(',', '')
                 try:
-                    value = float(clean)
-                    # Filter: realistic portfolio values between $1,000 and $50,000,000
-                    if 1000 <= value <= 50000000:
-                        parsed_values.append(value)
+                    # Remove commas and parse
+                    value = float(match.replace(',', ''))
+                    # Capital-sized: between $100k and $50M
+                    if 100_000 <= value <= 50_000_000:
+                        capital_values.append(value)
                 except ValueError:
                     continue
 
-            logger.info(f"Parsed KPI currency values: {parsed_values}")
+            logger.info(f"Capital-sized values (>=$100k): {capital_values}")
 
-            # We expect at least 3 values: portfolio, cash (or another), buying power
-            # Based on screenshot, values appear in order in the KPI strip
-            if len(parsed_values) < 1:
-                raise RuntimeError(
-                    f"No valid currency values found in KPI strip. "
-                    f"Raw matches: {matches}. Screenshot: {screenshot_path}"
-                )
-
-            # Deduplicate while preserving order
-            unique_values = []
-            seen = set()
-            for v in parsed_values:
-                if v not in seen:
-                    unique_values.append(v)
-                    seen.add(v)
-
-            logger.info(f"Unique KPI values: {unique_values}")
-
-            # Map values based on position
-            # From screenshot: Portfolio Value, Cash Balance, Buying Power typically appear left-to-right
-            # Often Portfolio = Cash = Buying Power at start (all same if no trades yet)
-            if len(unique_values) >= 3:
-                portfolio_value = unique_values[0]
-                cash_balance = unique_values[1]
-                buying_power = unique_values[2]
-            elif len(unique_values) == 2:
-                # Assume first is portfolio, second is cash/buying power
-                portfolio_value = unique_values[0]
-                cash_balance = unique_values[1]
-                buying_power = unique_values[1]
-                logger.warning("Only 2 unique values found, using second for both cash and buying power")
-            elif len(unique_values) == 1:
-                # All three are likely the same (common at start)
-                portfolio_value = unique_values[0]
-                cash_balance = unique_values[0]
-                buying_power = unique_values[0]
-                logger.warning("Only 1 unique value found, using it for all three")
+            # Take the first 3 capital-sized values (portfolio, cash, buying_power)
+            if len(capital_values) >= 3:
+                portfolio_value = capital_values[0]
+                cash_balance = capital_values[1]
+                buying_power = capital_values[2]
+            elif len(capital_values) == 2:
+                portfolio_value = capital_values[0]
+                cash_balance = capital_values[1]
+                buying_power = capital_values[1]
+                logger.warning("Only 2 capital values found, using second for both cash and buying power")
+            elif len(capital_values) == 1:
+                # All three are likely the same (common at competition start)
+                portfolio_value = capital_values[0]
+                cash_balance = capital_values[0]
+                buying_power = capital_values[0]
+                logger.warning("Only 1 capital value found, using it for all three")
             else:
                 raise RuntimeError(
-                    f"Could not parse capital values from KPI strip. "
-                    f"Parsed: {parsed_values}, Unique: {unique_values}. Screenshot: {screenshot_path}"
+                    f"No capital-sized values found (>=$100k). "
+                    f"Raw matches: {matches[:10]}. Screenshot: {screenshot_path}"
                 )
 
             logger.info(f"Capital from KPIs: Portfolio=${portfolio_value:,.2f}, "
