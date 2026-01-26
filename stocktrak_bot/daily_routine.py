@@ -497,11 +497,10 @@ def execute_day1_build():
         market_data = collector.get_all_data()
         print_market_summary(market_data)
 
-        # Get portfolio value
+        # Get portfolio value - FAIL CLOSED, no assumptions
         portfolio_value = bot.get_portfolio_value()
         if portfolio_value is None:
-            portfolio_value = 1000000  # Assume $1M starting capital
-            logger.warning(f"Could not get portfolio value, assuming ${portfolio_value:,.0f}")
+            raise Exception("CRITICAL: Could not get portfolio value. Cannot proceed with Day-1 setup.")
 
         logger.info(f"Starting capital: {format_currency(portfolio_value)}")
 
@@ -620,13 +619,63 @@ def health_check():
 
 if __name__ == "__main__":
     import sys
+    import argparse
 
+    parser = argparse.ArgumentParser(
+        description='StockTrak Trading Bot - DeMiguel 1/N Methodology',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python daily_routine.py                  # Normal daily routine
+  python daily_routine.py --day1           # Day-1 portfolio build
+  python daily_routine.py --dry-run        # Test without submitting orders
+  python daily_routine.py --safe-mode      # Max 5 shares, ETFs only
+  python daily_routine.py --status         # Show bot status only
+        '''
+    )
+
+    parser.add_argument('--day1', action='store_true',
+                        help='Execute Day-1 portfolio build (initial setup)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Navigate and fill orders but never submit (test mode)')
+    parser.add_argument('--safe-mode', action='store_true',
+                        help='Safe mode: max 5 shares per order, ETFs only, stop on any error')
+    parser.add_argument('--status', action='store_true',
+                        help='Show bot status and exit (no trading)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Enable verbose/debug logging')
+
+    args = parser.parse_args()
+
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    if len(sys.argv) > 1 and sys.argv[1] == '--day1':
+    # Store flags globally for use by order functions
+    import config
+    config.DRY_RUN_MODE = args.dry_run
+    config.SAFE_MODE = args.safe_mode
+
+    if args.dry_run:
+        logger.info("=" * 60)
+        logger.info("DRY RUN MODE - Orders will NOT be submitted")
+        logger.info("=" * 60)
+
+    if args.safe_mode:
+        logger.info("=" * 60)
+        logger.info("SAFE MODE - Max 5 shares, ETFs only, fail on any error")
+        logger.info("=" * 60)
+
+    if args.status:
+        # Just show status and exit
+        state = StateManager()
+        state.print_status()
+        sys.exit(0)
+
+    if args.day1:
         execute_day1_build()
     else:
         execute_daily_routine()

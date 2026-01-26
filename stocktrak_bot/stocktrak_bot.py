@@ -15,12 +15,14 @@ from datetime import datetime
 
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 
+import config
 from config import (
     STOCKTRAK_URL, STOCKTRAK_LOGIN_URL, STOCKTRAK_USERNAME, STOCKTRAK_PASSWORD,
     HEADLESS_MODE, SLOW_MO, DEFAULT_TIMEOUT, ORDER_SUBMISSION_WAIT,
     SCREENSHOT_ON_ERROR, SCREENSHOT_ON_TRADE
 )
 from utils import parse_currency, parse_number, log_trade
+from state_manager import StateManager
 
 logger = logging.getLogger('stocktrak_bot.browser')
 
@@ -854,7 +856,102 @@ class StockTrakBot:
             logger.error(f"Error getting transaction count: {e}")
             return 0
 
-    def place_buy_order(self, ticker: str, shares: int, limit_price: float) -> Tuple[bool, str]:
+    def _trade_equities_url(self, ticker: str) -> str:
+        """
+        Build the correct trade page URL for a ticker.
+
+        StockTrak's actual trade page is:
+        /trading/equities?securitysymbol={TICKER}&exchange=US
+
+        NOT /trade or /trading/stocks (those 404).
+        """
+        return f"{self.base_url}/trading/equities?securitysymbol={ticker.upper()}&exchange=US"
+
+    def assert_on_trade_page(self, ticker: str) -> None:
+        """
+        Verify we're on the correct trade page before placing orders.
+
+        CRITICAL: This prevents silent failures when navigation fails.
+        If not on trade page, takes screenshot and raises exception.
+        """
+        required_elements = [
+            "trade",  # "Trade Equities" or similar
+            ticker.upper(),  # The ticker symbol
+        ]
+
+        page_text = self.page.content().lower()
+        ticker_lower = ticker.lower()
+
+        # Check for trade page indicators
+        is_trade_page = (
+            "trade" in page_text and
+            (ticker_lower in page_text or "symbol" in page_text)
+        )
+
+        # Also check URL
+        current_url = self.page.url.lower()
+        url_ok = "trading" in current_url and "equities" in current_url
+
+        if not (is_trade_page or url_ok):
+            screenshot_path = take_debug_screenshot(self.page, f'not_on_trade_page_{ticker}')
+            raise RuntimeError(
+                f"NOT ON VALID TRADE PAGE for {ticker}. "
+                f"URL: {self.page.url}. Screenshot: {screenshot_path}"
+            )
+
+        logger.info(f"Verified on trade page for {ticker}")
+
+    def get_capital_from_trade_page(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        Read Portfolio Value, Cash Balance, Buying Power from trade page header.
+
+        These values are reliably displayed on /trading/equities.
+
+        Returns:
+            Tuple of (portfolio_value, cash_balance, buying_power)
+        """
+        values = {
+            'portfolio': None,
+            'cash': None,
+            'buying_power': None
+        }
+
+        # Selectors for the trade page header cards
+        selectors = {
+            'portfolio': [
+                "div:has-text('Portfolio Value')",
+                ".portfolio-value",
+                "[data-label='Portfolio Value']",
+            ],
+            'cash': [
+                "div:has-text('Cash Balance')",
+                ".cash-balance",
+                "[data-label='Cash Balance']",
+            ],
+            'buying_power': [
+                "div:has-text('Buying Power')",
+                ".buying-power",
+                "[data-label='Buying Power']",
+            ]
+        }
+
+        for key, sel_list in selectors.items():
+            for sel in sel_list:
+                try:
+                    elem = self.page.locator(sel).first
+                    if elem.is_visible(timeout=1000):
+                        text = elem.text_content()
+                        value = parse_currency(text)
+                        if value and value > 0:
+                            values[key] = value
+                            logger.debug(f"Found {key}: ${value:,.2f}")
+                            break
+                except:
+                    continue
+
+        return values['portfolio'], values['cash'], values['buying_power']
+
+    def place_buy_order(self, ticker: str, shares: int, limit_price: float, dry_run: bool = False) -> Tuple[bool, str]:
         """
         Place a limit buy order.
 
@@ -862,38 +959,56 @@ class StockTrakBot:
             ticker: Stock ticker symbol
             shares: Number of shares to buy
             limit_price: Limit price per share
+            dry_run: If True, navigate and fill but don't submit
 
         Returns:
             Tuple of (success, message)
         """
-        logger.info(f"Placing BUY order: {shares} {ticker} @ ${limit_price:.2f}")
+        logger.info(f"Placing BUY order: {shares} {ticker} @ ${limit_price:.2f}" +
+                   (" [DRY RUN]" if dry_run else ""))
+
+        # IDEMPOTENCY CHECK: Prevent duplicate orders on restart
+        state = StateManager()
+        if state.already_submitted_today(ticker, 'BUY', shares, limit_price):
+            logger.warning(f"DUPLICATE ORDER BLOCKED: BUY {shares} {ticker} @ ${limit_price:.2f} already submitted today")
+            return False, "Duplicate order blocked - already submitted today"
+
+        # SAFE MODE GUARDS
+        if config.SAFE_MODE:
+            # Check whitelist
+            if ticker.upper() not in config.SAFE_MODE_ETF_WHITELIST:
+                logger.warning(f"SAFE MODE: {ticker} not in ETF whitelist - blocking order")
+                return False, f"Safe mode: {ticker} not in ETF whitelist"
+            # Enforce max shares
+            if shares > config.SAFE_MODE_MAX_SHARES:
+                logger.warning(f"SAFE MODE: Reducing shares from {shares} to {config.SAFE_MODE_MAX_SHARES}")
+                shares = config.SAFE_MODE_MAX_SHARES
+
+        # Check global DRY_RUN_MODE (overrides function parameter)
+        if config.DRY_RUN_MODE:
+            dry_run = True
 
         try:
             # Dismiss any popups first
             dismiss_stocktrak_overlays(self.page)
 
-            # Navigate to trade page
-            trade_urls = [
-                f"{self.base_url}/trading/stocks",
-                f"{self.base_url}/trade",
-                f"{self.base_url}/trading",
-                f"{self.base_url}/trade/stocks",
-                f"{self.base_url}/order",
-            ]
-
-            for url in trade_urls:
-                try:
-                    self.page.goto(url)
-                    self.page.wait_for_load_state('networkidle')
-                    if any(x in self.page.url.lower() for x in ['trade', 'order']):
-                        break
-                except:
-                    continue
-
+            # Navigate to CORRECT trade page URL
+            trade_url = self._trade_equities_url(ticker)
+            logger.info(f"Navigating to: {trade_url}")
+            self.page.goto(trade_url)
+            self.page.wait_for_load_state('domcontentloaded')
             time.sleep(2)
-            self._screenshot(f'trade_page_{ticker}')
 
-            # Fill symbol
+            # Dismiss any popups on trade page
+            dismiss_stocktrak_overlays(self.page, max_attempts=3)
+
+            # CRITICAL: Verify we're on the trade page
+            self.assert_on_trade_page(ticker)
+
+            take_debug_screenshot(self.page, f'trade_page_{ticker}')
+
+            # The symbol should already be filled from URL parameter
+            # But verify/fill if needed
             symbol_selectors = [
                 'input[name="symbol"]',
                 'input[name="ticker"]',
@@ -903,74 +1018,78 @@ class StockTrakBot:
                 'input[placeholder*="ticker" i]',
                 'input[aria-label*="symbol" i]',
             ]
-            self._try_fill(symbol_selectors, ticker)
-            time.sleep(1)
+
+            # Check if symbol is already filled
+            symbol_filled = False
+            for sel in symbol_selectors:
+                try:
+                    elem = self.page.locator(sel).first
+                    if elem.is_visible(timeout=500):
+                        current_val = elem.input_value()
+                        if ticker.upper() in current_val.upper():
+                            symbol_filled = True
+                            break
+                except:
+                    continue
+
+            if not symbol_filled:
+                self._try_fill(symbol_selectors, ticker)
+                time.sleep(1)
 
             # Select Buy action
-            action_selectors = [
-                'select[name="action"]',
-                '#action',
-                'select[name="side"]',
-                '#side',
+            buy_selectors = [
+                'input[value="buy"]',
+                'input[type="radio"][value="buy"]',
+                'button:has-text("Buy")',
+                'label:has-text("Buy")',
+                '[data-action="buy"]',
+                '#buy-radio',
+                '.buy-button',
             ]
+            self._try_click(buy_selectors)
+
+            # Also try select dropdown
+            action_selectors = ['select[name="action"]', '#action', 'select[name="side"]']
             for selector in action_selectors:
                 try:
                     if self.page.locator(selector).count() > 0:
                         self.page.select_option(selector, value='buy')
                         break
                 except:
-                    try:
-                        self.page.select_option(selector, label='Buy')
-                        break
-                    except:
-                        continue
-
-            # Also try radio buttons or tabs for buy/sell
-            buy_button_selectors = [
-                'input[value="buy"]',
-                'button:has-text("Buy")',
-                'label:has-text("Buy")',
-                '[data-action="buy"]',
-            ]
-            self._try_click(buy_button_selectors)
+                    pass
 
             # Fill quantity
             qty_selectors = [
                 'input[name="quantity"]',
                 'input[name="shares"]',
+                'input[name="qty"]',
                 '#quantity',
                 '#shares',
+                '#qty',
                 'input[placeholder*="quantity" i]',
                 'input[placeholder*="shares" i]',
+                'input[type="number"]',
             ]
             self._try_fill(qty_selectors, str(shares))
 
             # Select Limit order type
-            type_selectors = [
-                'select[name="orderType"]',
-                'select[name="order_type"]',
-                'select[name="type"]',
-                '#orderType',
-                '#order_type',
+            limit_selectors = [
+                'input[value="limit"]',
+                'input[type="radio"][value="limit"]',
+                'button:has-text("Limit")',
+                'label:has-text("Limit")',
+                '#limit-radio',
             ]
+            self._try_click(limit_selectors)
+
+            # Also try select dropdown
+            type_selectors = ['select[name="orderType"]', 'select[name="order_type"]', '#orderType']
             for selector in type_selectors:
                 try:
                     self.page.select_option(selector, value='limit')
                     break
                 except:
-                    try:
-                        self.page.select_option(selector, label='Limit')
-                        break
-                    except:
-                        continue
-
-            # Also try radio/button for order type
-            limit_selectors = [
-                'input[value="limit"]',
-                'button:has-text("Limit")',
-                'label:has-text("Limit")',
-            ]
-            self._try_click(limit_selectors)
+                    pass
 
             # Fill limit price
             price_selectors = [
@@ -981,40 +1100,39 @@ class StockTrakBot:
                 '#limit_price',
                 '#price',
                 'input[placeholder*="price" i]',
+                'input[placeholder*="limit" i]',
             ]
             self._try_fill(price_selectors, f'{limit_price:.2f}')
 
             # Select Day order duration
-            duration_selectors = [
-                'select[name="duration"]',
-                'select[name="timeInForce"]',
-                '#duration',
-                '#timeInForce',
-            ]
+            duration_selectors = ['select[name="duration"]', 'select[name="timeInForce"]', '#duration']
             for selector in duration_selectors:
                 try:
                     self.page.select_option(selector, value='day')
                     break
                 except:
-                    try:
-                        self.page.select_option(selector, label='Day')
-                        break
-                    except:
-                        continue
+                    pass
 
             time.sleep(1)
-            self._screenshot(f'order_filled_{ticker}')
+            take_debug_screenshot(self.page, f'order_filled_{ticker}')
+
+            # DRY RUN: Stop here without submitting
+            if dry_run:
+                logger.info(f"DRY RUN complete for {ticker} - order NOT submitted")
+                return True, "Dry run complete - order not submitted"
 
             # Preview order (if available)
             preview_selectors = [
                 'button:has-text("Preview")',
                 'button:has-text("Review")',
+                'button:has-text("Review Order")',
                 '#preview-btn',
+                '#review-btn',
                 'input[value="Preview"]',
             ]
             self._try_click(preview_selectors)
             time.sleep(2)
-            self._screenshot(f'order_preview_{ticker}')
+            take_debug_screenshot(self.page, f'order_preview_{ticker}')
 
             # Submit order
             submit_selectors = [
@@ -1022,6 +1140,7 @@ class StockTrakBot:
                 'button:has-text("Place Order")',
                 'button:has-text("Confirm")',
                 'button:has-text("Execute")',
+                'button:has-text("Submit Order")',
                 '#submit-btn',
                 '#place-order',
                 'input[value="Submit"]',
@@ -1030,15 +1149,16 @@ class StockTrakBot:
             submitted = self._try_click(submit_selectors)
 
             if not submitted:
-                logger.error(f"Could not find submit button for {ticker}")
-                return False, "Could not find submit button"
+                screenshot_path = take_debug_screenshot(self.page, f'order_submit_failed_{ticker}')
+                logger.error(f"Could not find submit button for {ticker}. Screenshot: {screenshot_path}")
+                return False, f"Could not find submit button. Screenshot: {screenshot_path}"
 
             time.sleep(ORDER_SUBMISSION_WAIT)
-            self._screenshot(f'order_submitted_{ticker}')
+            take_debug_screenshot(self.page, f'order_submitted_{ticker}')
 
             # Check for confirmation
             page_text = self.page.content().lower()
-            if any(word in page_text for word in ['confirmed', 'submitted', 'success', 'order placed']):
+            if any(word in page_text for word in ['confirmed', 'submitted', 'success', 'order placed', 'order received']):
                 logger.info(f"BUY order confirmed: {shares} {ticker}")
                 log_trade('BUY', ticker, shares, limit_price, 'Order submitted')
                 return True, "Order submitted successfully"
@@ -1046,7 +1166,8 @@ class StockTrakBot:
             # Check for errors
             if any(word in page_text for word in ['error', 'failed', 'invalid', 'rejected', 'insufficient']):
                 error_msg = self._extract_error_message()
-                logger.error(f"Order may have failed for {ticker}: {error_msg}")
+                screenshot_path = take_debug_screenshot(self.page, f'order_error_{ticker}')
+                logger.error(f"Order failed for {ticker}: {error_msg}. Screenshot: {screenshot_path}")
                 return False, f"Order failed: {error_msg}"
 
             # Uncertain but probably OK
@@ -1054,12 +1175,17 @@ class StockTrakBot:
             log_trade('BUY', ticker, shares, limit_price, 'Order submitted (unconfirmed)')
             return True, "Order submitted (unconfirmed)"
 
-        except Exception as e:
-            logger.error(f"Error placing buy order: {e}")
-            self._screenshot(f'order_error_{ticker}')
+        except RuntimeError as e:
+            # Trade page verification failed
+            logger.error(f"Trade page error: {e}")
             return False, str(e)
 
-    def place_sell_order(self, ticker: str, shares: int, limit_price: float) -> Tuple[bool, str]:
+        except Exception as e:
+            screenshot_path = take_debug_screenshot(self.page, f'order_exception_{ticker}')
+            logger.error(f"Error placing buy order: {e}. Screenshot: {screenshot_path}")
+            return False, f"{e}. Screenshot: {screenshot_path}"
+
+    def place_sell_order(self, ticker: str, shares: int, limit_price: float, dry_run: bool = False) -> Tuple[bool, str]:
         """
         Place a limit sell order.
 
@@ -1067,154 +1193,262 @@ class StockTrakBot:
             ticker: Stock ticker symbol
             shares: Number of shares to sell
             limit_price: Limit price per share
+            dry_run: If True, navigate and fill but don't submit
 
         Returns:
             Tuple of (success, message)
         """
-        logger.info(f"Placing SELL order: {shares} {ticker} @ ${limit_price:.2f}")
+        logger.info(f"Placing SELL order: {shares} {ticker} @ ${limit_price:.2f}" +
+                   (" [DRY RUN]" if dry_run else ""))
+
+        # IDEMPOTENCY CHECK: Prevent duplicate orders on restart
+        state = StateManager()
+        if state.already_submitted_today(ticker, 'SELL', shares, limit_price):
+            logger.warning(f"DUPLICATE ORDER BLOCKED: SELL {shares} {ticker} @ ${limit_price:.2f} already submitted today")
+            return False, "Duplicate order blocked - already submitted today"
+
+        # SAFE MODE GUARDS
+        if config.SAFE_MODE:
+            # Check whitelist
+            if ticker.upper() not in config.SAFE_MODE_ETF_WHITELIST:
+                logger.warning(f"SAFE MODE: {ticker} not in ETF whitelist - blocking sell order")
+                return False, f"Safe mode: {ticker} not in ETF whitelist"
+            # Enforce max shares
+            if shares > config.SAFE_MODE_MAX_SHARES:
+                logger.warning(f"SAFE MODE: Reducing shares from {shares} to {config.SAFE_MODE_MAX_SHARES}")
+                shares = config.SAFE_MODE_MAX_SHARES
+
+        # Check global DRY_RUN_MODE (overrides function parameter)
+        if config.DRY_RUN_MODE:
+            dry_run = True
 
         try:
             # Dismiss any popups first
             dismiss_stocktrak_overlays(self.page)
 
-            # Navigate to trade page
-            self.page.goto(f"{self.base_url}/trading/stocks")
-            self.page.wait_for_load_state('networkidle')
+            # Navigate to CORRECT trade page URL
+            trade_url = self._trade_equities_url(ticker)
+            logger.info(f"Navigating to: {trade_url}")
+            self.page.goto(trade_url)
+            self.page.wait_for_load_state('domcontentloaded')
             time.sleep(2)
 
-            # Fill symbol
+            # Dismiss any popups on trade page
+            dismiss_stocktrak_overlays(self.page, max_attempts=3)
+
+            # CRITICAL: Verify we're on the trade page
+            self.assert_on_trade_page(ticker)
+
+            take_debug_screenshot(self.page, f'sell_trade_page_{ticker}')
+
+            # The symbol should already be filled from URL parameter
+            # But verify/fill if needed
             symbol_selectors = [
                 'input[name="symbol"]',
                 'input[name="ticker"]',
                 '#symbol',
                 '#ticker',
+                'input[placeholder*="symbol" i]',
+                'input[placeholder*="ticker" i]',
             ]
-            self._try_fill(symbol_selectors, ticker)
-            time.sleep(1)
+
+            # Check if symbol is already filled
+            symbol_filled = False
+            for sel in symbol_selectors:
+                try:
+                    elem = self.page.locator(sel).first
+                    if elem.is_visible(timeout=500):
+                        current_val = elem.input_value()
+                        if ticker.upper() in current_val.upper():
+                            symbol_filled = True
+                            break
+                except:
+                    continue
+
+            if not symbol_filled:
+                self._try_fill(symbol_selectors, ticker)
+                time.sleep(1)
 
             # Select Sell action
-            action_selectors = [
-                'select[name="action"]',
-                '#action',
-                'select[name="side"]',
+            sell_selectors = [
+                'input[value="sell"]',
+                'input[type="radio"][value="sell"]',
+                'button:has-text("Sell")',
+                'label:has-text("Sell")',
+                '[data-action="sell"]',
+                '#sell-radio',
+                '.sell-button',
             ]
+            self._try_click(sell_selectors)
+
+            # Also try select dropdown
+            action_selectors = ['select[name="action"]', '#action', 'select[name="side"]']
             for selector in action_selectors:
                 try:
                     if self.page.locator(selector).count() > 0:
                         self.page.select_option(selector, value='sell')
                         break
                 except:
-                    try:
-                        self.page.select_option(selector, label='Sell')
-                        break
-                    except:
-                        continue
-
-            # Try sell button
-            sell_button_selectors = [
-                'input[value="sell"]',
-                'button:has-text("Sell")',
-                'label:has-text("Sell")',
-            ]
-            self._try_click(sell_button_selectors)
+                    pass
 
             # Fill quantity
             qty_selectors = [
                 'input[name="quantity"]',
                 'input[name="shares"]',
+                'input[name="qty"]',
                 '#quantity',
                 '#shares',
+                '#qty',
+                'input[placeholder*="quantity" i]',
+                'input[placeholder*="shares" i]',
+                'input[type="number"]',
             ]
             self._try_fill(qty_selectors, str(shares))
 
-            # Select Limit order
-            type_selectors = [
-                'select[name="orderType"]',
-                'select[name="order_type"]',
-                '#orderType',
+            # Select Limit order type
+            limit_selectors = [
+                'input[value="limit"]',
+                'input[type="radio"][value="limit"]',
+                'button:has-text("Limit")',
+                'label:has-text("Limit")',
+                '#limit-radio',
             ]
+            self._try_click(limit_selectors)
+
+            # Also try select dropdown
+            type_selectors = ['select[name="orderType"]', 'select[name="order_type"]', '#orderType']
             for selector in type_selectors:
                 try:
                     self.page.select_option(selector, value='limit')
                     break
                 except:
-                    continue
+                    pass
 
-            # Fill price
+            # Fill limit price
             price_selectors = [
                 'input[name="limitPrice"]',
+                'input[name="limit_price"]',
                 'input[name="price"]',
                 '#limitPrice',
+                '#limit_price',
                 '#price',
+                'input[placeholder*="price" i]',
+                'input[placeholder*="limit" i]',
             ]
             self._try_fill(price_selectors, f'{limit_price:.2f}')
 
-            # Duration = Day
-            duration_selectors = ['select[name="duration"]', '#duration']
+            # Select Day order duration
+            duration_selectors = ['select[name="duration"]', 'select[name="timeInForce"]', '#duration']
             for selector in duration_selectors:
                 try:
                     self.page.select_option(selector, value='day')
                     break
                 except:
-                    continue
+                    pass
 
             time.sleep(1)
-            self._screenshot(f'sell_order_filled_{ticker}')
+            take_debug_screenshot(self.page, f'sell_order_filled_{ticker}')
 
-            # Preview
-            self._try_click(['button:has-text("Preview")', 'button:has-text("Review")'])
+            # DRY RUN: Stop here without submitting
+            if dry_run:
+                logger.info(f"DRY RUN complete for SELL {ticker} - order NOT submitted")
+                return True, "Dry run complete - order not submitted"
+
+            # Preview order (if available)
+            preview_selectors = [
+                'button:has-text("Preview")',
+                'button:has-text("Review")',
+                'button:has-text("Review Order")',
+                '#preview-btn',
+                '#review-btn',
+                'input[value="Preview"]',
+            ]
+            self._try_click(preview_selectors)
             time.sleep(2)
+            take_debug_screenshot(self.page, f'sell_order_preview_{ticker}')
 
-            # Submit
+            # Submit order
             submit_selectors = [
                 'button:has-text("Submit")',
                 'button:has-text("Place Order")',
                 'button:has-text("Confirm")',
+                'button:has-text("Execute")',
+                'button:has-text("Submit Order")',
                 '#submit-btn',
+                '#place-order',
+                'input[value="Submit"]',
+                'button[type="submit"]',
             ]
-            self._try_click(submit_selectors)
+            submitted = self._try_click(submit_selectors)
+
+            if not submitted:
+                screenshot_path = take_debug_screenshot(self.page, f'sell_submit_failed_{ticker}')
+                logger.error(f"Could not find submit button for SELL {ticker}. Screenshot: {screenshot_path}")
+                return False, f"Could not find submit button. Screenshot: {screenshot_path}"
 
             time.sleep(ORDER_SUBMISSION_WAIT)
-            self._screenshot(f'sell_order_submitted_{ticker}')
+            take_debug_screenshot(self.page, f'sell_order_submitted_{ticker}')
 
-            # Check result
+            # Check for confirmation
             page_text = self.page.content().lower()
-            if any(word in page_text for word in ['confirmed', 'submitted', 'success']):
+            if any(word in page_text for word in ['confirmed', 'submitted', 'success', 'order placed', 'order received']):
                 logger.info(f"SELL order confirmed: {shares} {ticker}")
                 log_trade('SELL', ticker, shares, limit_price, 'Order submitted')
                 return True, "Sell order submitted successfully"
 
-            if any(word in page_text for word in ['error', 'failed', 'invalid']):
-                return False, "Sell order may have failed"
+            # Check for errors
+            if any(word in page_text for word in ['error', 'failed', 'invalid', 'rejected', 'insufficient']):
+                error_msg = self._extract_error_message()
+                screenshot_path = take_debug_screenshot(self.page, f'sell_order_error_{ticker}')
+                logger.error(f"SELL order failed for {ticker}: {error_msg}. Screenshot: {screenshot_path}")
+                return False, f"Order failed: {error_msg}"
 
+            # Uncertain but probably OK
+            logger.info(f"SELL order submitted (unconfirmed): {shares} {ticker}")
+            log_trade('SELL', ticker, shares, limit_price, 'Order submitted (unconfirmed)')
             return True, "Sell order submitted (unconfirmed)"
 
-        except Exception as e:
-            logger.error(f"Error placing sell order: {e}")
-            self._screenshot(f'sell_order_error_{ticker}')
+        except RuntimeError as e:
+            # Trade page verification failed
+            logger.error(f"Trade page error: {e}")
             return False, str(e)
 
-    def _try_fill(self, selectors: List[str], value: str) -> bool:
-        """Try multiple selectors to fill a form field"""
+        except Exception as e:
+            screenshot_path = take_debug_screenshot(self.page, f'sell_order_exception_{ticker}')
+            logger.error(f"Error placing sell order: {e}. Screenshot: {screenshot_path}")
+            return False, f"{e}. Screenshot: {screenshot_path}"
+
+    def _try_fill(self, selectors: List[str], value: str, timeout: int = 2000) -> bool:
+        """
+        Try multiple selectors to fill a form field.
+
+        Uses wait_for() pattern for reliability instead of count() > 0.
+        """
         for selector in selectors:
             try:
-                if self.page.locator(selector).count() > 0:
-                    self.page.fill(selector, value)
-                    logger.debug(f"Filled '{value}' with selector: {selector}")
-                    return True
+                loc = self.page.locator(selector).first
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.fill(value)
+                logger.debug(f"Filled '{value}' with selector: {selector}")
+                return True
             except Exception as e:
                 logger.debug(f"Fill failed with {selector}: {e}")
                 continue
         return False
 
-    def _try_click(self, selectors: List[str]) -> bool:
-        """Try multiple selectors to click an element"""
+    def _try_click(self, selectors: List[str], timeout: int = 2000) -> bool:
+        """
+        Try multiple selectors to click an element.
+
+        Uses wait_for() pattern for reliability instead of count() > 0.
+        """
         for selector in selectors:
             try:
-                if self.page.locator(selector).count() > 0:
-                    self.page.click(selector)
-                    logger.debug(f"Clicked with selector: {selector}")
-                    return True
+                loc = self.page.locator(selector).first
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.click()
+                logger.debug(f"Clicked with selector: {selector}")
+                return True
             except Exception as e:
                 logger.debug(f"Click failed with {selector}: {e}")
                 continue
