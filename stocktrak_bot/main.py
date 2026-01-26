@@ -87,21 +87,20 @@ def test_mode():
         if bot.login():
             print("✓ Login SUCCESS")
 
-            value = bot.get_portfolio_value()
-            if value:
-                print(f"✓ Portfolio Value: ${value:,.2f}")
-            else:
-                print("✗ Could not fetch portfolio value")
+            # Use robust KPI-based capital reading
+            try:
+                portfolio, cash, buying_power = bot.get_capital_from_trade_kpis("VOO")
+                print(f"✓ Portfolio Value: ${portfolio:,.2f}")
+                print(f"✓ Cash Balance: ${cash:,.2f}")
+                print(f"✓ Buying Power: ${buying_power:,.2f}")
+            except Exception as e:
+                print(f"✗ Could not fetch capital: {e}")
 
             holdings = bot.get_current_holdings()
             print(f"✓ Holdings: {list(holdings.keys()) if holdings else 'None'}")
 
             trades = bot.get_transaction_count()
             print(f"✓ Trade Count: {trades}")
-
-            cash = bot.get_cash_balance()
-            if cash:
-                print(f"✓ Cash Balance: ${cash:,.2f}")
         else:
             print("✗ Login FAILED - check credentials and screenshots")
             return

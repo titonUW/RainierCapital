@@ -1691,14 +1691,16 @@ def test_login():
 
         print("✓ Verification passed!")
 
-        # Step 3: Get portfolio info
-        print("\n[STEP 3] Fetching portfolio information...")
+        # Step 3: Get portfolio info from trade KPIs
+        print("\n[STEP 3] Fetching portfolio information from trade KPIs...")
 
-        value = bot.get_portfolio_value()
-        if value:
-            print(f"✓ Portfolio value: ${value:,.2f}")
-        else:
-            print("⚠ Could not get portfolio value")
+        try:
+            portfolio, cash, buying_power = bot.get_capital_from_trade_kpis("VOO")
+            print(f"✓ Portfolio value: ${portfolio:,.2f}")
+            print(f"✓ Cash balance: ${cash:,.2f}")
+            print(f"✓ Buying power: ${buying_power:,.2f}")
+        except Exception as e:
+            print(f"⚠ Could not get capital: {e}")
 
         holdings = bot.get_current_holdings()
         if holdings:
