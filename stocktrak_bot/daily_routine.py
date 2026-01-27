@@ -80,14 +80,15 @@ def execute_daily_routine():
         if not bot.login():
             raise Exception("Login failed - cannot proceed")
 
-        # Get StockTrak data
-        logger.info("Fetching portfolio data from StockTrak...")
-        portfolio_value = bot.get_portfolio_value()
+        # Get capital from trade page KPIs (robust, fail-closed)
+        logger.info("Reading capital from trade page KPIs...")
+        portfolio_value, cash_balance, buying_power = bot.get_capital_from_trade_kpis("VOO")
+        logger.info(f"Capital: Portfolio=${portfolio_value:,.2f}, Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
+
+        # Get other StockTrak data
+        logger.info("Fetching holdings and trade count...")
         stocktrak_holdings = bot.get_current_holdings()
         trade_count = bot.get_transaction_count()
-
-        if portfolio_value is None:
-            raise Exception("Could not get portfolio value")
 
         # Sync state with StockTrak
         sync_state_with_stocktrak(state, stocktrak_holdings, trade_count)
@@ -497,10 +498,10 @@ def execute_day1_build():
         market_data = collector.get_all_data()
         print_market_summary(market_data)
 
-        # Get portfolio value - FAIL CLOSED, no assumptions
-        portfolio_value = bot.get_portfolio_value()
-        if portfolio_value is None:
-            raise Exception("CRITICAL: Could not get portfolio value. Cannot proceed with Day-1 setup.")
+        # Get capital from trade page KPIs - FAIL CLOSED, no assumptions
+        logger.info("Reading capital from trade page KPIs...")
+        portfolio_value, cash_balance, buying_power = bot.get_capital_from_trade_kpis("VOO")
+        logger.info(f"Capital: Portfolio=${portfolio_value:,.2f}, Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
 
         logger.info(f"Starting capital: {format_currency(portfolio_value)}")
 
@@ -631,6 +632,7 @@ Examples:
   python daily_routine.py --dry-run        # Test without submitting orders
   python daily_routine.py --safe-mode      # Max 5 shares, ETFs only
   python daily_routine.py --status         # Show bot status only
+  python daily_routine.py --capital-test   # Test capital reading, no trading
         '''
     )
 
@@ -642,6 +644,8 @@ Examples:
                         help='Safe mode: max 5 shares per order, ETFs only, stop on any error')
     parser.add_argument('--status', action='store_true',
                         help='Show bot status and exit (no trading)')
+    parser.add_argument('--capital-test', action='store_true',
+                        help='Login and read capital from trade KPIs, then exit (no trading)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose/debug logging')
 
@@ -674,6 +678,38 @@ Examples:
         state = StateManager()
         state.print_status()
         sys.exit(0)
+
+    if args.capital_test:
+        # Test capital reading from trade KPIs
+        logger.info("=" * 60)
+        logger.info("CAPITAL TEST - Reading from trade page KPIs")
+        logger.info("=" * 60)
+        bot = None
+        try:
+            bot = StockTrakBot()
+            bot.start_browser(headless=False)  # Show browser for debugging
+
+            if not bot.login():
+                logger.error("Login failed")
+                sys.exit(1)
+
+            portfolio, cash, buying_power = bot.get_capital_from_trade_kpis("VOO")
+
+            print("\n" + "=" * 60)
+            print("CAPITAL TEST RESULTS")
+            print("=" * 60)
+            print(f"Portfolio Value:  ${portfolio:,.2f}")
+            print(f"Cash Balance:     ${cash:,.2f}")
+            print(f"Buying Power:     ${buying_power:,.2f}")
+            print("=" * 60)
+            logger.info("Capital test completed successfully")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Capital test failed: {e}")
+            sys.exit(1)
+        finally:
+            if bot:
+                bot.close()
 
     if args.day1:
         execute_day1_build()

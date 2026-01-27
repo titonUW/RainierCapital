@@ -10,6 +10,7 @@ UPDATED: Robust popup handling, page verification, and error recovery.
 import logging
 import time
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
@@ -951,6 +952,101 @@ class StockTrakBot:
 
         return values['portfolio'], values['cash'], values['buying_power']
 
+    def get_capital_from_trade_kpis(self, ticker: str = "VOO") -> Tuple[float, float, float]:
+        """
+        Navigate to canonical trade page and robustly extract capital from KPI strip.
+
+        Uses regex to find money values (with or without $) in the page text.
+        The $ sign is often rendered via CSS, not in DOM text.
+
+        Args:
+            ticker: Any valid ticker to navigate to the trade page (default VOO)
+
+        Returns:
+            Tuple of (portfolio_value, cash_balance, buying_power)
+
+        Raises:
+            RuntimeError: If cannot parse all 3 values (FAIL-CLOSED behavior)
+        """
+        logger.info(f"Reading capital from trade KPIs using ticker {ticker}...")
+
+        # Navigate to canonical trade page
+        trade_url = self._trade_equities_url(ticker)
+        logger.info(f"Navigating to: {trade_url}")
+        self.page.goto(trade_url)
+        self.page.wait_for_load_state('domcontentloaded')
+        time.sleep(2)
+
+        # Dismiss popups that may block the page
+        dismiss_stocktrak_overlays(self.page, max_attempts=5)
+        time.sleep(0.5)
+
+        # Take screenshot for debugging
+        screenshot_path = take_debug_screenshot(self.page, f'trade_kpis_{ticker}')
+        logger.info(f"Trade KPIs screenshot: {screenshot_path}")
+
+        try:
+            # Get ALL text from the page body
+            body_text = self.page.locator('body').inner_text()
+            logger.debug(f"Body text length: {len(body_text)}")
+
+            # Regex that matches money values WITH OR WITHOUT $
+            # Matches: $500,315.16 OR 500,315.16
+            # Pattern: optional $, optional whitespace, 1-3 digits, then groups of comma+3 digits, then decimal+2 digits
+            money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})+\.\d{2})'
+            matches = re.findall(money_pattern, body_text)
+
+            logger.info(f"Raw money matches: {matches[:20]}")  # Log first 20 matches
+
+            # Parse and filter to CAPITAL-SIZED values only (>= $100,000)
+            # This filters out stock prices, order totals, etc.
+            capital_values = []
+            for match in matches:
+                try:
+                    # Remove commas and parse
+                    value = float(match.replace(',', ''))
+                    # Capital-sized: between $100k and $50M
+                    if 100_000 <= value <= 50_000_000:
+                        capital_values.append(value)
+                except ValueError:
+                    continue
+
+            logger.info(f"Capital-sized values (>=$100k): {capital_values}")
+
+            # Take the first 3 capital-sized values (portfolio, cash, buying_power)
+            if len(capital_values) >= 3:
+                portfolio_value = capital_values[0]
+                cash_balance = capital_values[1]
+                buying_power = capital_values[2]
+            elif len(capital_values) == 2:
+                portfolio_value = capital_values[0]
+                cash_balance = capital_values[1]
+                buying_power = capital_values[1]
+                logger.warning("Only 2 capital values found, using second for both cash and buying power")
+            elif len(capital_values) == 1:
+                # All three are likely the same (common at competition start)
+                portfolio_value = capital_values[0]
+                cash_balance = capital_values[0]
+                buying_power = capital_values[0]
+                logger.warning("Only 1 capital value found, using it for all three")
+            else:
+                raise RuntimeError(
+                    f"No capital-sized values found (>=$100k). "
+                    f"Raw matches: {matches[:10]}. Screenshot: {screenshot_path}"
+                )
+
+            logger.info(f"Capital from KPIs: Portfolio=${portfolio_value:,.2f}, "
+                       f"Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
+
+            return portfolio_value, cash_balance, buying_power
+
+        except RuntimeError:
+            raise  # Re-raise our own errors
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to extract capital from trade KPIs: {e}. Screenshot: {screenshot_path}"
+            )
+
     def place_buy_order(self, ticker: str, shares: int, limit_price: float, dry_run: bool = False) -> Tuple[bool, str]:
         """
         Place a limit buy order.
@@ -1545,14 +1641,16 @@ def test_login():
 
         print("✓ Verification passed!")
 
-        # Step 3: Get portfolio info
-        print("\n[STEP 3] Fetching portfolio information...")
+        # Step 3: Get portfolio info from trade KPIs
+        print("\n[STEP 3] Fetching portfolio information from trade KPIs...")
 
-        value = bot.get_portfolio_value()
-        if value:
-            print(f"✓ Portfolio value: ${value:,.2f}")
-        else:
-            print("⚠ Could not get portfolio value")
+        try:
+            portfolio, cash, buying_power = bot.get_capital_from_trade_kpis("VOO")
+            print(f"✓ Portfolio value: ${portfolio:,.2f}")
+            print(f"✓ Cash balance: ${cash:,.2f}")
+            print(f"✓ Buying power: ${buying_power:,.2f}")
+        except Exception as e:
+            print(f"⚠ Could not get capital: {e}")
 
         holdings = bot.get_current_holdings()
         if holdings:
