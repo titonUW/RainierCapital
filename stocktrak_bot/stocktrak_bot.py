@@ -1155,40 +1155,34 @@ class StockTrakBot:
                 return False, f"Could not fill quantity - SHARES input not found. Screenshot: {screenshot_path}"
             time.sleep(0.5)
 
-            # Select ORDER TYPE = Limit (dropdown on StockTrak)
-            logger.info("Setting order type to Limit...")
+            # Select ORDER TYPE = MARKET (most reliable for Day-1)
+            # Limit orders have a custom JS price widget that's fragile to automate
+            logger.info("Setting order type to MARKET...")
             try:
-                # Try dropdown first
+                # Find the order type dropdown and select Market
                 order_type_dropdown = self.page.locator('select').filter(has_text='Market')
                 if order_type_dropdown.count() > 0:
-                    order_type_dropdown.first.select_option(label='Limit')
+                    order_type_dropdown.first.select_option(label='Market')
+                    logger.info("Order type set to Market")
                 else:
                     # Try other selectors
-                    for sel in ['select[name="orderType"]', 'select:near(:text("ORDER TYPE"))']:
+                    for sel in ['select[name="orderType"]', 'select']:
                         try:
-                            self.page.select_option(sel, label='Limit', timeout=3000)
-                            break
+                            dropdown = self.page.locator(sel).first
+                            if dropdown.is_visible(timeout=2000):
+                                dropdown.select_option(label='Market')
+                                logger.info("Order type set to Market via fallback")
+                                break
                         except:
                             continue
             except Exception as e:
-                logger.warning(f"Could not set order type to Limit: {e}")
+                logger.warning(f"Could not set order type: {e}, proceeding with default")
             time.sleep(0.5)
 
-            # Fill LIMIT PRICE
-            logger.info(f"Filling limit price: ${limit_price:.2f}")
-            price_filled = self._try_fill([
-                'input[placeholder*="0.00" i]',    # Price placeholder
-                'input[name="limitPrice"]',
-                'input[name="price"]',
-                'input:near(:text("LIMIT"))',
-                '#limitPrice',
-                '#price',
-            ], f'{limit_price:.2f}', timeout=8000)
-            if not price_filled:
-                logger.warning("Could not fill limit price, order may use market price")
-            time.sleep(0.5)
+            # SKIP LIMIT PRICE - Market orders don't need it
+            # The StockTrak limit price widget uses hidden inputs that are hard to automate
 
-            # Set DURATION = Good for Day (usually default)
+            # Set DURATION = Good for Day (usually default, but ensure it's set)
             try:
                 duration_dropdown = self.page.locator('select').filter(has_text='Good for')
                 if duration_dropdown.count() > 0:
@@ -1204,34 +1198,31 @@ class StockTrakBot:
                 logger.info(f"DRY RUN complete for {ticker} - order NOT submitted")
                 return True, "Dry run complete - order not submitted"
 
-            # Click REVIEW ORDER button
-            logger.info("Clicking Review Order...")
-            review_clicked = self._try_click([
-                'button:has-text("Review Order")',  # Primary on StockTrak
-                'button:has-text("Review")',
-                'button:has-text("Preview")',
-                '#review-btn',
-            ], timeout=8000)
-            if not review_clicked:
+            # Click REVIEW ORDER button - wait for it to become visible
+            logger.info("Waiting for Review Order button...")
+            try:
+                review_btn = self.page.locator("button:has-text('Review Order')")
+                review_btn.wait_for(state="visible", timeout=15000)
+                review_btn.click()
+                logger.info("Clicked Review Order")
+            except Exception as e:
                 screenshot_path = take_debug_screenshot(self.page, f'review_failed_{ticker}')
-                logger.error(f"Could not click Review Order. Screenshot: {screenshot_path}")
+                logger.error(f"Could not click Review Order: {e}. Screenshot: {screenshot_path}")
                 return False, f"Could not click Review Order. Screenshot: {screenshot_path}"
 
             time.sleep(3)  # Wait for review modal
             take_debug_screenshot(self.page, f'order_preview_{ticker}')
 
-            # Click PLACE ORDER button (final submit)
-            logger.info("Clicking Place Order...")
-            submit_clicked = self._try_click([
-                'button:has-text("Place Order")',  # Primary on StockTrak
-                'button:has-text("Confirm")',
-                'button:has-text("Submit")',
-                'button:has-text("Execute")',
-            ], timeout=8000)
-
-            if not submit_clicked:
+            # Click PLACE ORDER button - wait for it to become visible
+            logger.info("Waiting for Place Order button...")
+            try:
+                place_btn = self.page.locator("button:has-text('Place Order')")
+                place_btn.wait_for(state="visible", timeout=15000)
+                place_btn.click()
+                logger.info("Clicked Place Order")
+            except Exception as e:
                 screenshot_path = take_debug_screenshot(self.page, f'submit_failed_{ticker}')
-                logger.error(f"Could not click Place Order. Screenshot: {screenshot_path}")
+                logger.error(f"Could not click Place Order: {e}. Screenshot: {screenshot_path}")
                 return False, f"Could not click Place Order. Screenshot: {screenshot_path}"
 
             time.sleep(ORDER_SUBMISSION_WAIT)
@@ -1397,40 +1388,34 @@ class StockTrakBot:
                 return False, f"Could not fill quantity - SHARES input not found. Screenshot: {screenshot_path}"
             time.sleep(0.5)
 
-            # Select ORDER TYPE = Limit (dropdown on StockTrak)
-            logger.info("Setting order type to Limit...")
+            # Select ORDER TYPE = MARKET (most reliable)
+            # Limit orders have a custom JS price widget that's fragile to automate
+            logger.info("Setting order type to MARKET...")
             try:
-                # Try dropdown first
+                # Find the order type dropdown and select Market
                 order_type_dropdown = self.page.locator('select').filter(has_text='Market')
                 if order_type_dropdown.count() > 0:
-                    order_type_dropdown.first.select_option(label='Limit')
+                    order_type_dropdown.first.select_option(label='Market')
+                    logger.info("Order type set to Market")
                 else:
                     # Try other selectors
-                    for sel in ['select[name="orderType"]', 'select:near(:text("ORDER TYPE"))']:
+                    for sel in ['select[name="orderType"]', 'select']:
                         try:
-                            self.page.select_option(sel, label='Limit', timeout=3000)
-                            break
+                            dropdown = self.page.locator(sel).first
+                            if dropdown.is_visible(timeout=2000):
+                                dropdown.select_option(label='Market')
+                                logger.info("Order type set to Market via fallback")
+                                break
                         except:
                             continue
             except Exception as e:
-                logger.warning(f"Could not set order type to Limit: {e}")
+                logger.warning(f"Could not set order type: {e}, proceeding with default")
             time.sleep(0.5)
 
-            # Fill LIMIT PRICE
-            logger.info(f"Filling limit price: ${limit_price:.2f}")
-            price_filled = self._try_fill([
-                'input[placeholder*="0.00" i]',    # Price placeholder
-                'input[name="limitPrice"]',
-                'input[name="price"]',
-                'input:near(:text("LIMIT"))',
-                '#limitPrice',
-                '#price',
-            ], f'{limit_price:.2f}', timeout=8000)
-            if not price_filled:
-                logger.warning("Could not fill limit price, order may use market price")
-            time.sleep(0.5)
+            # SKIP LIMIT PRICE - Market orders don't need it
+            # The StockTrak limit price widget uses hidden inputs that are hard to automate
 
-            # Set DURATION = Good for Day (usually default)
+            # Set DURATION = Good for Day (usually default, but ensure it's set)
             try:
                 duration_dropdown = self.page.locator('select').filter(has_text='Good for')
                 if duration_dropdown.count() > 0:
@@ -1446,34 +1431,31 @@ class StockTrakBot:
                 logger.info(f"DRY RUN complete for SELL {ticker} - order NOT submitted")
                 return True, "Dry run complete - order not submitted"
 
-            # Click REVIEW ORDER button
-            logger.info("Clicking Review Order...")
-            review_clicked = self._try_click([
-                'button:has-text("Review Order")',  # Primary on StockTrak
-                'button:has-text("Review")',
-                'button:has-text("Preview")',
-                '#review-btn',
-            ], timeout=8000)
-            if not review_clicked:
+            # Click REVIEW ORDER button - wait for it to become visible
+            logger.info("Waiting for Review Order button...")
+            try:
+                review_btn = self.page.locator("button:has-text('Review Order')")
+                review_btn.wait_for(state="visible", timeout=15000)
+                review_btn.click()
+                logger.info("Clicked Review Order")
+            except Exception as e:
                 screenshot_path = take_debug_screenshot(self.page, f'sell_review_failed_{ticker}')
-                logger.error(f"Could not click Review Order. Screenshot: {screenshot_path}")
+                logger.error(f"Could not click Review Order: {e}. Screenshot: {screenshot_path}")
                 return False, f"Could not click Review Order. Screenshot: {screenshot_path}"
 
             time.sleep(3)  # Wait for review modal
             take_debug_screenshot(self.page, f'sell_order_preview_{ticker}')
 
-            # Click PLACE ORDER button (final submit)
-            logger.info("Clicking Place Order...")
-            submit_clicked = self._try_click([
-                'button:has-text("Place Order")',  # Primary on StockTrak
-                'button:has-text("Confirm")',
-                'button:has-text("Submit")',
-                'button:has-text("Execute")',
-            ], timeout=8000)
-
-            if not submit_clicked:
+            # Click PLACE ORDER button - wait for it to become visible
+            logger.info("Waiting for Place Order button...")
+            try:
+                place_btn = self.page.locator("button:has-text('Place Order')")
+                place_btn.wait_for(state="visible", timeout=15000)
+                place_btn.click()
+                logger.info("Clicked Place Order")
+            except Exception as e:
                 screenshot_path = take_debug_screenshot(self.page, f'sell_submit_failed_{ticker}')
-                logger.error(f"Could not click Place Order. Screenshot: {screenshot_path}")
+                logger.error(f"Could not click Place Order: {e}. Screenshot: {screenshot_path}")
                 return False, f"Could not click Place Order. Screenshot: {screenshot_path}"
 
             time.sleep(ORDER_SUBMISSION_WAIT)
