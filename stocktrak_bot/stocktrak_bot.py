@@ -1088,30 +1088,71 @@ class StockTrakBot:
 
             # Click BUY button (big green button on StockTrak)
             logger.info("Clicking Buy button...")
-            buy_clicked = self._try_click([
-                'button:has-text("Buy")',          # Primary - the big Buy button
-                'button.buy-button',
-                '[data-action="buy"]',
-                'label:has-text("Buy")',
-                'input[value="buy"]',
-            ], timeout=8000)
-            if not buy_clicked:
-                logger.warning("Could not click Buy button, may already be selected")
+            try:
+                buy_btn = self.page.locator("button:has-text('Buy')").first
+                buy_btn.wait_for(state="visible", timeout=8000)
+                buy_btn.click()
+                logger.info("Clicked Buy button")
+            except Exception as e:
+                logger.warning(f"Could not click Buy button: {e}, may already be selected")
             time.sleep(1)
 
-            # Fill QUANTITY (input near "SHARES" label or type="number")
+            # Fill QUANTITY - CRITICAL: Use SHARES-anchored locator
+            # Avoid input[type="number"] which matches hidden "amount-invest" field
             logger.info(f"Filling quantity: {shares}")
-            qty_filled = self._try_fill([
-                'input[type="number"]',            # Most reliable on this UI
-                'input[name="quantity"]',
-                'input[name="shares"]',
-                'input[placeholder*="100" i]',     # Default placeholder shows 100
-                '#quantity',
-                '#shares',
-            ], str(shares), timeout=8000)
+            qty_filled = False
+
+            # Method 1: Anchor off "SHARES" label (most reliable for this UI)
+            try:
+                shares_input = self.page.locator("text=SHARES").locator("..").locator("input").first
+                shares_input.wait_for(state="visible", timeout=8000)
+                if shares_input.is_visible():
+                    shares_input.click()
+                    shares_input.press("Control+a")  # Select all
+                    shares_input.type(str(shares))
+                    qty_filled = True
+                    logger.info(f"Filled shares using SHARES-anchored locator: {shares}")
+            except Exception as e:
+                logger.debug(f"SHARES-anchored locator failed: {e}")
+
+            # Method 2: Try ancestor search if direct parent doesn't work
+            if not qty_filled:
+                try:
+                    shares_input = self.page.locator("text=SHARES").locator("xpath=ancestor::div[1]//input").first
+                    shares_input.wait_for(state="visible", timeout=5000)
+                    if shares_input.is_visible():
+                        shares_input.click()
+                        shares_input.press("Control+a")
+                        shares_input.type(str(shares))
+                        qty_filled = True
+                        logger.info(f"Filled shares using ancestor locator: {shares}")
+                except Exception as e:
+                    logger.debug(f"Ancestor locator failed: {e}")
+
+            # Method 3: Fallback to explicit name selectors (NOT input[type="number"])
+            if not qty_filled:
+                fallback_selectors = [
+                    'input[name="shares"]',
+                    'input[name="quantity"]',
+                    '#shares',
+                    '#quantity',
+                ]
+                for sel in fallback_selectors:
+                    try:
+                        elem = self.page.locator(sel).first
+                        if elem.is_visible(timeout=2000):
+                            elem.click()
+                            elem.press("Control+a")
+                            elem.type(str(shares))
+                            qty_filled = True
+                            logger.info(f"Filled shares using fallback selector: {sel}")
+                            break
+                    except:
+                        continue
+
             if not qty_filled:
                 screenshot_path = take_debug_screenshot(self.page, f'qty_fill_failed_{ticker}')
-                return False, f"Could not fill quantity. Screenshot: {screenshot_path}"
+                return False, f"Could not fill quantity - SHARES input not found. Screenshot: {screenshot_path}"
             time.sleep(0.5)
 
             # Select ORDER TYPE = Limit (dropdown on StockTrak)
@@ -1289,30 +1330,71 @@ class StockTrakBot:
 
             # Click SELL button (button on StockTrak)
             logger.info("Clicking Sell button...")
-            sell_clicked = self._try_click([
-                'button:has-text("Sell")',          # Primary - the Sell button
-                'button.sell-button',
-                '[data-action="sell"]',
-                'label:has-text("Sell")',
-                'input[value="sell"]',
-            ], timeout=8000)
-            if not sell_clicked:
-                logger.warning("Could not click Sell button, may already be selected")
+            try:
+                sell_btn = self.page.locator("button:has-text('Sell')").first
+                sell_btn.wait_for(state="visible", timeout=8000)
+                sell_btn.click()
+                logger.info("Clicked Sell button")
+            except Exception as e:
+                logger.warning(f"Could not click Sell button: {e}, may already be selected")
             time.sleep(1)
 
-            # Fill QUANTITY (input near "SHARES" label or type="number")
+            # Fill QUANTITY - CRITICAL: Use SHARES-anchored locator
+            # Avoid input[type="number"] which matches hidden "amount-invest" field
             logger.info(f"Filling quantity: {shares}")
-            qty_filled = self._try_fill([
-                'input[type="number"]',            # Most reliable on this UI
-                'input[name="quantity"]',
-                'input[name="shares"]',
-                'input[placeholder*="100" i]',     # Default placeholder shows 100
-                '#quantity',
-                '#shares',
-            ], str(shares), timeout=8000)
+            qty_filled = False
+
+            # Method 1: Anchor off "SHARES" label (most reliable for this UI)
+            try:
+                shares_input = self.page.locator("text=SHARES").locator("..").locator("input").first
+                shares_input.wait_for(state="visible", timeout=8000)
+                if shares_input.is_visible():
+                    shares_input.click()
+                    shares_input.press("Control+a")  # Select all
+                    shares_input.type(str(shares))
+                    qty_filled = True
+                    logger.info(f"Filled shares using SHARES-anchored locator: {shares}")
+            except Exception as e:
+                logger.debug(f"SHARES-anchored locator failed: {e}")
+
+            # Method 2: Try ancestor search if direct parent doesn't work
+            if not qty_filled:
+                try:
+                    shares_input = self.page.locator("text=SHARES").locator("xpath=ancestor::div[1]//input").first
+                    shares_input.wait_for(state="visible", timeout=5000)
+                    if shares_input.is_visible():
+                        shares_input.click()
+                        shares_input.press("Control+a")
+                        shares_input.type(str(shares))
+                        qty_filled = True
+                        logger.info(f"Filled shares using ancestor locator: {shares}")
+                except Exception as e:
+                    logger.debug(f"Ancestor locator failed: {e}")
+
+            # Method 3: Fallback to explicit name selectors (NOT input[type="number"])
+            if not qty_filled:
+                fallback_selectors = [
+                    'input[name="shares"]',
+                    'input[name="quantity"]',
+                    '#shares',
+                    '#quantity',
+                ]
+                for sel in fallback_selectors:
+                    try:
+                        elem = self.page.locator(sel).first
+                        if elem.is_visible(timeout=2000):
+                            elem.click()
+                            elem.press("Control+a")
+                            elem.type(str(shares))
+                            qty_filled = True
+                            logger.info(f"Filled shares using fallback selector: {sel}")
+                            break
+                    except:
+                        continue
+
             if not qty_filled:
                 screenshot_path = take_debug_screenshot(self.page, f'sell_qty_fill_failed_{ticker}')
-                return False, f"Could not fill quantity. Screenshot: {screenshot_path}"
+                return False, f"Could not fill quantity - SHARES input not found. Screenshot: {screenshot_path}"
             time.sleep(0.5)
 
             # Select ORDER TYPE = Limit (dropdown on StockTrak)
