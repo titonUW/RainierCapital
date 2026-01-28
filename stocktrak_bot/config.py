@@ -196,6 +196,50 @@ PROHIBITED_TICKERS = [
 PROHIBITED_SUFFIXES = ['.PK', '.OB', '.TO', '.L', '.AX']  # OTC/Foreign
 
 # =============================================================================
+# WATCHLIST / UNIVERSE (Canonical, deduplicated)
+# =============================================================================
+# These define the allowed universe for satellite positions.
+# A ticker must be in WATCHLIST AND pass regime + SMA + volatility + bucket rules.
+# Keep equities and ETFs separate to prevent logic bugs.
+
+WATCHLIST_EQUITIES = [
+    "AMD",      # AI / Semis
+    "AMZN",     # Mega-cap / Growth
+    "ASTS",     # Space / High-beta
+    "DDOG",     # AI / Growth
+    "GOOGL",    # Mega-cap (Class A, more liquid)
+    "HOOD",     # Fintech
+    "IREN",     # Speculative / Narrative
+    "LLY",      # Healthcare / Defensive
+    "META",     # Mega-cap / Growth
+    "MSFT",     # Mega-cap / AI
+    "MU",       # AI / Semis
+    "NBIS",     # Speculative / Narrative
+    "NVO",      # Healthcare / Defensive
+    "NVDA",     # AI / Semis
+    "PLTR",     # AI / High-beta
+    "RKLB",     # Space / High-beta
+    "RDDT",     # Momentum / High-beta
+    "STX",      # Tech / Storage
+    "SYF",      # Financials
+    "TSLA",     # Momentum / High-beta
+    "UNH",      # Healthcare / Defensive
+    "VRT",      # AI / Infra
+    "VRTX",     # Biotech / Defensive
+    "WMT",      # Mega-cap / Stabilizer
+]
+
+WATCHLIST_ETFS = [
+    "QQQ",      # Nasdaq 100
+    "VOO",      # S&P 500
+    "VT",       # Total World
+    "XLV",      # Healthcare Sector
+]
+
+# Combined watchlist (for simple membership checks)
+WATCHLIST_ALL = WATCHLIST_EQUITIES + WATCHLIST_ETFS
+
+# =============================================================================
 # ALLOWED EXCHANGES
 # =============================================================================
 ALLOWED_EXCHANGES = ['NYSE', 'NASDAQ', 'AMEX']
@@ -220,6 +264,26 @@ def get_bucket_for_ticker(ticker):
         if ticker in bucket_tickers:
             return bucket_name
     return None
+
+
+def is_in_watchlist(ticker: str, equity_only: bool = False) -> bool:
+    """Check if ticker is in the approved watchlist.
+
+    Args:
+        ticker: The ticker symbol to check
+        equity_only: If True, only check WATCHLIST_EQUITIES (exclude ETFs)
+
+    Returns:
+        True if ticker is in the watchlist, False otherwise
+    """
+    if equity_only:
+        return ticker.upper() in WATCHLIST_EQUITIES
+    return ticker.upper() in WATCHLIST_ALL
+
+
+def is_watchlist_etf(ticker: str) -> bool:
+    """Check if ticker is specifically a watchlist ETF."""
+    return ticker.upper() in WATCHLIST_ETFS
 
 
 # =============================================================================
