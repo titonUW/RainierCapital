@@ -357,6 +357,21 @@ class ExecutionPipeline:
 
         self.page.goto(trade_url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(3)  # Give page time to fully render
+
+        # CRITICAL: Check if we got redirected to login (session expired)
+        if self._check_login_redirect():
+            logger.warning("Session expired - redirected to login. Re-authenticating...")
+            if not self.bot.login():
+                raise RuntimeError("Re-login failed after session expiration")
+            # Re-navigate to trade page
+            logger.info(f"Re-navigating to: {trade_url}")
+            self.page.goto(trade_url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(3)
+
+            # If still on login, something is very wrong
+            if self._check_login_redirect():
+                raise RuntimeError("Still redirected to login after re-authentication")
+
         self._dismiss_overlays()
 
         # Verify we're on trade page
@@ -365,10 +380,28 @@ class ExecutionPipeline:
         self._take_screenshot(f"trade_page_{order.ticker}")
         return True
 
+    def _check_login_redirect(self) -> bool:
+        """Check if we've been redirected to the login page."""
+        url = self.page.url.lower()
+        if 'login' in url:
+            return True
+        # Also check for login form elements
+        try:
+            if self.page.locator("input[type='password']").first.is_visible(timeout=1000):
+                # Check if this looks like a login page, not a trade page
+                page_text = self.page.locator('body').inner_text().lower()
+                if 'welcome back' in page_text and 'log in' in page_text:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _verify_on_trade_page(self, ticker: str):
         """Checkpoint: Verify we're on the correct trade page."""
-        # Check URL contains trading
+        # Check URL contains trading (and NOT login)
         url = self.page.url.lower()
+        if "login" in url:
+            raise RuntimeError(f"On login page, not trading page. URL: {url}")
         if "trading" not in url:
             raise RuntimeError(f"Not on trading page. URL: {url}")
 
