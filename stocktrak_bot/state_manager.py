@@ -81,8 +81,10 @@ class StateManager:
                 try:
                     with open(STATE_BACKUP_FILE, 'r') as f:
                         return json.load(f)
-                except:
-                    pass
+                except (json.JSONDecodeError, IOError) as backup_error:
+                    logger.critical(f"BOTH state files corrupted: primary={e}, backup={backup_error}")
+                    logger.critical("INITIALIZING FRESH STATE - position data will be lost!")
+
             return self._initialize_state()
 
     def _initialize_state(self) -> Dict:

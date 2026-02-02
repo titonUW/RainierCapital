@@ -32,12 +32,16 @@ class MarketDataCollector:
         """Get list of all tickers to monitor"""
         return get_all_tickers()
 
-    def get_all_data(self, tickers: List[str] = None) -> Dict:
+    def get_all_data(self, tickers: List[str] = None,
+                       max_consecutive_failures: int = 5,
+                       max_total_failures_pct: float = 0.5) -> Dict:
         """
-        Fetch all required market data.
+        Fetch all required market data with circuit breaker.
 
         Args:
             tickers: List of tickers to fetch (defaults to all)
+            max_consecutive_failures: Abort after this many consecutive failures
+            max_total_failures_pct: Abort if this percentage of tickers fail
 
         Returns:
             Dict with ticker data and VIX
@@ -48,25 +52,43 @@ class MarketDataCollector:
         data = {}
         logger.info(f"Fetching market data for {len(tickers)} tickers...")
 
-        # Get VIX first
+        # Get VIX first - CRITICAL: return None if unavailable, don't default
         data['vix'] = self._get_vix()
+        if data['vix'] is None:
+            logger.critical("VIX data unavailable - this is critical for regime detection")
 
-        # Fetch data for all tickers
+        # Fetch data for all tickers with circuit breaker
         success_count = 0
         fail_count = 0
+        consecutive_failures = 0
 
         for ticker in tickers:
+            # Circuit breaker: too many consecutive failures
+            if consecutive_failures >= max_consecutive_failures:
+                logger.critical(f"CIRCUIT BREAKER: {consecutive_failures} consecutive failures - aborting fetch")
+                break
+
             try:
                 ticker_data = self._get_ticker_data(ticker)
                 if ticker_data:
                     data[ticker] = ticker_data
                     success_count += 1
+                    consecutive_failures = 0  # Reset on success
                 else:
                     fail_count += 1
+                    consecutive_failures += 1
+                    data[ticker] = None
             except Exception as e:
                 logger.error(f"Failed to get data for {ticker}: {e}")
                 data[ticker] = None
                 fail_count += 1
+                consecutive_failures += 1
+
+            # Circuit breaker: too many total failures
+            total_attempted = success_count + fail_count
+            if total_attempted >= 5 and fail_count / total_attempted > max_total_failures_pct:
+                logger.critical(f"CIRCUIT BREAKER: {fail_count}/{total_attempted} failures exceeds threshold - aborting")
+                break
 
             # Rate limiting - be gentle with yfinance
             time.sleep(0.1)
@@ -74,12 +96,16 @@ class MarketDataCollector:
         logger.info(f"Fetched data for {success_count} tickers, {fail_count} failed")
         return data
 
-    def _get_vix(self) -> float:
+    def _get_vix(self) -> Optional[float]:
         """
         Get current VIX level.
 
         Returns:
-            VIX level or default of 18.0 if unavailable
+            VIX level or None if unavailable (NEVER defaults to 18.0)
+
+        CRITICAL: VIX is essential for regime detection. Returning a false
+        default of 18.0 could cause the bot to execute risk-on trades during
+        a SHOCK regime (VIX > 30), which is dangerous. Callers must handle None.
         """
         try:
             vix = yf.Ticker('^VIX')
@@ -90,12 +116,12 @@ class MarketDataCollector:
                 logger.info(f"VIX: {vix_level:.2f}")
                 return vix_level
             else:
-                logger.warning("No VIX history available, using default")
-                return 18.0
+                logger.critical("CRITICAL: No VIX history available - returning None")
+                return None
 
         except Exception as e:
-            logger.error(f"VIX fetch error: {e}, using default 18.0")
-            return 18.0
+            logger.critical(f"CRITICAL: VIX fetch failed - {e} - returning None")
+            return None
 
     def _get_ticker_data(self, ticker: str) -> Optional[Dict]:
         """

@@ -14,9 +14,53 @@ UPDATED (Perfection Patch):
 """
 
 import logging
+import signal
+import sys
+import threading
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import time
+from contextlib import contextmanager
+
+
+# =============================================================================
+# EXECUTION TIMEOUT - Hard cap to prevent infinite hangs
+# =============================================================================
+EXECUTION_TIMEOUT_SECONDS = 540  # 9 minutes (leave 1 minute buffer before market close)
+
+
+class ExecutionTimeoutError(Exception):
+    """Raised when execution exceeds timeout."""
+    pass
+
+
+@contextmanager
+def execution_timeout(seconds: int, error_message: str = "Execution timeout"):
+    """
+    Context manager for execution timeout.
+    Works on both Unix (signal-based) and Windows (thread-based).
+    """
+    if sys.platform == 'win32':
+        # Windows: Use threading-based timeout
+        timer = threading.Timer(seconds, lambda: (_ for _ in ()).throw(ExecutionTimeoutError(error_message)))
+        timer.daemon = True
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
+    else:
+        # Unix: Use signal-based timeout (more reliable)
+        def timeout_handler(signum, frame):
+            raise ExecutionTimeoutError(error_message)
+
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
 import config
 from config import (
@@ -96,12 +140,20 @@ def execute_daily_routine():
     4. Evaluates existing positions for exits
     5. Looks for new entry opportunities
     6. Executes trades
+
+    CRITICAL: Wrapped in execution_timeout to prevent hangs.
     """
     logger.info("=" * 70)
     logger.info(f"DAILY ROUTINE STARTED: {datetime.now()}")
+    logger.info(f"TIMEOUT: {EXECUTION_TIMEOUT_SECONDS} seconds")
     logger.info("=" * 70)
 
     state = StateManager()
+
+    # CRITICAL: Verify state integrity before proceeding
+    if not _verify_state_integrity(state):
+        logger.critical("STATE INTEGRITY CHECK FAILED - aborting execution")
+        return
 
     # Check if already ran today
     if state.already_executed_today():
@@ -115,64 +167,13 @@ def execute_daily_routine():
 
     bot = None
     try:
-        # Initialize bot
-        bot = StockTrakBot()
-        bot.start_browser(headless=True)
+        # WRAP ENTIRE EXECUTION IN TIMEOUT
+        with execution_timeout(EXECUTION_TIMEOUT_SECONDS, "Daily routine exceeded timeout"):
+            _execute_daily_routine_inner(bot, state)
 
-        if not bot.login():
-            raise Exception("Login failed - cannot proceed")
-
-        # Get capital from trade page KPIs (robust, fail-closed)
-        logger.info("Reading capital from trade page KPIs...")
-        portfolio_value, cash_balance, buying_power = bot.get_capital_from_trade_kpis("VOO")
-        logger.info(f"Capital: Portfolio=${portfolio_value:,.2f}, Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
-
-        # Get other StockTrak data
-        logger.info("Fetching holdings and trade count...")
-        stocktrak_holdings = bot.get_current_holdings()
-        trade_count = bot.get_transaction_count()
-
-        # Sync state with StockTrak
-        sync_state_with_stocktrak(state, stocktrak_holdings, trade_count)
-
-        # Get market data
-        logger.info("Fetching market data...")
-        collector = MarketDataCollector()
-        market_data = collector.get_all_data()
-
-        # Print market summary
-        print_market_summary(market_data)
-
-        # Determine regimes
-        voo_data = market_data.get('VOO', {})
-        voo_price = voo_data.get('price', 0)
-        voo_sma200 = voo_data.get('sma200') or voo_data.get('sma100')
-
-        vix_level = market_data.get('vix', 18)
-        market_regime = get_market_regime(voo_price, voo_sma200)
-        vix_regime = get_vix_regime(vix_level)
-
-        logger.info(f"Portfolio Value: {format_currency(portfolio_value)}")
-        logger.info(f"Market Regime: {market_regime}")
-        logger.info(f"VIX Regime: {vix_regime} (VIX={vix_level:.2f})")
-        logger.info(f"Trades Used: {state.get_trades_used()}/80")
-
-        # Print scoring report
-        print_scoring_report(market_data, state.get_positions())
-
-        # Execute based on regime
-        if market_regime == 'RISK_OFF':
-            execute_risk_off_mode(bot, state, market_data, portfolio_value, vix_level)
-        else:
-            execute_normal_mode(bot, state, market_data, portfolio_value, vix_level)
-
-        # Log daily value
-        state.log_daily_value(portfolio_value, vix_level)
-
-        # Mark execution complete
-        state.mark_execution()
-
-        logger.info("Daily routine completed successfully")
+    except ExecutionTimeoutError as e:
+        logger.critical(f"EXECUTION TIMEOUT: {e}")
+        state.log_error(f"Execution timeout after {EXECUTION_TIMEOUT_SECONDS}s")
 
     except Exception as e:
         logger.critical(f"CRITICAL ERROR in daily routine: {e}")
@@ -183,7 +184,143 @@ def execute_daily_routine():
 
     finally:
         if bot:
-            bot.close()
+            try:
+                bot.close()
+            except Exception:
+                pass
+
+
+def _verify_state_integrity(state: StateManager) -> bool:
+    """
+    Verify state file integrity before execution.
+
+    Returns False if state appears corrupted.
+    """
+    trades_used = state.get_trades_used()
+
+    # Check for impossible values
+    if trades_used < 0:
+        logger.critical(f"STATE CORRUPTION: trades_used is negative ({trades_used})")
+        return False
+
+    if trades_used > 100:  # Allow some buffer above 80 for edge cases
+        logger.critical(f"STATE CORRUPTION: trades_used impossibly high ({trades_used})")
+        return False
+
+    # Check positions count is reasonable
+    positions = state.get_positions()
+    if len(positions) > 50:  # Way more than our strategy would ever hold
+        logger.critical(f"STATE CORRUPTION: too many positions ({len(positions)})")
+        return False
+
+    logger.info(f"State integrity verified: {trades_used} trades, {len(positions)} positions")
+    return True
+
+
+def _execute_daily_routine_inner(bot, state: StateManager):
+    """
+    Inner execution logic (wrapped in timeout by caller).
+    """
+    # Initialize bot
+    bot = StockTrakBot()
+    bot.start_browser(headless=True)
+
+    if not bot.login():
+        raise Exception("Login failed - cannot proceed")
+
+    # Get capital from trade page KPIs (robust, fail-closed)
+    logger.info("Reading capital from trade page KPIs...")
+    try:
+        portfolio_value, cash_balance, buying_power = bot.get_capital_from_trade_kpis("VOO")
+    except Exception as e:
+        logger.critical(f"CRITICAL: Failed to read capital - {e}")
+        raise RuntimeError(f"Cannot proceed without capital data: {e}")
+
+    logger.info(f"Capital: Portfolio=${portfolio_value:,.2f}, Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
+
+    # Get other StockTrak data
+    logger.info("Fetching holdings and trade count...")
+    stocktrak_holdings = bot.get_current_holdings()
+    trade_count = bot.get_transaction_count()
+
+    # Sync state with StockTrak
+    sync_state_with_stocktrak(state, stocktrak_holdings, trade_count)
+
+    # Get market data with circuit breaker
+    logger.info("Fetching market data...")
+    collector = MarketDataCollector()
+    market_data = collector.get_all_data()
+
+    # CRITICAL: Verify we have essential data
+    if not _verify_market_data(market_data):
+        raise RuntimeError("Market data fetch failed - cannot proceed safely")
+
+    # Print market summary
+    print_market_summary(market_data)
+
+    # Determine regimes
+    voo_data = market_data.get('VOO', {})
+    voo_price = voo_data.get('price', 0)
+    voo_sma200 = voo_data.get('sma200') or voo_data.get('sma100')
+
+    # CRITICAL: VIX must be valid - no default
+    vix_level = market_data.get('vix')
+    if vix_level is None:
+        raise RuntimeError("VIX data unavailable - cannot determine regime safely")
+
+    market_regime = get_market_regime(voo_price, voo_sma200)
+    vix_regime = get_vix_regime(vix_level)
+
+    logger.info(f"Portfolio Value: {format_currency(portfolio_value)}")
+    logger.info(f"Market Regime: {market_regime}")
+    logger.info(f"VIX Regime: {vix_regime} (VIX={vix_level:.2f})")
+    logger.info(f"Trades Used: {state.get_trades_used()}/80")
+
+    # Print scoring report
+    print_scoring_report(market_data, state.get_positions())
+
+    # Execute based on regime
+    if market_regime == 'RISK_OFF':
+        execute_risk_off_mode(bot, state, market_data, portfolio_value, vix_level)
+    else:
+        execute_normal_mode(bot, state, market_data, portfolio_value, vix_level)
+
+    # Log daily value
+    state.log_daily_value(portfolio_value, vix_level)
+
+    # Mark execution complete
+    state.mark_execution()
+
+    logger.info("Daily routine completed successfully")
+
+
+def _verify_market_data(market_data: Dict) -> bool:
+    """
+    Verify we have minimum required market data.
+
+    Returns False if critical data is missing.
+    """
+    # Must have VIX
+    if market_data.get('vix') is None:
+        logger.critical("MISSING: VIX data")
+        return False
+
+    # Must have VOO for regime detection
+    voo_data = market_data.get('VOO')
+    if not voo_data or not voo_data.get('price'):
+        logger.critical("MISSING: VOO price data")
+        return False
+
+    # Count successful ticker fetches
+    total_tickers = len([k for k in market_data.keys() if k not in ('vix',)])
+    failed_tickers = len([k for k, v in market_data.items() if k != 'vix' and v is None])
+
+    if failed_tickers > total_tickers * 0.5:  # More than 50% failed
+        logger.critical(f"TOO MANY FAILURES: {failed_tickers}/{total_tickers} tickers failed")
+        return False
+
+    logger.info(f"Market data verified: {total_tickers - failed_tickers}/{total_tickers} tickers OK")
+    return True
 
 
 def is_friday() -> bool:
