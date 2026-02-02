@@ -1,0 +1,10 @@
+# FastAPI Backend Dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+watchfiles>=0.21.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
+
+# For Streamlit dashboard (alternative)
+streamlit>=1.29.0
+pandas>=2.0.0
