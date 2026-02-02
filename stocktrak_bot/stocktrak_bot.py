@@ -109,14 +109,15 @@ def run_step(page: Page, name: str, fn: Callable[[], Any], max_attempts: int = 3
 
 def dismiss_stocktrak_overlays(page, total_ms: int = 15000, max_attempts: int = None) -> int:
     """
-    Aggressively dismiss ALL popups/modals that block interaction.
-    Uses a time-based loop that keeps trying until timeout.
+    Carefully dismiss popups/modals that block interaction.
+    CRITICAL: Only click elements that are clearly dismiss buttons,
+    NOT social media links or navigation elements.
 
     Handles:
     - Robinhood promo modal ("Don't Show Again" / "Remind Me Later")
     - Site tours ("Skip" / "Skip Tour")
     - Cookie notices
-    - Any modal/overlay with close buttons
+    - Modal close buttons
 
     Args:
         page: Playwright page object
@@ -129,29 +130,38 @@ def dismiss_stocktrak_overlays(page, total_ms: int = 15000, max_attempts: int = 
     dismissed_count = 0
     end_time = time.time() + (total_ms / 1000)
 
-    # Button text patterns to match (case-insensitive)
-    button_patterns = [
-        r"don't show again",
-        r"remind me later",
-        r"skip",
-        r"skip tour",
-        r"no thanks",
-        r"got it",
-        r"close",
-        r"done",
-        r"dismiss",
-        r"ok",
-        r"end tour",
-        r"maybe later",
+    # EXCLUDED: URLs/hrefs that should NEVER be clicked
+    # These are social media or external links that would navigate away
+    excluded_href_patterns = [
+        'facebook', 'twitter', 'linkedin', 'instagram', 'youtube',
+        'mailto:', 'tel:', '/about', '/contact', '/help', '/support',
+        '/terms', '/privacy', '/faq', 'stocktrak.com/StockTrak'
     ]
 
-    # Specific CSS selectors (exact matches)
-    css_selectors = [
+    # Safe button text patterns (ONLY for actual buttons, not links)
+    safe_button_patterns = [
+        r"^don't show again$",
+        r"^remind me later$",
+        r"^skip tour$",
+        r"^skip$",
+        r"^no thanks$",
+        r"^got it$",
+        r"^close$",
+        r"^done$",
+        r"^dismiss$",
+        r"^end tour$",
+        r"^maybe later$",
+        r"^cancel$",
+        r"^×$",  # X symbol
+        r"^x$",  # letter X
+    ]
+
+    # Specific CSS selectors for known modals (SAFE - inside modals only)
+    modal_selectors = [
         # Robinhood promo modal (exact IDs)
         "#btn-dont-show-again",
         "#btn-remindlater",
         "#OverlayModalPopup button",
-        "#OverlayModalPopup a.button",
 
         # Tour library specific (Intro.js, Shepherd.js, Hopscotch)
         ".introjs-skipbutton",
@@ -165,20 +175,19 @@ def dismiss_stocktrak_overlays(page, total_ms: int = 15000, max_attempts: int = 
         ".walkthrough-skip",
         ".walkthrough-close",
 
-        # Generic modal close buttons
+        # Generic modal close buttons - MUST be inside .modal or overlay
         ".modal .close",
-        ".modal-close",
         ".modal .btn-close",
-        "button[aria-label='Close']",
-        "button[aria-label='close']",
-        "[aria-label='Close']",
-        "button.close",
-        ".btn-close",
-        ".close-button",
+        ".modal-close",
+        ".modal button.close",
+        "[role='dialog'] button[aria-label='Close']",
+        "[role='dialog'] .close",
+        ".overlay .close",
+        ".popup .close",
 
-        # X close icons
-        "button:has-text('×')",
-        "a:has-text('×')",
+        # Bootstrap modal close
+        ".modal-header .close",
+        ".modal-header .btn-close",
 
         # UI dialog close
         ".ui-dialog-titlebar-close",
@@ -188,46 +197,60 @@ def dismiss_stocktrak_overlays(page, total_ms: int = 15000, max_attempts: int = 
         closed_any = False
 
         # Method 1: Click buttons by accessible name (role=button)
-        for pattern in button_patterns:
+        # Buttons are generally safe - they don't navigate away
+        for pattern in safe_button_patterns:
             try:
                 btn = page.get_by_role("button", name=re.compile(pattern, re.I)).first
-                if btn.is_visible(timeout=500):
-                    btn.click(force=True, timeout=1500)
+                if btn.is_visible(timeout=300):
+                    btn.click(force=True, timeout=1000)
                     dismissed_count += 1
                     closed_any = True
-                    logger.info(f"Dismissed popup #{dismissed_count} via button pattern: {pattern}")
-            except:
+                    logger.info(f"Dismissed popup #{dismissed_count} via button: {pattern}")
+                    time.sleep(0.2)
+            except Exception:
                 pass
 
-        # Method 2: Click links by text (for <a> tags styled as buttons)
-        for pattern in button_patterns:
-            try:
-                link = page.get_by_role("link", name=re.compile(pattern, re.I)).first
-                if link.is_visible(timeout=500):
-                    link.click(force=True, timeout=1500)
-                    dismissed_count += 1
-                    closed_any = True
-                    logger.info(f"Dismissed popup #{dismissed_count} via link pattern: {pattern}")
-            except:
-                pass
-
-        # Method 3: Click specific CSS selectors
-        for sel in css_selectors:
+        # Method 2: Click specific modal CSS selectors
+        for sel in modal_selectors:
             try:
                 loc = page.locator(sel).first
-                if loc.is_visible(timeout=300):
+                if loc.is_visible(timeout=200):
                     loc.click(force=True, timeout=800)
                     dismissed_count += 1
                     closed_any = True
                     logger.info(f"Dismissed popup #{dismissed_count} via selector: {sel}")
                     time.sleep(0.2)
-            except:
+            except Exception:
                 pass
 
-        # Method 4: ESC key closes many modals
+        # Method 3: ESC key closes many modals (SAFE)
         try:
             page.keyboard.press("Escape")
-        except:
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        # Method 4: Look for links ONLY inside modals/overlays
+        # Check if there's an active modal first
+        try:
+            modal = page.locator(".modal:visible, [role='dialog']:visible, .overlay:visible, #OverlayModalPopup:visible").first
+            if modal.is_visible(timeout=200):
+                # Only look for dismiss links INSIDE the modal
+                for pattern in [r"skip", r"close", r"no thanks", r"maybe later", r"remind me"]:
+                    try:
+                        link = modal.get_by_role("link", name=re.compile(pattern, re.I)).first
+                        if link.is_visible(timeout=200):
+                            # CRITICAL: Verify link doesn't go to social media
+                            href = link.get_attribute("href") or ""
+                            if not any(excluded in href.lower() for excluded in excluded_href_patterns):
+                                link.click(force=True, timeout=800)
+                                dismissed_count += 1
+                                closed_any = True
+                                logger.info(f"Dismissed popup #{dismissed_count} via modal link: {pattern}")
+                                time.sleep(0.2)
+                    except Exception:
+                        pass
+        except Exception:
             pass
 
         # If nothing was closed this iteration, we might be done
@@ -235,7 +258,7 @@ def dismiss_stocktrak_overlays(page, total_ms: int = 15000, max_attempts: int = 
             break
 
         # Small delay between iterations
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(200)
 
     if dismissed_count > 0:
         logger.info(f"Total popups dismissed: {dismissed_count}")
@@ -367,7 +390,8 @@ class StockTrakBot:
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
             self.browser = None  # Persistent context doesn't use separate browser
-            # Use the default page or create one
+            # Close all tabs except one, and use that one
+            self._close_extra_tabs()
             if self.context.pages:
                 self.page = self.context.pages[0]
             else:
@@ -404,10 +428,25 @@ class StockTrakBot:
         logger.info("Attempting login to StockTrak...")
 
         try:
+            # First, close any extra tabs that might be open from previous sessions
+            self._close_extra_tabs()
+
             # Navigate to login page
             self.page.goto(STOCKTRAK_LOGIN_URL, wait_until="domcontentloaded")
+
+            # CRITICAL: Verify we're still on StockTrak before dismissing popups
+            if not self._ensure_on_stocktrak():
+                logger.error("Failed to reach StockTrak login page")
+                return False
+
+            # Now safe to dismiss popups (they're StockTrak popups, not external sites)
             dismiss_stocktrak_overlays(self.page, total_ms=10000)
             time.sleep(1)
+
+            # CRITICAL: Verify we didn't navigate away during popup dismissal
+            if not self._ensure_on_stocktrak():
+                logger.error("Navigated away from StockTrak during popup dismissal!")
+                return False
 
             # Screenshot for debugging
             take_debug_screenshot(self.page, 'login_page')
@@ -480,10 +519,20 @@ class StockTrakBot:
             logger.info("Waiting for page to load after login...")
             self.page.wait_for_load_state('networkidle', timeout=60000)  # 60s max
 
+            # CRITICAL: Verify we're still on StockTrak after login
+            if not self._ensure_on_stocktrak():
+                logger.error("Not on StockTrak after login attempt!")
+                return False
+
             # Clear popups (time-based, more robust)
             logger.info("=== CLEARING POPUPS ===")
             total_dismissed = dismiss_stocktrak_overlays(self.page, total_ms=20000)
             logger.info(f"=== TOTAL POPUPS DISMISSED: {total_dismissed} ===")
+
+            # CRITICAL: Verify we didn't navigate away during popup dismissal
+            if not self._ensure_on_stocktrak():
+                logger.error("Navigated away from StockTrak during post-login popup dismissal!")
+                return False
 
             take_debug_screenshot(self.page, 'after_login_popups_cleared')
 
@@ -540,6 +589,61 @@ class StockTrakBot:
             logger.error(f"Login exception: {e}")
             screenshot_path = take_debug_screenshot(self.page, 'login_exception')
             logger.error(f"EXCEPTION screenshot: {screenshot_path}")
+            return False
+
+    def _close_extra_tabs(self):
+        """
+        Close all tabs except the first one.
+        Prevents issues from social media links opening new tabs.
+        """
+        if not self.context:
+            return
+
+        pages = self.context.pages
+        if len(pages) <= 1:
+            return
+
+        logger.info(f"Found {len(pages)} tabs open - closing extras")
+        # Keep only the first page, close the rest
+        for page in pages[1:]:
+            try:
+                url = page.url
+                logger.info(f"Closing extra tab: {url}")
+                page.close()
+            except Exception as e:
+                logger.warning(f"Could not close tab: {e}")
+
+    def _ensure_on_stocktrak(self) -> bool:
+        """
+        Verify we're on a stocktrak.com domain, navigate back if not.
+
+        Returns:
+            True if on StockTrak (or navigated back successfully)
+        """
+        if not self.page:
+            return False
+
+        current_url = self.page.url.lower()
+        valid_domains = ['stocktrak.com', 'app.stocktrak.com']
+
+        # Check if we're on a valid domain
+        if any(domain in current_url for domain in valid_domains):
+            return True
+
+        # We're on the wrong site - this is a problem
+        logger.warning(f"NOT ON STOCKTRAK! Current URL: {current_url}")
+
+        # Close any extra tabs that might have opened
+        self._close_extra_tabs()
+
+        # Try to navigate back to StockTrak
+        try:
+            logger.info("Navigating back to StockTrak...")
+            self.page.goto(STOCKTRAK_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(1)
+            return 'stocktrak.com' in self.page.url.lower()
+        except Exception as e:
+            logger.error(f"Could not navigate back to StockTrak: {e}")
             return False
 
     def verify_ready_for_trading(self) -> Tuple[bool, str]:
