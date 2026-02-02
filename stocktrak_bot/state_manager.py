@@ -25,6 +25,10 @@ logger = logging.getLogger('stocktrak_bot.state_manager')
 
 STATE_FILE = 'bot_state.json'
 STATE_BACKUP_FILE = 'bot_state_backup.json'
+DASHBOARD_STATE_FILE = os.path.join(os.path.dirname(__file__), 'state', 'dashboard_state.json')
+
+# Ensure state directory exists
+os.makedirs(os.path.dirname(DASHBOARD_STATE_FILE), exist_ok=True)
 
 
 @dataclass
@@ -319,6 +323,66 @@ class StateManager:
     def get_daily_values(self) -> List[Dict]:
         """Get daily portfolio value history"""
         return self.state.get('daily_values', [])
+
+    def write_dashboard_state(self, running: bool = False, mode: str = "IDLE",
+                               step: str = None, error: str = None,
+                               regime: str = "UNKNOWN", vix: float = None,
+                               last_screenshot: str = None, run_id: str = None):
+        """
+        Write a dashboard-friendly state file for the UI to read.
+
+        This is called frequently during bot execution to give real-time visibility.
+
+        Args:
+            running: Is the bot currently executing?
+            mode: Current mode (TEST, DRY-RUN, LIVE, IDLE)
+            step: Current step name (LOGIN, NAVIGATE, FILL_ORDER, etc.)
+            error: Last error message if any
+            regime: Current market regime (RISK-ON, RISK-OFF, etc.)
+            vix: Current VIX value
+            last_screenshot: Path to most recent screenshot
+            run_id: Unique run identifier
+        """
+        positions = self.get_positions()
+        positions_list = [
+            {
+                "ticker": ticker,
+                "shares": pos.get("shares", 0),
+                "entry_price": pos.get("entry_price", 0),
+                "bucket": pos.get("bucket"),
+            }
+            for ticker, pos in positions.items()
+        ]
+
+        recent_trades = self.get_trade_log()[-20:] if self.get_trade_log() else []
+
+        dashboard_state = {
+            "running": running,
+            "mode": mode,
+            "step": step,
+            "run_id": run_id,
+            "last_update": datetime.now().isoformat(),
+            "last_result": "OK" if not error else "FAIL",
+            "error": error,
+            "trades_used": self.get_trades_used(),
+            "trades_remaining": self.get_trades_remaining(),
+            "regime": regime,
+            "vix": vix,
+            "positions_count": len(positions),
+            "positions": positions_list,
+            "recent_trades": recent_trades,
+            "last_screenshot": last_screenshot,
+            "last_execution_date": self.state.get("last_execution_date"),
+            "last_execution_time": self.state.get("last_execution_time"),
+            "error_count": self.state.get("error_count", 0),
+        }
+
+        try:
+            with open(DASHBOARD_STATE_FILE, 'w') as f:
+                json.dump(dashboard_state, f, indent=2, default=str)
+            logger.debug(f"Dashboard state written to {DASHBOARD_STATE_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not write dashboard state: {e}")
 
     def print_status(self):
         """Print current bot status"""
