@@ -39,6 +39,10 @@ env/
 stocktrak_bot/logs/
 *.log
 
+# Playwright persistent browser profile (contains cookies/session)
+stocktrak_bot/.pw_profile/
+.pw_profile/
+
 # State files (contains position data)
 bot_state.json
 stocktrak_bot/bot_state.json
