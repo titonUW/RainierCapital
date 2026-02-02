@@ -1817,68 +1817,66 @@ class StockTrakBot:
         """
         Check if we're already logged in (e.g., from persistent session).
 
-        CRITICAL: This must reliably detect logged-in state to avoid
-        trying to fill login forms when already on the dashboard.
+        CRITICAL: Must NOT use "Welcome back" - that text appears on the
+        LOGIN PAGE itself ("Welcome back! Log in..."). This was causing
+        false positives.
 
         Returns:
             True if logged-in indicators are visible
         """
-        # First check: URL-based detection (fastest)
         current_url = self.page.url.lower()
-        if 'dashboard' in current_url or 'portfolio' in current_url or 'trading' in current_url:
-            # We're on a page that requires login - likely logged in
-            logger.info(f"URL suggests logged in: {current_url}")
 
-            # Verify with a quick element check
-            try:
-                if self.page.locator("text=Logout").first.is_visible(timeout=3000):
-                    logger.info("Confirmed logged in via Logout button")
-                    return True
-            except Exception:
-                pass
+        # FIRST: If URL contains "login", we're definitely NOT logged in
+        if '/login' in current_url:
+            logger.info(f"On login page - NOT logged in: {current_url}")
+            return False
 
-            try:
-                if self.page.locator("text=Welcome back").first.is_visible(timeout=2000):
-                    logger.info("Confirmed logged in via Welcome message")
-                    return True
-            except Exception:
-                pass
-
-            # If URL looks right but can't confirm, assume logged in
-            if 'dashboard' in current_url:
-                logger.info("Assuming logged in based on dashboard URL")
-                return True
-
-        # Element-based indicators (more thorough check)
-        logged_in_indicators = [
-            "text=Welcome back",
-            "text=My Dashboard",
-            "text=Portfolio Simulation",
-            "text=My Portfolio",
-            "text=Logout",
-            "text=Trading Portfolio",
-            "text=View Portfolio",
-            "text=Open Positions",
-            "text=PORTFOLIO VALUE",
-        ]
-
-        for indicator in logged_in_indicators:
-            try:
-                if self.page.locator(indicator).first.is_visible(timeout=1500):
-                    logger.info(f"Logged in indicator found: {indicator}")
-                    return True
-            except Exception:
-                pass
-
-        # Check for login form - if it exists, we're NOT logged in
+        # Check for Logout link - this ONLY exists when authenticated
         try:
-            login_form = self.page.locator("input[type='password']").first
-            if login_form.is_visible(timeout=1000):
-                logger.info("Login form detected - NOT logged in")
-                return False
+            logout_link = self.page.get_by_role("link", name=re.compile("logout", re.I))
+            if logout_link.count() > 0 and logout_link.first.is_visible(timeout=3000):
+                logger.info("Confirmed logged in via Logout link")
+                return True
         except Exception:
             pass
 
+        # Check for authenticated-only content
+        authenticated_indicators = [
+            # These ONLY appear when logged in, never on login page
+            "text=PORTFOLIO VALUE",
+            "text=BUYING POWER",
+            "text=CASH BALANCE",
+            "text=Open Positions",
+            "text=Closed Positions",
+            "text=Transaction History",
+            "text=My Dashboard",
+        ]
+
+        for indicator in authenticated_indicators:
+            try:
+                if self.page.locator(indicator).first.is_visible(timeout=1500):
+                    logger.info(f"Confirmed logged in via: {indicator}")
+                    return True
+            except Exception:
+                pass
+
+        # URL-based check (only if NOT on login page)
+        if 'dashboard' in current_url or 'portfolio' in current_url or 'trading' in current_url:
+            # On an authenticated URL - check for password field
+            # If password field exists, we're on login page (redirected)
+            try:
+                if self.page.locator("input[type='password']").first.is_visible(timeout=1000):
+                    logger.info("Password field visible - on login page, NOT logged in")
+                    return False
+            except Exception:
+                pass
+
+            # No password field and on authenticated URL = probably logged in
+            logger.info(f"On authenticated URL without login form: {current_url}")
+            return True
+
+        # Default: not logged in
+        logger.info("No login indicators found - NOT logged in")
         return False
 
     def verify_trade_in_history(self, ticker: str, side: str, shares: int) -> Tuple[bool, str]:
