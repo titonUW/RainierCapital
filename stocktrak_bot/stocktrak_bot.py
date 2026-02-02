@@ -1186,6 +1186,23 @@ class StockTrakBot:
         self.page.wait_for_load_state('domcontentloaded')
         time.sleep(2)
 
+        # CRITICAL: Check if we got redirected to login page (session expired)
+        current_url = self.page.url.lower()
+        if 'login' in current_url:
+            logger.warning("Session expired - redirected to login page. Re-authenticating...")
+            # We need to login again
+            if not self.login():
+                raise RuntimeError("Re-login failed after session expiration")
+            # Now navigate back to trade page
+            logger.info(f"Re-navigating to: {trade_url}")
+            self.page.goto(trade_url)
+            self.page.wait_for_load_state('domcontentloaded')
+            time.sleep(2)
+
+            # Check again - if still on login, something is wrong
+            if 'login' in self.page.url.lower():
+                raise RuntimeError("Still on login page after re-authentication")
+
         # Dismiss popups that may block the page
         dismiss_stocktrak_overlays(self.page, max_attempts=5)
         time.sleep(0.5)
