@@ -492,7 +492,15 @@ class StockTrakBot:
             # Fill username
             username_filled = self._try_fill(username_selectors, self.username)
             if not username_filled:
-                logger.error("Could not find username field")
+                # CRITICAL: Before failing, check if we're actually logged in
+                # (login page may have redirected to dashboard)
+                logger.warning("Could not find username field - checking if already logged in...")
+                if self._check_logged_in():
+                    logger.info("Actually already logged in - no login form needed!")
+                    self.logged_in = True
+                    return True
+                # Not logged in and can't find form - real error
+                logger.error("Could not find username field and not logged in")
                 screenshot_path = take_debug_screenshot(self.page, 'login_error_username')
                 logger.error(f"ERROR screenshot: {screenshot_path}")
                 return False
@@ -500,6 +508,12 @@ class StockTrakBot:
             # Fill password
             password_filled = self._try_fill(password_selectors, self.password)
             if not password_filled:
+                # Same check - maybe we got logged in somehow
+                logger.warning("Could not find password field - checking if already logged in...")
+                if self._check_logged_in():
+                    logger.info("Actually already logged in!")
+                    self.logged_in = True
+                    return True
                 logger.error("Could not find password field")
                 screenshot_path = take_debug_screenshot(self.page, 'login_error_password')
                 logger.error(f"ERROR screenshot: {screenshot_path}")
@@ -1758,23 +1772,67 @@ class StockTrakBot:
         """
         Check if we're already logged in (e.g., from persistent session).
 
+        CRITICAL: This must reliably detect logged-in state to avoid
+        trying to fill login forms when already on the dashboard.
+
         Returns:
             True if logged-in indicators are visible
         """
+        # First check: URL-based detection (fastest)
+        current_url = self.page.url.lower()
+        if 'dashboard' in current_url or 'portfolio' in current_url or 'trading' in current_url:
+            # We're on a page that requires login - likely logged in
+            logger.info(f"URL suggests logged in: {current_url}")
+
+            # Verify with a quick element check
+            try:
+                if self.page.locator("text=Logout").first.is_visible(timeout=3000):
+                    logger.info("Confirmed logged in via Logout button")
+                    return True
+            except Exception:
+                pass
+
+            try:
+                if self.page.locator("text=Welcome back").first.is_visible(timeout=2000):
+                    logger.info("Confirmed logged in via Welcome message")
+                    return True
+            except Exception:
+                pass
+
+            # If URL looks right but can't confirm, assume logged in
+            if 'dashboard' in current_url:
+                logger.info("Assuming logged in based on dashboard URL")
+                return True
+
+        # Element-based indicators (more thorough check)
         logged_in_indicators = [
+            "text=Welcome back",
+            "text=My Dashboard",
             "text=Portfolio Simulation",
             "text=My Portfolio",
             "text=Logout",
-            "text=Trading",
+            "text=Trading Portfolio",
+            "text=View Portfolio",
+            "text=Open Positions",
+            "text=PORTFOLIO VALUE",
         ]
 
         for indicator in logged_in_indicators:
             try:
-                if self.page.locator(indicator).first.is_visible(timeout=2000):
-                    logger.debug(f"Logged in indicator found: {indicator}")
+                if self.page.locator(indicator).first.is_visible(timeout=1500):
+                    logger.info(f"Logged in indicator found: {indicator}")
                     return True
-            except:
+            except Exception:
                 pass
+
+        # Check for login form - if it exists, we're NOT logged in
+        try:
+            login_form = self.page.locator("input[type='password']").first
+            if login_form.is_visible(timeout=1000):
+                logger.info("Login form detected - NOT logged in")
+                return False
+        except Exception:
+            pass
 
         return False
 
