@@ -383,7 +383,7 @@ class ExecutionPipeline:
         logger.info(f"Using URL: {trade_url}")
 
         self.page.goto(trade_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(3)  # Give page time to fully render
+        time.sleep(2)  # Give page time to fully render
 
         # CRITICAL: Check if we got redirected to login (session expired)
         if self._check_login_redirect():
@@ -393,7 +393,7 @@ class ExecutionPipeline:
             # Re-navigate to trade page
             logger.info(f"Re-navigating to: {trade_url}")
             self.page.goto(trade_url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(3)
+            time.sleep(2)
 
             # If still on login, something is very wrong
             if self._check_login_redirect():
