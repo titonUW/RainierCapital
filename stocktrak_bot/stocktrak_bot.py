@@ -11,12 +11,19 @@ import logging
 import time
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Callable, Any
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 
 import config
+
+# =============================================================================
+# PERSISTENT BROWSER PROFILE (popups won't come back after "Don't show again")
+# =============================================================================
+PROFILE_DIR = Path(__file__).resolve().parent / ".pw_profile"
+PROFILE_DIR.mkdir(exist_ok=True)
 from config import (
     STOCKTRAK_URL, STOCKTRAK_LOGIN_URL, STOCKTRAK_USERNAME, STOCKTRAK_PASSWORD,
     HEADLESS_MODE, SLOW_MO, DEFAULT_TIMEOUT, ORDER_SUBMISSION_WAIT,
@@ -32,70 +39,126 @@ SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs'
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
-def dismiss_stocktrak_overlays(page, max_attempts: int = 5) -> int:
+# =============================================================================
+# STALL-PROOF WRAPPER: Every step has a hard timeout + retries
+# =============================================================================
+def run_step(page: Page, name: str, fn: Callable[[], Any], max_attempts: int = 3,
+             reset_url: str = "https://app.stocktrak.com/dashboard/standard") -> Any:
+    """
+    Execute a step with retries, screenshots on failure, and hard reset between attempts.
+
+    This is the "no more stalls" wrapper. Every step either completes or fails fast
+    with artifacts (screenshots + logs).
+
+    Args:
+        page: Playwright page object
+        name: Step name for logging/screenshots
+        fn: The function to execute (takes no args)
+        max_attempts: Maximum retry attempts
+        reset_url: URL to navigate to on failure reset
+
+    Returns:
+        The return value of fn() on success
+
+    Raises:
+        Exception: Re-raises the last exception after all attempts fail
+    """
+    last_exception = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"[{name}] Attempt {attempt}/{max_attempts}")
+            result = fn()
+            logger.info(f"[{name}] SUCCESS on attempt {attempt}")
+            return result
+
+        except Exception as e:
+            last_exception = e
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logger.warning(f"[{name}] FAILED attempt {attempt}: {e}")
+
+            # Take failure screenshot
+            try:
+                screenshot_path = os.path.join(SCREENSHOT_DIR, f"{name}_fail_{attempt}_{ts}.png")
+                page.screenshot(path=screenshot_path, full_page=True)
+                logger.info(f"[{name}] Failure screenshot: {screenshot_path}")
+            except Exception as ss_err:
+                logger.debug(f"[{name}] Could not take screenshot: {ss_err}")
+
+            # Log current URL and title for debugging
+            try:
+                logger.info(f"[{name}] Current URL: {page.url}")
+                logger.info(f"[{name}] Current title: {page.title()}")
+            except:
+                pass
+
+            # Hard reset between retries (navigate to dashboard)
+            if attempt < max_attempts:
+                try:
+                    logger.info(f"[{name}] Resetting to {reset_url}...")
+                    page.goto(reset_url, wait_until="domcontentloaded", timeout=60000)
+                    dismiss_stocktrak_overlays(page, total_ms=10000)
+                    time.sleep(1)
+                except Exception as reset_err:
+                    logger.warning(f"[{name}] Reset failed: {reset_err}")
+
+    # All attempts exhausted
+    logger.error(f"[{name}] FAILED after {max_attempts} attempts")
+    raise last_exception
+
+
+def dismiss_stocktrak_overlays(page, total_ms: int = 15000, max_attempts: int = None) -> int:
     """
     Aggressively dismiss ALL popups/modals that block interaction.
+    Uses a time-based loop that keeps trying until timeout.
 
     Handles:
-    - Robinhood promo modal
-    - Site tours (multiple steps)
+    - Robinhood promo modal ("Don't Show Again" / "Remind Me Later")
+    - Site tours ("Skip" / "Skip Tour")
     - Cookie notices
     - Any modal/overlay with close buttons
 
     Args:
         page: Playwright page object
-        max_attempts: Maximum number of dismiss cycles
+        total_ms: Total milliseconds to spend dismissing (default 15s)
+        max_attempts: Deprecated, use total_ms instead
 
     Returns:
         Number of popups dismissed
     """
     dismissed_count = 0
+    end_time = time.time() + (total_ms / 1000)
 
-    # All known selectors for StockTrak popups
-    all_dismiss_selectors = [
-        # Robinhood promo modal (exact IDs from inspection)
+    # Button text patterns to match (case-insensitive)
+    button_patterns = [
+        r"don't show again",
+        r"remind me later",
+        r"skip",
+        r"skip tour",
+        r"no thanks",
+        r"got it",
+        r"close",
+        r"done",
+        r"dismiss",
+        r"ok",
+        r"end tour",
+        r"maybe later",
+    ]
+
+    # Specific CSS selectors (exact matches)
+    css_selectors = [
+        # Robinhood promo modal (exact IDs)
         "#btn-dont-show-again",
         "#btn-remindlater",
         "#OverlayModalPopup button",
         "#OverlayModalPopup a.button",
 
-        # Generic Ok/Close buttons
-        "button:has-text('Ok')",
-        "button:has-text('OK')",
-        "button:has-text('Close')",
-        "button:has-text('Done')",
-        "button:has-text('Got it')",
-        "button:has-text('Dismiss')",
-        "a:has-text('Ok')",
-        "a:has-text('OK')",
-        "a:has-text('Close')",
-        "a:has-text(\"Don't Show Again\")",
-        "a:has-text(\"Remind Me Later\")",
-
-        # Site tour selectors
-        "button:has-text('Skip')",
-        "button:has-text('Skip Tour')",
-        "button:has-text('Skip tour')",
-        "button:has-text('End Tour')",
-        "button:has-text('End tour')",
-        "button:has-text('No Thanks')",
-        "button:has-text('No thanks')",
-        "button:has-text('Maybe Later')",
-        "button:has-text('Next')",  # Click through tour if Skip not available
-        "a:has-text('Skip')",
-        "a:has-text('Skip Tour')",
-        "a:has-text('No Thanks')",
-
         # Tour library specific (Intro.js, Shepherd.js, Hopscotch)
         ".introjs-skipbutton",
         ".introjs-donebutton",
-        ".introjs-button.introjs-skipbutton",
         ".shepherd-cancel-icon",
         ".shepherd-button-secondary",
-        ".shepherd-button:has-text('Skip')",
-        ".shepherd-button:has-text('Exit')",
         ".hopscotch-bubble-close",
-        ".hopscotch-cta:has-text('Skip')",
         ".tour-skip",
         ".tour-close",
         ".tour-end",
@@ -106,63 +169,73 @@ def dismiss_stocktrak_overlays(page, max_attempts: int = 5) -> int:
         ".modal .close",
         ".modal-close",
         ".modal .btn-close",
-        ".modal [aria-label='Close']",
         "button[aria-label='Close']",
         "button[aria-label='close']",
         "[aria-label='Close']",
-        "[aria-label='close']",
         "button.close",
-        "button.close-button",
-        ".close-button",
         ".btn-close",
+        ".close-button",
+
+        # X close icons
         "button:has-text('×')",
         "a:has-text('×')",
-        ".modal button.btn-secondary",
 
-        # Overlay/backdrop clicks (last resort)
-        ".modal-backdrop",
-        ".overlay-close",
+        # UI dialog close
+        ".ui-dialog-titlebar-close",
     ]
 
-    for attempt in range(max_attempts):
-        found_any = False
+    while time.time() < end_time:
+        closed_any = False
 
-        for sel in all_dismiss_selectors:
+        # Method 1: Click buttons by accessible name (role=button)
+        for pattern in button_patterns:
             try:
-                loc = page.locator(sel).first
-                if loc.is_visible(timeout=300):
-                    try:
-                        loc.click(timeout=800)
-                        dismissed_count += 1
-                        found_any = True
-                        logger.info(f"Dismissed popup #{dismissed_count} using: {sel}")
-                        time.sleep(0.3)
-                    except Exception as click_err:
-                        logger.debug(f"Click failed for {sel}: {click_err}")
+                btn = page.get_by_role("button", name=re.compile(pattern, re.I)).first
+                if btn.is_visible(timeout=500):
+                    btn.click(force=True, timeout=1500)
+                    dismissed_count += 1
+                    closed_any = True
+                    logger.info(f"Dismissed popup #{dismissed_count} via button pattern: {pattern}")
             except:
                 pass
 
-        # Try ESC key
+        # Method 2: Click links by text (for <a> tags styled as buttons)
+        for pattern in button_patterns:
+            try:
+                link = page.get_by_role("link", name=re.compile(pattern, re.I)).first
+                if link.is_visible(timeout=500):
+                    link.click(force=True, timeout=1500)
+                    dismissed_count += 1
+                    closed_any = True
+                    logger.info(f"Dismissed popup #{dismissed_count} via link pattern: {pattern}")
+            except:
+                pass
+
+        # Method 3: Click specific CSS selectors
+        for sel in css_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=300):
+                    loc.click(force=True, timeout=800)
+                    dismissed_count += 1
+                    closed_any = True
+                    logger.info(f"Dismissed popup #{dismissed_count} via selector: {sel}")
+                    time.sleep(0.2)
+            except:
+                pass
+
+        # Method 4: ESC key closes many modals
         try:
             page.keyboard.press("Escape")
-            time.sleep(0.2)
         except:
             pass
 
-        # Try clicking outside modals (on body)
-        try:
-            # Click at top-left corner which is usually safe
-            page.mouse.click(10, 10)
-            time.sleep(0.2)
-        except:
-            pass
-
-        # If we found and dismissed something, do another pass
-        # If nothing found, we're done
-        if not found_any:
+        # If nothing was closed this iteration, we might be done
+        if not closed_any:
             break
 
-        time.sleep(0.3)
+        # Small delay between iterations
+        page.wait_for_timeout(250)
 
     if dismissed_count > 0:
         logger.info(f"Total popups dismissed: {dismissed_count}")
@@ -265,30 +338,52 @@ class StockTrakBot:
         # Ensure logs directory exists
         os.makedirs('logs', exist_ok=True)
 
-    def start_browser(self, headless: bool = None):
+    def start_browser(self, headless: bool = None, use_persistent: bool = True):
         """
         Start browser with configured settings.
 
+        Uses a persistent browser profile by default so that "Don't show again"
+        settings stick across sessions and popups stop coming back.
+
         Args:
             headless: Override headless setting
+            use_persistent: Use persistent browser context (default True)
         """
         if headless is not None:
             self.headless = headless
 
-        logger.info(f"Starting browser (headless={self.headless})...")
+        logger.info(f"Starting browser (headless={self.headless}, persistent={use_persistent})...")
 
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(
-            headless=self.headless,
-            slow_mo=SLOW_MO,
-        )
 
-        self.context = self.browser.new_context(
-            viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        )
-
-        self.page = self.context.new_page()
+        if use_persistent:
+            # PERSISTENT CONTEXT: Cookies/localStorage persist across runs
+            # This means "Don't show again" actually works!
+            self.context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=self.headless,
+                slow_mo=SLOW_MO,
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            self.browser = None  # Persistent context doesn't use separate browser
+            # Use the default page or create one
+            if self.context.pages:
+                self.page = self.context.pages[0]
+            else:
+                self.page = self.context.new_page()
+            logger.info(f"Using persistent profile: {PROFILE_DIR}")
+        else:
+            # Ephemeral context (fresh every time)
+            self.browser = self.playwright.chromium.launch(
+                headless=self.headless,
+                slow_mo=SLOW_MO,
+            )
+            self.context = self.browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            self.page = self.context.new_page()
 
         # Increase timeouts - StockTrak can be slow
         self.page.set_default_timeout(90000)  # 90 seconds
@@ -300,6 +395,9 @@ class StockTrakBot:
         """
         Login to StockTrak at app.stocktrak.com.
 
+        Uses checkpoint verification: waits for a known logged-in element
+        (like "Portfolio Simulation") rather than assuming success.
+
         Returns:
             True if login successful, False otherwise
         """
@@ -307,17 +405,18 @@ class StockTrakBot:
 
         try:
             # Navigate to login page
-            self.page.goto(STOCKTRAK_LOGIN_URL)
-            self.page.wait_for_load_state('domcontentloaded')
-            time.sleep(2)
-
-            # CRITICAL: Dismiss any popups that appear on login page
-            logger.info("Dismissing any popups on login page...")
-            dismiss_stocktrak_overlays(self.page, max_attempts=5)
+            self.page.goto(STOCKTRAK_LOGIN_URL, wait_until="domcontentloaded")
+            dismiss_stocktrak_overlays(self.page, total_ms=10000)
             time.sleep(1)
 
             # Screenshot for debugging
-            screenshot_path = take_debug_screenshot(self.page, 'login_page')
+            take_debug_screenshot(self.page, 'login_page')
+
+            # Check if already logged in (persistent profile may have session)
+            if self._check_logged_in():
+                logger.info("Already logged in (from persistent session)")
+                self.logged_in = True
+                return True
 
             # Try common login form selectors
             username_selectors = [
@@ -377,56 +476,44 @@ class StockTrakBot:
                 logger.error(f"ERROR screenshot: {screenshot_path}")
                 return False
 
-            # Wait for navigation - use domcontentloaded (faster than networkidle)
+            # Wait for navigation
             logger.info("Waiting for page to load after login...")
-            self.page.wait_for_load_state('domcontentloaded')
-            time.sleep(2)
+            self.page.wait_for_load_state('networkidle')
 
-            # CRITICAL: Clear ALL popups with aggressive loop
-            logger.info("=== CLEARING ALL POPUPS (this may take a moment) ===")
-            total_dismissed = 0
-
-            for pass_num in range(5):  # Up to 5 passes
-                logger.info(f"Popup clearing pass {pass_num + 1}/5...")
-                dismissed = dismiss_stocktrak_overlays(self.page, max_attempts=3)
-                total_dismissed += dismissed
-                take_debug_screenshot(self.page, f'after_popup_pass_{pass_num + 1}')
-                time.sleep(1)
-
-                # If no popups found in this pass, we might be done
-                if dismissed == 0:
-                    # But wait a bit and try once more in case of delayed popups
-                    time.sleep(2)
-                    final_check = dismiss_stocktrak_overlays(self.page, max_attempts=2)
-                    total_dismissed += final_check
-                    if final_check == 0:
-                        logger.info("No more popups detected")
-                        break
-
+            # Clear popups (time-based, more robust)
+            logger.info("=== CLEARING POPUPS ===")
+            total_dismissed = dismiss_stocktrak_overlays(self.page, total_ms=20000)
             logger.info(f"=== TOTAL POPUPS DISMISSED: {total_dismissed} ===")
-            take_debug_screenshot(self.page, 'after_all_popups_cleared')
 
-            # Verify page is ready
-            is_ready, status = verify_page_ready(self.page, expected_url_contains='dashboard')
-            if not is_ready:
-                logger.warning(f"Page verification: {status}")
-                # Try one more aggressive popup clear
-                dismiss_stocktrak_overlays(self.page, max_attempts=5)
+            take_debug_screenshot(self.page, 'after_login_popups_cleared')
 
-            # Check for success indicators
-            success_indicators = [
-                'portfolio', 'dashboard', 'home', 'account',
-                'holdings', 'trade', 'positions', 'overview'
+            # CHECKPOINT: Wait for a known logged-in element
+            # "Portfolio Simulation" only exists when logged in
+            logger.info("Waiting for login checkpoint (Portfolio Simulation)...")
+            try:
+                self.page.wait_for_selector("text=Portfolio Simulation", timeout=90000)
+                self.logged_in = True
+                logger.info("LOGIN CHECKPOINT PASSED: 'Portfolio Simulation' visible")
+                return True
+            except Exception as e:
+                logger.warning(f"Primary checkpoint failed: {e}")
+
+            # Fallback checkpoints
+            fallback_indicators = [
+                "text=My Portfolio",
+                "text=Trading",
+                "text=Logout",
+                "text=Account",
             ]
 
-            current_url = self.page.url.lower()
-            page_content = self.page.content().lower()
-
-            for indicator in success_indicators:
-                if indicator in current_url or f'>{indicator}' in page_content:
-                    self.logged_in = True
-                    logger.info(f"Login successful! (found: {indicator})")
-                    return True
+            for indicator in fallback_indicators:
+                try:
+                    if self.page.locator(indicator).first.is_visible(timeout=3000):
+                        self.logged_in = True
+                        logger.info(f"Login checkpoint passed via: {indicator}")
+                        return True
+                except:
+                    continue
 
             # Check for error messages
             error_selectors = ['.error', '.alert-danger', '.login-error', '#error', '.alert-error']
@@ -446,8 +533,7 @@ class StockTrakBot:
                 return True
 
             logger.warning("Login status uncertain - check screenshots")
-            screenshot_path = take_debug_screenshot(self.page, 'login_uncertain')
-            logger.warning(f"Uncertain state screenshot: {screenshot_path}")
+            take_debug_screenshot(self.page, 'login_uncertain')
             return False
 
         except Exception as e:
@@ -1024,6 +1110,71 @@ class StockTrakBot:
                 f"Failed to extract capital from trade KPIs: {e}. Screenshot: {screenshot_path}"
             )
 
+    def go_to_equity_trade_ticket(self, ticker: str) -> bool:
+        """
+        Navigate to the equity trade ticket for a given symbol.
+
+        Tries menu navigation first (more stable), falls back to direct URL.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            True if navigation successful, False otherwise
+        """
+        logger.info(f"Navigating to trade ticket for {ticker}")
+        dismiss_stocktrak_overlays(self.page, total_ms=5000)
+
+        # Method 1: Menu navigation (Trading tab → Stocks/Equities)
+        try:
+            logger.info("Trying menu navigation: Trading → Stocks")
+
+            # Hover over Trading tab
+            trading_link = self.page.get_by_role("link", name=re.compile("^Trading$", re.I))
+            trading_link.hover()
+            self.page.wait_for_timeout(300)
+
+            # Click on Stocks or Equities submenu
+            stocks_link = self.page.get_by_role("link", name=re.compile("stock|equit", re.I)).first
+            stocks_link.click()
+            self.page.wait_for_load_state("networkidle")
+            dismiss_stocktrak_overlays(self.page, total_ms=5000)
+
+            # Fill symbol in the search box
+            symbol_input = self.page.get_by_label(re.compile("symbol|ticker|search", re.I)).first
+            symbol_input.wait_for(state="visible", timeout=10000)
+            symbol_input.fill(ticker.upper())
+            symbol_input.press("Enter")
+            self.page.wait_for_load_state("networkidle")
+            dismiss_stocktrak_overlays(self.page, total_ms=5000)
+
+            # Verify we're on the trade page
+            self.page.wait_for_selector("button:has-text('Buy')", timeout=15000)
+            logger.info(f"Menu navigation successful for {ticker}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Menu navigation failed: {e}")
+
+        # Method 2: Direct URL navigation (fallback)
+        try:
+            logger.info("Falling back to direct URL navigation")
+            trade_url = self._trade_equities_url(ticker)
+            self.page.goto(trade_url)
+            self.page.wait_for_load_state('domcontentloaded')
+            time.sleep(2)
+            dismiss_stocktrak_overlays(self.page, total_ms=5000)
+
+            # Verify we're on the trade page
+            self.assert_on_trade_page(ticker)
+            logger.info(f"URL navigation successful for {ticker}")
+            return True
+
+        except Exception as e:
+            logger.error(f"URL navigation also failed: {e}")
+            take_debug_screenshot(self.page, f'trade_nav_failed_{ticker}')
+            return False
+
     def place_buy_order(self, ticker: str, shares: int, limit_price: float, dry_run: bool = False) -> Tuple[bool, str]:
         """
         Place a limit buy order.
@@ -1062,21 +1213,9 @@ class StockTrakBot:
             dry_run = True
 
         try:
-            # Dismiss any popups first
-            dismiss_stocktrak_overlays(self.page)
-
-            # Navigate to CORRECT trade page URL (symbol is in URL, no need to fill)
-            trade_url = self._trade_equities_url(ticker)
-            logger.info(f"Navigating to: {trade_url}")
-            self.page.goto(trade_url)
-            self.page.wait_for_load_state('domcontentloaded')
-            time.sleep(3)  # StockTrak is slow
-
-            # Dismiss any popups on trade page
-            dismiss_stocktrak_overlays(self.page, max_attempts=3)
-
-            # CRITICAL: Verify we're on the trade page
-            self.assert_on_trade_page(ticker)
+            # Navigate to trade ticket (tries menu first, falls back to URL)
+            if not self.go_to_equity_trade_ticket(ticker):
+                return False, f"Could not navigate to trade page for {ticker}"
 
             take_debug_screenshot(self.page, f'trade_page_{ticker}')
 
@@ -1307,26 +1446,13 @@ class StockTrakBot:
             dry_run = True
 
         try:
-            # Dismiss any popups first
-            dismiss_stocktrak_overlays(self.page)
-
-            # Navigate to CORRECT trade page URL (symbol is in URL, no need to fill)
-            trade_url = self._trade_equities_url(ticker)
-            logger.info(f"Navigating to: {trade_url}")
-            self.page.goto(trade_url)
-            self.page.wait_for_load_state('domcontentloaded')
-            time.sleep(3)  # StockTrak is slow
-
-            # Dismiss any popups on trade page
-            dismiss_stocktrak_overlays(self.page, max_attempts=3)
-
-            # CRITICAL: Verify we're on the trade page
-            self.assert_on_trade_page(ticker)
+            # Navigate to trade ticket (tries menu first, falls back to URL)
+            if not self.go_to_equity_trade_ticket(ticker):
+                return False, f"Could not navigate to trade page for {ticker}"
 
             take_debug_screenshot(self.page, f'sell_trade_page_{ticker}')
 
-            # Symbol is already set via URL parameter - NO NEED TO FILL
-            # Just verify the ticker is displayed on the page
+            # Verify the ticker is displayed on the page
             page_text = self.page.locator('body').inner_text()
             if ticker.upper() not in page_text.upper():
                 logger.warning(f"Ticker {ticker} not visible on page, but continuing...")
@@ -1523,6 +1649,156 @@ class StockTrakBot:
             screenshot_path = take_debug_screenshot(self.page, f'sell_order_exception_{ticker}')
             logger.error(f"Error placing sell order: {e}. Screenshot: {screenshot_path}")
             return False, f"{e}. Screenshot: {screenshot_path}"
+
+    def _check_logged_in(self) -> bool:
+        """
+        Check if we're already logged in (e.g., from persistent session).
+
+        Returns:
+            True if logged-in indicators are visible
+        """
+        logged_in_indicators = [
+            "text=Portfolio Simulation",
+            "text=My Portfolio",
+            "text=Logout",
+            "text=Trading",
+        ]
+
+        for indicator in logged_in_indicators:
+            try:
+                if self.page.locator(indicator).first.is_visible(timeout=2000):
+                    logger.debug(f"Logged in indicator found: {indicator}")
+                    return True
+            except:
+                pass
+
+        return False
+
+    def verify_trade_in_history(self, ticker: str, side: str, shares: int) -> Tuple[bool, str]:
+        """
+        Verify a trade exists in Transaction History or Order History.
+
+        This is the idempotency check: after clicking Place Order, if anything
+        errors, verify in history before retrying.
+
+        Args:
+            ticker: Stock ticker
+            side: "BUY" or "SELL"
+            shares: Number of shares
+
+        Returns:
+            Tuple of (found, status_message)
+        """
+        logger.info(f"Verifying trade in history: {side} {shares} {ticker}")
+
+        # First, check Transaction History (for executed trades)
+        try:
+            # Navigate via menu: My Portfolio → Transaction History
+            self.page.get_by_role("link", name=re.compile("My Portfolio", re.I)).hover()
+            time.sleep(0.3)
+            self.page.get_by_role("link", name=re.compile("Transaction History", re.I)).click()
+            self.page.wait_for_load_state("networkidle")
+            dismiss_stocktrak_overlays(self.page, total_ms=5000)
+
+            # Look for the ticker in recent transactions
+            time.sleep(1)
+            page_text = self.page.content()
+
+            if ticker.upper() in page_text.upper():
+                logger.info(f"Found {ticker} in Transaction History")
+                # Try to find the specific row
+                row = self.page.locator("tr", has_text=re.compile(ticker, re.I)).first
+                if row.is_visible(timeout=3000):
+                    row_text = row.text_content()
+                    if side.upper() in row_text.upper() and str(shares) in row_text:
+                        logger.info(f"Trade verified: {side} {shares} {ticker}")
+                        return True, "Trade verified in Transaction History"
+
+        except Exception as e:
+            logger.debug(f"Transaction History check failed: {e}")
+
+        # Fallback: Check Order History (for pending orders)
+        try:
+            self.page.get_by_role("link", name=re.compile("My Portfolio", re.I)).hover()
+            time.sleep(0.3)
+            self.page.get_by_role("link", name=re.compile("Order History", re.I)).click()
+            self.page.wait_for_load_state("networkidle")
+            dismiss_stocktrak_overlays(self.page, total_ms=5000)
+
+            time.sleep(1)
+            page_text = self.page.content()
+
+            if ticker.upper() in page_text.upper():
+                logger.info(f"Found {ticker} in Order History")
+                return True, "Trade found in Order History"
+
+        except Exception as e:
+            logger.debug(f"Order History check failed: {e}")
+
+        return False, "Trade not found in history"
+
+    def add_trade_note(self, ticker: str, note_text: str) -> Tuple[bool, str]:
+        """
+        Add a Trading Note to a trade via Transaction/Order History.
+
+        StockTrak's Trading Notes are NOT part of the trade ticket.
+        They are added via "Add/View Notes" in Order History or Transaction History.
+
+        Args:
+            ticker: Stock ticker to find in history
+            note_text: The rationale/note to attach
+
+        Returns:
+            Tuple of (success, message)
+        """
+        logger.info(f"Adding trade note for {ticker}")
+
+        try:
+            # Navigate to Transaction History
+            self.page.get_by_role("link", name=re.compile("My Portfolio", re.I)).hover()
+            time.sleep(0.3)
+            self.page.get_by_role("link", name=re.compile("Transaction History", re.I)).click()
+            self.page.wait_for_load_state("networkidle")
+            dismiss_stocktrak_overlays(self.page, total_ms=5000)
+
+            time.sleep(1)
+
+            # Find the row containing the ticker
+            row = self.page.locator("tr", has_text=re.compile(ticker, re.I)).first
+            row.wait_for(state="visible", timeout=30000)
+
+            # Click Add/View Notes in that row
+            notes_link = row.get_by_role("link", name=re.compile("Add|View|Notes", re.I))
+            if notes_link.count() > 0:
+                notes_link.first.click()
+                time.sleep(0.5)
+
+                # Fill the note textbox
+                note_input = self.page.get_by_role("textbox").first
+                note_input.wait_for(state="visible", timeout=10000)
+                note_input.fill(note_text)
+
+                # Save the note
+                save_btn = self.page.get_by_role("button", name=re.compile("save|submit|add", re.I)).first
+                save_btn.click()
+                time.sleep(1)
+
+                # Verify note appears
+                if note_text[:20] in self.page.content():
+                    logger.info(f"Trade note added successfully for {ticker}")
+                    return True, "Note added successfully"
+
+                logger.warning("Note may not have saved - text not visible")
+                return True, "Note submitted (unconfirmed)"
+
+            else:
+                logger.warning(f"No notes link found for {ticker}")
+                return False, "Notes link not found"
+
+        except Exception as e:
+            logger.error(f"Error adding trade note: {e}")
+            take_debug_screenshot(self.page, f'trade_note_error_{ticker}')
+            return False, f"Error: {e}"
 
     def _try_fill(self, selectors: List[str], value: str, timeout: int = 2000) -> bool:
         """
