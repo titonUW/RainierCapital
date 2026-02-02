@@ -40,11 +40,13 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
 # =============================================================================
-# STALL-PROOF WRAPPER: Every step has a hard timeout + retries
+# DEPRECATED: Use ExecutionPipeline._run_step instead
 # =============================================================================
 def run_step(page: Page, name: str, fn: Callable[[], Any], max_attempts: int = 3,
              reset_url: str = "https://app.stocktrak.com/dashboard/standard") -> Any:
     """
+    DEPRECATED: Use execution_pipeline.ExecutionPipeline._run_step instead.
+
     Execute a step with retries, screenshots on failure, and hard reset between attempts.
 
     This is the "no more stalls" wrapper. Every step either completes or fails fast
@@ -680,12 +682,12 @@ class StockTrakBot:
         try:
             # Step 1: Clear any remaining popups
             logger.info("Step 1: Clearing any remaining popups...")
-            dismissed = dismiss_stocktrak_overlays(self.page, max_attempts=5)
+            dismissed = dismiss_stocktrak_overlays(self.page, total_ms=3000)
             if dismissed > 0:
                 logger.info(f"Cleared {dismissed} popup(s)")
-                time.sleep(1)
+                time.sleep(0.5)
                 # Try again in case more appeared
-                dismiss_stocktrak_overlays(self.page, max_attempts=3)
+                dismiss_stocktrak_overlays(self.page, total_ms=2000)
 
             # Step 2: Verify URL
             logger.info("Step 2: Verifying URL...")
@@ -711,7 +713,7 @@ class StockTrakBot:
                     if self.page.locator(sel).first.is_visible(timeout=500):
                         errors.append(f"Blocking overlay still visible: {sel}")
                         # Try to dismiss it
-                        dismiss_stocktrak_overlays(self.page, max_attempts=3)
+                        dismiss_stocktrak_overlays(self.page, total_ms=2000)
                 except:
                     pass
 
@@ -798,15 +800,15 @@ class StockTrakBot:
         """
         try:
             # Clear popups
-            dismiss_stocktrak_overlays(self.page, max_attempts=3)
-            time.sleep(0.5)
+            dismiss_stocktrak_overlays(self.page, total_ms=2000)
+            time.sleep(0.3)
 
             # Quick verification
             is_ready, status = verify_page_ready(self.page)
             if not is_ready:
                 logger.warning(f"Page not ready: {status}")
                 # Try one more popup clear
-                dismiss_stocktrak_overlays(self.page, max_attempts=3)
+                dismiss_stocktrak_overlays(self.page, total_ms=2000)
                 time.sleep(0.5)
                 is_ready, status = verify_page_ready(self.page)
 
@@ -840,9 +842,9 @@ class StockTrakBot:
                 try:
                     self.page.goto(url)
                     self.page.wait_for_load_state('domcontentloaded')
-                    time.sleep(1)
+                    time.sleep(0.5)
                     # Clear any popups that appear on navigation
-                    dismiss_stocktrak_overlays(self.page, max_attempts=3)
+                    dismiss_stocktrak_overlays(self.page, total_ms=2000)
                     if 'portfolio' in self.page.url.lower() or 'dashboard' in self.page.url.lower():
                         break
                 except:
@@ -1027,10 +1029,10 @@ class StockTrakBot:
             logger.info(f"Reading trade count from: {trade_url}")
             self.page.goto(trade_url)
             self.page.wait_for_load_state('domcontentloaded')
-            time.sleep(2)
+            time.sleep(1)
 
             # Dismiss any popups
-            dismiss_stocktrak_overlays(self.page, max_attempts=3)
+            dismiss_stocktrak_overlays(self.page, total_ms=2000)
 
             # Get page text
             body_text = self.page.locator('body').inner_text()
@@ -1204,7 +1206,7 @@ class StockTrakBot:
                 raise RuntimeError("Still on login page after re-authentication")
 
         # Dismiss popups that may block the page
-        dismiss_stocktrak_overlays(self.page, max_attempts=5)
+        dismiss_stocktrak_overlays(self.page, total_ms=3000)
         time.sleep(0.5)
 
         # Take screenshot for debugging
@@ -1340,7 +1342,11 @@ class StockTrakBot:
 
     def place_buy_order(self, ticker: str, shares: int, limit_price: float, dry_run: bool = False) -> Tuple[bool, str]:
         """
-        Place a limit buy order.
+        DEPRECATED: Use ExecutionPipeline.execute() instead.
+
+        Place a limit buy order. This method has been replaced by the
+        execution_pipeline module which provides better reliability, retries,
+        screenshots, and verification.
 
         Args:
             ticker: Stock ticker symbol
@@ -1351,6 +1357,7 @@ class StockTrakBot:
         Returns:
             Tuple of (success, message)
         """
+        logger.warning("place_buy_order is DEPRECATED - use ExecutionPipeline.execute() instead")
         logger.info(f"Placing BUY order: {shares} {ticker} @ ${limit_price:.2f}" +
                    (" [DRY RUN]" if dry_run else ""))
 
@@ -1573,7 +1580,11 @@ class StockTrakBot:
 
     def place_sell_order(self, ticker: str, shares: int, limit_price: float, dry_run: bool = False) -> Tuple[bool, str]:
         """
-        Place a limit sell order.
+        DEPRECATED: Use ExecutionPipeline.execute() instead.
+
+        Place a limit sell order. This method has been replaced by the
+        execution_pipeline module which provides better reliability, retries,
+        screenshots, and verification.
 
         Args:
             ticker: Stock ticker symbol
@@ -1584,6 +1595,7 @@ class StockTrakBot:
         Returns:
             Tuple of (success, message)
         """
+        logger.warning("place_sell_order is DEPRECATED - use ExecutionPipeline.execute() instead")
         logger.info(f"Placing SELL order: {shares} {ticker} @ ${limit_price:.2f}" +
                    (" [DRY RUN]" if dry_run else ""))
 
@@ -2121,7 +2133,7 @@ def test_login():
             print("\nAttempting recovery...")
 
             # Try one more time to clear popups
-            dismiss_stocktrak_overlays(bot.page, max_attempts=10)
+            dismiss_stocktrak_overlays(bot.page, total_ms=5000)
             time.sleep(2)
 
             is_ready, status = bot.verify_ready_for_trading()
