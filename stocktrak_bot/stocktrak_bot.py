@@ -476,9 +476,9 @@ class StockTrakBot:
                 logger.error(f"ERROR screenshot: {screenshot_path}")
                 return False
 
-            # Wait for navigation
+            # Wait for navigation - EXPLICIT TIMEOUT to prevent hangs
             logger.info("Waiting for page to load after login...")
-            self.page.wait_for_load_state('networkidle')
+            self.page.wait_for_load_state('networkidle', timeout=60000)  # 60s max
 
             # Clear popups (time-based, more robust)
             logger.info("=== CLEARING POPUPS ===")

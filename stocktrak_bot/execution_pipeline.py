@@ -325,8 +325,9 @@ class ExecutionPipeline:
                 if self.page.locator(indicator).first.is_visible(timeout=5000):
                     logger.info(f"Login verified via: {indicator}")
                     return True
-            except:
-                pass
+            except Exception:
+                # Expected to fail for most indicators - continue checking others
+                continue
 
         # Not logged in - try to login
         logger.info("Not logged in - attempting login...")
@@ -603,13 +604,14 @@ class ExecutionPipeline:
         """Navigate to Transaction History or Order History."""
         self._dismiss_overlays()
 
-        # Hover My Portfolio
+        # Hover My Portfolio to trigger dropdown
         try:
             portfolio_link = self.page.get_by_role("link", name=re.compile("My Portfolio", re.I))
             portfolio_link.hover()
             time.sleep(0.3)
-        except:
-            pass
+        except Exception as e:
+            # Menu might not need hover - continue to direct click
+            logger.debug(f"Portfolio hover failed (may be OK): {e}")
 
         # Click history link
         history_link = self.page.get_by_role("link", name=re.compile(history_type, re.I))
@@ -633,7 +635,8 @@ class ExecutionPipeline:
                 if order.side in row_text and str(order.shares) in row_text:
                     logger.info(f"Found matching trade: {row_text[:100]}")
                     return True
-            except:
+            except Exception as e:
+                logger.debug(f"Row {i} check failed: {e}")
                 continue
 
         return False
@@ -679,12 +682,49 @@ class ExecutionPipeline:
     # UTILITIES
     # =========================================================================
     def _dismiss_overlays(self, total_ms: int = 10000):
-        """Dismiss popups using bot's method."""
+        """
+        Dismiss popups using bot's method.
+
+        CRITICAL: This must work reliably or trades will fail with
+        "Element not visible" errors. Log failures clearly.
+        """
         try:
             from stocktrak_bot import dismiss_stocktrak_overlays
             dismiss_stocktrak_overlays(self.page, total_ms=total_ms)
-        except:
-            pass
+        except ImportError as e:
+            logger.warning(f"Could not import dismiss_stocktrak_overlays: {e}")
+            # Fallback: try basic overlay dismissal
+            self._dismiss_overlays_fallback()
+        except Exception as e:
+            logger.warning(f"Overlay dismissal failed: {e}")
+            self._dismiss_overlays_fallback()
+
+    def _dismiss_overlays_fallback(self):
+        """Fallback overlay dismissal when main method unavailable."""
+        try:
+            # Try common close button patterns
+            close_selectors = [
+                "button:has-text('Close')",
+                "button:has-text('×')",
+                "button:has-text('X')",
+                "[aria-label='Close']",
+                ".close-button",
+                ".modal-close",
+            ]
+            for selector in close_selectors:
+                try:
+                    close_btn = self.page.locator(selector).first
+                    if close_btn.is_visible(timeout=500):
+                        close_btn.click()
+                        time.sleep(0.2)
+                except Exception:
+                    pass
+
+            # Press Escape as last resort
+            self.page.keyboard.press("Escape")
+            time.sleep(0.2)
+        except Exception as e:
+            logger.debug(f"Fallback overlay dismissal failed: {e}")
 
     def _take_screenshot(self, name: str) -> str:
         """Take and log a screenshot."""
@@ -710,8 +750,8 @@ class ExecutionPipeline:
                 run_id=order.run_id,
                 last_screenshot=self.screenshots[-1] if self.screenshots else None
             )
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Dashboard update failed (non-critical): {e}")
 
 
 # =============================================================================

@@ -65,11 +65,16 @@ def run_scheduler():
     logger.info("Next run times:")
     log_next_runs()
 
-    # Main loop
+    # Main loop with adaptive check interval
+    # CRITICAL: 30-second interval could miss the execution window
+    # Use 5-second checks during market hours, 30-second otherwise
     while True:
         try:
             schedule.run_pending()
-            time.sleep(30)  # Check every 30 seconds
+
+            # Adaptive sleep: shorter during execution window (3:50-4:05 PM ET)
+            check_interval = _get_check_interval()
+            time.sleep(check_interval)
 
         except KeyboardInterrupt:
             logger.info("Scheduler stopped by user")
@@ -77,7 +82,31 @@ def run_scheduler():
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
-            time.sleep(60)  # Wait a minute before retrying
+            time.sleep(30)  # Brief wait before retrying
+
+
+def _get_check_interval() -> int:
+    """
+    Get adaptive check interval based on time of day.
+
+    Returns shorter interval during critical execution window.
+    """
+    now = datetime.now(ET)
+    hour = now.hour
+    minute = now.minute
+
+    # Critical window: 3:50 PM - 4:10 PM ET (execution + buffer)
+    if hour == 15 and minute >= 50:
+        return 5  # Check every 5 seconds
+    if hour == 16 and minute <= 10:
+        return 5  # Check every 5 seconds
+
+    # Market hours: 9:30 AM - 4:00 PM ET
+    if 9 <= hour < 16:
+        return 15  # Check every 15 seconds
+
+    # Off hours
+    return 60  # Check every minute
 
 
 def safe_execute():
@@ -103,8 +132,8 @@ def safe_execute():
         try:
             state = StateManager()
             state.log_error(str(e))
-        except:
-            pass
+        except Exception as state_err:
+            logger.error(f"Could not log error to state: {state_err}")
 
 
 def safe_health_check():
@@ -263,8 +292,8 @@ class KeepAwake:
             try:
                 import ctypes
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS only
-            except:
-                pass
+            except Exception:
+                pass  # Non-critical: keep-awake cleanup failure
 
         elif system == 'Darwin':
             if hasattr(self, 'caffeinate_proc'):
