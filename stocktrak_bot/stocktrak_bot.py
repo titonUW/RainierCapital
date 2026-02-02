@@ -715,28 +715,56 @@ class StockTrakBot:
                 except:
                     pass
 
-            # Step 4: Check key navigation elements are accessible
-            logger.info("Step 4: Checking navigation elements...")
-            nav_selectors = [
-                "a:has-text('Portfolio')",
-                "a:has-text('Trading')",
-                "a:has-text('Dashboard')",
-                "[href*='portfolio']",
-                "[href*='trading']",
+            # Step 4: Check key navigation/dashboard elements are accessible
+            # Using text-based and role-based selectors that match StockTrak's current UI
+            logger.info("Step 4: Checking dashboard UI elements...")
+            nav_candidates = [
+                # Text-based (most reliable for current StockTrak UI)
+                lambda: self.page.get_by_text(re.compile(r"My Dashboard", re.I)).first,
+                lambda: self.page.get_by_text(re.compile(r"Trading Portfolio", re.I)).first,
+                lambda: self.page.get_by_text(re.compile(r"Portfolio Value", re.I)).first,
+                lambda: self.page.get_by_text(re.compile(r"Open Positions", re.I)).first,
+                # Role-based navigation links
+                lambda: self.page.get_by_role("link", name=re.compile(r"Portfolio Simulation", re.I)).first,
+                lambda: self.page.get_by_role("link", name=re.compile(r"Investing Research", re.I)).first,
+                lambda: self.page.get_by_role("link", name=re.compile(r"Dashboard", re.I)).first,
+                lambda: self.page.get_by_role("link", name=re.compile(r"Logout", re.I)).first,
+                # Fallback: any link with portfolio/trading in href
+                lambda: self.page.locator("[href*='portfolio']").first,
+                lambda: self.page.locator("[href*='trading']").first,
+                lambda: self.page.locator("[href*='dashboard']").first,
             ]
 
             nav_found = False
-            for sel in nav_selectors:
+            for get_loc in nav_candidates:
                 try:
-                    if self.page.locator(sel).first.is_visible(timeout=1000):
+                    loc = get_loc()
+                    if loc.is_visible(timeout=2000):
                         nav_found = True
-                        logger.info(f"Navigation element found: {sel}")
+                        logger.info(f"Dashboard UI element found")
                         break
-                except:
+                except Exception:
                     pass
 
             if not nav_found:
-                errors.append("No navigation elements found - page may not be fully loaded")
+                # Don't fail immediately - check if we're actually on StockTrak
+                if 'stocktrak.com' in self.page.url.lower():
+                    logger.warning("Navigation elements not found but on StockTrak - page may still be loading")
+                    # Give it more time
+                    time.sleep(3)
+                    # Try one more time with longer timeout
+                    for get_loc in nav_candidates[:4]:  # Just try the main text-based ones
+                        try:
+                            loc = get_loc()
+                            if loc.is_visible(timeout=5000):
+                                nav_found = True
+                                logger.info("Dashboard UI element found after extended wait")
+                                break
+                        except Exception:
+                            pass
+
+                if not nav_found:
+                    errors.append("No navigation elements found - page may not be fully loaded")
 
             # Step 5: Take verification screenshot
             logger.info("Step 5: Taking verification screenshot...")

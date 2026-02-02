@@ -356,7 +356,7 @@ class ExecutionPipeline:
         logger.info(f"Using URL: {trade_url}")
 
         self.page.goto(trade_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(2)
+        time.sleep(3)  # Give page time to fully render
         self._dismiss_overlays()
 
         # Verify we're on trade page
@@ -372,10 +372,9 @@ class ExecutionPipeline:
         if "trading" not in url:
             raise RuntimeError(f"Not on trading page. URL: {url}")
 
-        # Check ticker is visible or Buy button exists
-        try:
-            self.page.wait_for_selector("button:has-text('Buy')", timeout=15000)
-        except:
+        # Look for Buy button using multiple strategies
+        buy_found = self._find_buy_sell_button("Buy")
+        if not buy_found:
             raise RuntimeError("Buy button not found - not on trade page")
 
         # Verify ticker is in page content
@@ -383,16 +382,92 @@ class ExecutionPipeline:
         if ticker.upper() not in page_text:
             logger.warning(f"Ticker {ticker} not visible on page")
 
+    def _find_buy_sell_button(self, side: str) -> bool:
+        """
+        Find Buy or Sell button using multiple selector strategies.
+
+        StockTrak's buttons may be styled differently or have varying HTML structure.
+        We try multiple approaches to find them reliably.
+
+        Args:
+            side: "Buy" or "Sell"
+
+        Returns:
+            True if button found, False otherwise
+        """
+        strategies = [
+            # Strategy 1: Button by role with name (case-insensitive)
+            lambda: self.page.get_by_role("button", name=re.compile(f"^{side}$", re.I)).first,
+            # Strategy 2: Button with exact text
+            lambda: self.page.locator(f"button:has-text('{side}')").first,
+            # Strategy 3: Any clickable element with text
+            lambda: self.page.locator(f"text='{side}'").first,
+            # Strategy 4: Look in ACTION section
+            lambda: self.page.locator("text=ACTION").locator("..").locator(f"text='{side}'").first,
+            # Strategy 5: Div/span styled as button
+            lambda: self.page.locator(f"div:has-text('{side}')").first,
+            # Strategy 6: By aria-label
+            lambda: self.page.locator(f"[aria-label*='{side}' i]").first,
+        ]
+
+        for i, strategy in enumerate(strategies):
+            try:
+                elem = strategy()
+                if elem.is_visible(timeout=3000):
+                    logger.info(f"Found {side} button via strategy {i+1}")
+                    return True
+            except Exception as e:
+                logger.debug(f"Strategy {i+1} for {side} button failed: {e}")
+                continue
+
+        return False
+
+    def _click_buy_sell_button(self, side: str) -> bool:
+        """
+        Click the Buy or Sell button using multiple strategies.
+
+        Args:
+            side: "Buy" or "Sell"
+
+        Returns:
+            True if clicked successfully
+        """
+        strategies = [
+            # Strategy 1: Button by role with name (case-insensitive)
+            lambda: self.page.get_by_role("button", name=re.compile(f"^{side}$", re.I)).first,
+            # Strategy 2: Button with exact text
+            lambda: self.page.locator(f"button:has-text('{side}')").first,
+            # Strategy 3: Look in ACTION section specifically
+            lambda: self.page.locator("text=ACTION").locator("..").get_by_role("button", name=re.compile(side, re.I)).first,
+            # Strategy 4: Any element with exact text that's clickable
+            lambda: self.page.get_by_text(side, exact=True).first,
+            # Strategy 5: CSS class patterns common for buy/sell
+            lambda: self.page.locator(f".btn-{side.lower()}, .{side.lower()}-button, #{side.lower()}-btn").first,
+        ]
+
+        for i, strategy in enumerate(strategies):
+            try:
+                elem = strategy()
+                if elem.is_visible(timeout=3000):
+                    logger.info(f"Clicking {side} button via strategy {i+1}")
+                    elem.click(timeout=5000)
+                    return True
+            except Exception as e:
+                logger.debug(f"Click strategy {i+1} for {side} failed: {e}")
+                continue
+
+        return False
+
     def _fill_order_form(self, order: TradeOrder) -> bool:
         """Fill the order form with proper verification."""
         logger.info(f"Filling order: {order.side} {order.shares} {order.ticker}")
 
         self._dismiss_overlays()
 
-        # 1. Click BUY or SELL
-        side_btn = self.page.locator(f"button:has-text('{order.side.capitalize()}')").first
-        side_btn.wait_for(state="visible", timeout=10000)
-        side_btn.click()
+        # 1. Click BUY or SELL using robust method
+        if not self._click_buy_sell_button(order.side.capitalize()):
+            raise RuntimeError(f"Could not find/click {order.side} button")
+
         time.sleep(0.5)
         logger.info(f"Clicked {order.side} button")
 
@@ -411,56 +486,85 @@ class ExecutionPipeline:
     def _find_shares_input(self):
         """Find the SHARES input field using multiple strategies."""
         strategies = [
-            # Strategy 1: Anchor off SHARES label
+            # Strategy 1: Input near SHARES label
             lambda: self.page.locator("text=SHARES").locator("..").locator("input").first,
-            # Strategy 2: Ancestor search
+            # Strategy 2: Input with SHARES in ancestor
             lambda: self.page.locator("text=SHARES").locator("xpath=ancestor::div[1]//input").first,
-            # Strategy 3: Name/ID selectors
+            # Strategy 3: Input by common names
             lambda: self.page.locator('input[name="shares"]').first,
             lambda: self.page.locator('input[name="quantity"]').first,
             lambda: self.page.locator('#shares').first,
             lambda: self.page.locator('#quantity').first,
+            # Strategy 4: Numeric input near buy/sell section
+            lambda: self.page.locator('input[type="number"]').first,
+            lambda: self.page.locator('input[type="text"]').nth(1),  # Often 2nd text input after symbol
+            # Strategy 5: Look for input with "100" default value
+            lambda: self.page.locator('input[value="100"]').first,
         ]
 
         for i, strategy in enumerate(strategies):
             try:
                 elem = strategy()
-                if elem.is_visible(timeout=3000):
+                if elem.is_visible(timeout=2000):
                     logger.info(f"Found shares input via strategy {i+1}")
                     return elem
-            except:
+            except Exception:
                 continue
 
         raise RuntimeError("Could not find SHARES input field")
 
     def _fill_shares_with_verification(self, input_elem, shares: int):
-        """Fill shares with hard-clear and value verification."""
-        max_attempts = 3
+        """
+        Fill shares with AGGRESSIVE clearing and value verification.
+
+        The input often has a default value (e.g., "100") that must be
+        completely removed before entering the new value.
+        """
+        max_attempts = 5
 
         for attempt in range(max_attempts):
             try:
-                # Hard clear: Click → Ctrl+A → Backspace
+                # AGGRESSIVE CLEAR: Multiple methods to ensure field is empty
                 input_elem.click()
+                time.sleep(0.2)
+
+                # Method 1: Triple-click to select all
+                input_elem.click(click_count=3)
                 time.sleep(0.1)
+
+                # Method 2: Ctrl+A to select all
                 input_elem.press("Control+a")
                 time.sleep(0.1)
+
+                # Method 3: Delete/Backspace
+                input_elem.press("Delete")
                 input_elem.press("Backspace")
                 time.sleep(0.1)
 
-                # Type value with delay
-                input_elem.type(str(shares), delay=30)
+                # Verify field is now empty
+                current_value = input_elem.input_value().strip()
+                if current_value:
+                    logger.warning(f"Field not empty after clear (has: '{current_value}'), trying again...")
+                    # Try clearing with JavaScript
+                    input_elem.evaluate("el => el.value = ''")
+                    time.sleep(0.1)
+
+                # Now type the new value character by character
+                input_elem.type(str(shares), delay=50)
                 time.sleep(0.3)
 
-                # Verify value
+                # Verify the value
                 actual = input_elem.input_value().strip()
                 actual_digits = "".join(c for c in actual if c.isdigit())
                 expected_digits = str(shares)
 
                 if actual_digits == expected_digits:
-                    logger.info(f"Shares verified: {actual}")
+                    logger.info(f"Shares verified: {actual} (expected: {shares})")
                     return
                 else:
-                    logger.warning(f"Shares mismatch: expected {shares}, got {actual}")
+                    logger.warning(f"Shares mismatch attempt {attempt+1}: expected {shares}, got '{actual}'")
+                    # Clear via JavaScript and retry
+                    input_elem.evaluate("el => el.value = ''")
 
             except Exception as e:
                 logger.warning(f"Fill attempt {attempt+1} failed: {e}")
