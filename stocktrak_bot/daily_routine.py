@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import time
 
+import config
 from config import (
     CORE_POSITIONS, SATELLITE_POSITION_SIZE, DAY1_SATELLITES,
     REGIME_PARAMS, EVENT_FREEZE_DATES, HARD_STOP_TRADES,
@@ -39,8 +40,49 @@ from utils import (
     calculate_limit_price, calculate_shares_for_allocation,
     format_currency, is_trading_day, get_current_time_et
 )
+from execution_pipeline import ExecutionPipeline, TradeOrder, TradeResult
 
 logger = logging.getLogger('stocktrak_bot.daily_routine')
+
+
+def execute_trade_safely(bot, state: StateManager, ticker: str, side: str,
+                         shares: int, rationale: str, dry_run: bool = False) -> Tuple[bool, str]:
+    """
+    Execute a trade using the stall-proof execution pipeline.
+
+    This replaces direct bot.place_buy_order/place_sell_order calls with
+    a fully verified pipeline that:
+    - Handles retries with screenshots
+    - Verifies trade in history
+    - Adds trade notes
+    - Never double-places
+
+    Args:
+        bot: StockTrakBot instance
+        state: StateManager instance
+        ticker: Stock ticker
+        side: "BUY" or "SELL"
+        shares: Number of shares
+        rationale: Trade rationale for notes
+        dry_run: If True, stop before placing
+
+    Returns:
+        Tuple of (success, message)
+    """
+    order = TradeOrder(
+        ticker=ticker,
+        side=side,
+        shares=shares,
+        rationale=rationale
+    )
+
+    pipeline = ExecutionPipeline(bot, state_manager=state, dry_run=dry_run)
+    result = pipeline.execute(order)
+
+    if result.success:
+        return True, f"{side} {shares} {ticker} executed successfully"
+    else:
+        return False, f"Failed at {result.state.value}: {result.message}"
 
 
 def execute_daily_routine():
@@ -245,17 +287,19 @@ def execute_normal_mode(
                 logger.warning(f"Cannot sell {ticker}: trade limit reached")
                 continue
 
-            limit_price = calculate_limit_price(current_price, is_buy=False)
-            success, msg = bot.place_sell_order(ticker, shares, limit_price)
+            # Use stall-proof execution pipeline
+            exit_type = "RISK EXIT" if is_risk_exit else "DISCRETIONARY"
+            success, msg = execute_trade_safely(
+                bot, state, ticker, "SELL", shares,
+                rationale=f"{exit_type}: {sell_reason}",
+                dry_run=config.DRY_RUN_MODE
+            )
 
             if success:
-                exit_type = "RISK EXIT" if is_risk_exit else "DISCRETIONARY"
-                logger.info(f"SELL [{exit_type}] {ticker}: {shares} shares @ ${limit_price:.2f} ({sell_reason})")
-                state.log_trade(ticker, 'SELL', shares, limit_price, sell_reason)
-                state.increment_trade_count()
+                logger.info(f"SELL [{exit_type}] {ticker}: {shares} shares ({sell_reason})")
                 state.remove_position(ticker)
                 sells_executed.append((ticker, position.get('bucket')))
-                time.sleep(3)
+                time.sleep(2)
 
     # ===== STEP 2: Check for profit-taking (FRIDAY ONLY) =====
     if friday:
@@ -281,17 +325,19 @@ def execute_normal_mode(
             ticker_data = market_data.get(ticker, {})
             current_price = ticker_data.get('price', 0)
             shares = position.get('shares', 0)
-            limit_price = calculate_limit_price(current_price, is_buy=False)
 
-            success, msg = bot.place_sell_order(ticker, shares, limit_price)
+            # Use stall-proof execution pipeline
+            success, msg = execute_trade_safely(
+                bot, state, ticker, "SELL", shares,
+                rationale="PROFIT_TAKE_DISCRETIONARY",
+                dry_run=config.DRY_RUN_MODE
+            )
             if success:
-                logger.info(f"PROFIT TAKE [DISCRETIONARY] {ticker}: {shares} shares @ ${limit_price:.2f}")
-                state.log_trade(ticker, 'SELL', shares, limit_price, 'PROFIT_TAKE')
-                state.increment_trade_count()
+                logger.info(f"PROFIT TAKE [DISCRETIONARY] {ticker}: {shares} shares")
                 state.increment_week_replacements()
                 state.remove_position(ticker)
                 sells_executed.append((ticker, position.get('bucket')))
-                time.sleep(3)
+                time.sleep(2)
     else:
         logger.info("Skipping profit-taking (non-Friday)")
 
@@ -379,19 +425,23 @@ def execute_normal_mode(
             logger.debug(f"{ticker}: Failed validation - {checks}")
             continue
 
-        # Execute buy
-        limit_price = calculate_limit_price(price, is_buy=True)
-        success, msg = bot.place_buy_order(ticker, shares, limit_price)
+        # Execute buy using stall-proof pipeline
+        entry_type = "DISCRETIONARY" if friday else "EMERGENCY"
+        rationale = 'DOUBLE7_ENTRY' if friday else 'EMERGENCY_REPLACE'
+
+        success, msg = execute_trade_safely(
+            bot, state, ticker, "BUY", shares,
+            rationale=f"{entry_type}: {rationale}",
+            dry_run=config.DRY_RUN_MODE
+        )
 
         if success:
-            entry_type = "DISCRETIONARY" if friday else "EMERGENCY"
-            logger.info(f"BUY [{entry_type}] {ticker}: {shares} shares @ ${limit_price:.2f}")
-            state.log_trade(ticker, 'BUY', shares, limit_price, 'DOUBLE7_ENTRY' if friday else 'EMERGENCY_REPLACE')
-            state.increment_trade_count()
+            logger.info(f"BUY [{entry_type}] {ticker}: {shares} shares")
+            limit_price = calculate_limit_price(price, is_buy=True)
             state.add_position(ticker, shares, limit_price, bucket=candidate.bucket)
             buys_executed.append(ticker)
             week_replacements += 1
-            time.sleep(3)
+            time.sleep(2)
 
             # Check limits
             if len(buys_executed) >= (max_satellites - current_satellites):
@@ -450,15 +500,17 @@ def execute_risk_off_mode(
             if not trade_valid:
                 continue
 
-            limit_price = calculate_limit_price(current_price, is_buy=False)
-            success, msg = bot.place_sell_order(ticker, shares, limit_price)
+            # Use stall-proof execution pipeline
+            success, msg = execute_trade_safely(
+                bot, state, ticker, "SELL", shares,
+                rationale="RISK_OFF_STOP",
+                dry_run=config.DRY_RUN_MODE
+            )
 
             if success:
-                logger.info(f"RISK-OFF SELL {ticker}: {shares} shares @ ${limit_price:.2f}")
-                state.log_trade(ticker, 'SELL', shares, limit_price, 'RISK_OFF_STOP')
-                state.increment_trade_count()
+                logger.info(f"RISK-OFF SELL {ticker}: {shares} shares")
                 state.remove_position(ticker)
-                time.sleep(3)
+                time.sleep(2)
 
     logger.info("Risk-off mode complete - no new buys permitted")
 
@@ -526,17 +578,21 @@ def execute_day1_build():
 
             logger.info(f"CORE: {ticker} - {shares} shares @ ${limit_price:.2f} ({target_pct*100:.0f}%)")
 
-            success, msg = bot.place_buy_order(ticker, shares, limit_price)
+            # Use stall-proof execution pipeline
+            success, msg = execute_trade_safely(
+                bot, state, ticker, "BUY", shares,
+                rationale=f"DAY1_CORE_{target_pct*100:.0f}PCT",
+                dry_run=config.DRY_RUN_MODE
+            )
 
             if success:
-                state.log_trade(ticker, 'BUY', shares, limit_price, 'DAY1_CORE')
-                state.increment_trade_count()
+                logger.info(f"SUCCESS: {ticker} - {msg}")
                 state.add_position(ticker, shares, limit_price, bucket='CORE')
                 trades_executed += 1
             else:
                 logger.error(f"Failed to buy {ticker}: {msg}")
 
-            time.sleep(5)
+            time.sleep(3)
 
         # ===== SATELLITE POSITIONS (8 trades) =====
         logger.info("\n--- Building SATELLITE positions ---")
@@ -559,17 +615,21 @@ def execute_day1_build():
 
             logger.info(f"SATELLITE: {ticker} ({bucket}) - {shares} shares @ ${limit_price:.2f}")
 
-            success, msg = bot.place_buy_order(ticker, shares, limit_price)
+            # Use stall-proof execution pipeline
+            success, msg = execute_trade_safely(
+                bot, state, ticker, "BUY", shares,
+                rationale=f"DAY1_{bucket}",
+                dry_run=config.DRY_RUN_MODE
+            )
 
             if success:
-                state.log_trade(ticker, 'BUY', shares, limit_price, f'DAY1_{bucket}')
-                state.increment_trade_count()
+                logger.info(f"SUCCESS: {ticker} - {msg}")
                 state.add_position(ticker, shares, limit_price, bucket=bucket)
                 trades_executed += 1
             else:
                 logger.error(f"Failed to buy {ticker}: {msg}")
 
-            time.sleep(5)
+            time.sleep(3)
 
         # Mark execution
         state.mark_execution()
