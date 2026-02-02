@@ -656,11 +656,21 @@ class ExecutionPipeline:
         Click Preview/Review Order button OR skip if StockTrak uses direct submission.
 
         StockTrak's interface may vary - some views have Preview, others submit directly.
-        We handle both cases.
+        We handle both cases with maximum resilience.
         """
         logger.info("Looking for Preview/Review Order button...")
 
         self._dismiss_overlays()
+
+        # CRITICAL: Wait for page to fully render - buttons may not be visible immediately
+        time.sleep(2)
+
+        # Scroll down to ensure button is in view
+        try:
+            self.page.evaluate("window.scrollBy(0, 300)")
+            time.sleep(0.5)
+        except Exception:
+            pass
 
         # Try multiple button text patterns for preview step
         preview_patterns = [
@@ -669,34 +679,70 @@ class ExecutionPipeline:
             "Preview",
             "Continue",
             "Next",
+            "Review",
         ]
 
         preview_found = False
+
+        # Strategy 1: getByRole with flexible regex (contains, not exact)
         for pattern in preview_patterns:
             try:
-                btn = self.page.get_by_role("button", name=re.compile(f"^{pattern}$", re.I)).first
-                if btn.is_visible(timeout=3000):
-                    logger.info(f"Found preview button: {pattern}")
+                btn = self.page.get_by_role("button", name=re.compile(pattern, re.I)).first
+                if btn.is_visible(timeout=2000):
+                    logger.info(f"Found preview button via role: {pattern}")
                     btn.click()
                     preview_found = True
                     break
             except Exception:
                 pass
 
-            # Also try locator approach
+        # Strategy 2: locator with has-text
+        if not preview_found:
+            for pattern in preview_patterns:
+                try:
+                    btn = self.page.locator(f"button:has-text('{pattern}')").first
+                    if btn.is_visible(timeout=1500):
+                        logger.info(f"Found preview button via locator: {pattern}")
+                        btn.click()
+                        preview_found = True
+                        break
+                except Exception:
+                    pass
+
+        # Strategy 3: Any element containing the text (not just buttons)
+        if not preview_found:
+            for pattern in preview_patterns:
+                try:
+                    elem = self.page.locator(f"text=/{pattern}/i").first
+                    if elem.is_visible(timeout=1500):
+                        logger.info(f"Found preview element via text: {pattern}")
+                        elem.click()
+                        preview_found = True
+                        break
+                except Exception:
+                    pass
+
+        # Strategy 4: Look for ANY button below the shares input
+        if not preview_found:
+            logger.info("Trying to find any action button in form area...")
             try:
-                btn = self.page.locator(f"button:has-text('{pattern}')").first
-                if btn.is_visible(timeout=2000):
-                    logger.info(f"Found preview button via locator: {pattern}")
-                    btn.click()
-                    preview_found = True
-                    break
-            except Exception:
-                pass
+                # Find buttons near ORDER TYPE or SHARES
+                form_buttons = self.page.locator("button").all()
+                for btn in form_buttons:
+                    try:
+                        btn_text = btn.text_content().strip().lower()
+                        if btn.is_visible() and btn_text and any(kw in btn_text for kw in ['review', 'preview', 'order', 'submit', 'continue', 'next']):
+                            logger.info(f"Found form button: {btn_text}")
+                            btn.click()
+                            preview_found = True
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.debug(f"Form button search failed: {e}")
 
         if not preview_found:
             # No preview button - check if Place Order is directly visible
-            # StockTrak may skip preview and go directly to submission
             logger.info("No preview button found - checking for direct Place Order...")
             place_patterns = ["Place Order", "Submit Order", "Submit", "Place Trade", "Execute"]
             for pattern in place_patterns:
@@ -714,7 +760,7 @@ class ExecutionPipeline:
             self._take_screenshot(f"no_buttons_{order.ticker}")
             return True
 
-        # Wait for preview to load
+        # Wait for preview/confirmation to load
         self.page.wait_for_load_state("networkidle", timeout=30000)
         time.sleep(2)
         self._dismiss_overlays()
