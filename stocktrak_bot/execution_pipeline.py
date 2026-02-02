@@ -312,25 +312,52 @@ class ExecutionPipeline:
         """Verify we're logged in to StockTrak."""
         logger.info("Verifying login status...")
 
-        # Check for logged-in indicators
+        # FIRST: Check if we're on login page - if so, definitely not logged in
+        url = self.page.url.lower()
+        if '/login' in url:
+            logger.info("On login page - need to authenticate")
+            if not self.bot.login():
+                raise RuntimeError("Login failed")
+            return True
+
+        # Check for Logout link - ONLY exists when authenticated
+        try:
+            logout = self.page.get_by_role("link", name=re.compile("logout", re.I))
+            if logout.count() > 0 and logout.first.is_visible(timeout=3000):
+                logger.info("Login verified via Logout link")
+                return True
+        except Exception:
+            pass
+
+        # Check for authenticated-only indicators (NOT "Welcome back" - that's on login page too!)
         indicators = [
+            "text=PORTFOLIO VALUE",
+            "text=BUYING POWER",
+            "text=Open Positions",
+            "text=My Dashboard",
             "text=Portfolio Simulation",
-            "text=My Portfolio",
-            "text=Trading",
-            "text=Logout",
         ]
 
         for indicator in indicators:
             try:
-                if self.page.locator(indicator).first.is_visible(timeout=5000):
+                if self.page.locator(indicator).first.is_visible(timeout=2000):
                     logger.info(f"Login verified via: {indicator}")
                     return True
             except Exception:
-                # Expected to fail for most indicators - continue checking others
                 continue
 
+        # Check for password field - indicates login page
+        try:
+            if self.page.locator("input[type='password']").first.is_visible(timeout=1000):
+                logger.info("Password field visible - on login page")
+                if not self.bot.login():
+                    raise RuntimeError("Login failed")
+                return True
+        except Exception:
+            pass
+
         # Not logged in - try to login
-        logger.info("Not logged in - attempting login...")
+        logger.info("No login indicators found - attempting login...")
         if not self.bot.login():
             raise RuntimeError("Login failed")
 
