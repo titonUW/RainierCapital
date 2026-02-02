@@ -571,11 +571,6 @@ class ExecutionPipeline:
 
         raise RuntimeError(f"Could not fill shares input after {max_attempts} attempts")
 
-            except Exception as e:
-                logger.warning(f"Fill attempt {attempt+1} failed: {e}")
-
-        raise RuntimeError(f"Could not fill shares input after {max_attempts} attempts")
-
     def _set_order_type(self, order_type: str = "Market"):
         """Set order type dropdown."""
         try:
