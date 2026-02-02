@@ -773,11 +773,19 @@ class ExecutionPipeline:
         """Click Place Order and verify submission."""
         logger.info("Clicking Place Order...")
 
+        # CRITICAL: Wait for the confirmation modal to appear after Review Order
+        # The modal takes time to render and the Place Order button is inside it
+        logger.info("Waiting for confirmation modal to appear...")
+        time.sleep(2)  # Give modal time to animate in
+
         self._dismiss_overlays()
 
         # IDEMPOTENCY: Check one more time before placing
         if self._check_already_placed(order):
             raise RuntimeError("Order already placed - aborting to prevent duplicate")
+
+        # Take screenshot to see what we're looking at
+        self._take_screenshot(f"before_place_{order.ticker}")
 
         # Find and click Place Order using multiple strategies
         place_patterns = [
@@ -793,26 +801,109 @@ class ExecutionPipeline:
         ]
 
         clicked = False
-        for pattern in place_patterns:
+
+        # Strategy 1: Look for button inside modal/dialog specifically
+        logger.info("Strategy 1: Looking inside modal for Place Order button...")
+        modal_selectors = [
+            ".modal:visible",
+            ".modal.show",
+            "[role='dialog']",
+            ".modal-content",
+            ".confirmation-modal",
+            "#orderConfirmation",
+        ]
+
+        for modal_sel in modal_selectors:
+            if clicked:
+                break
             try:
-                btn = self.page.get_by_role("button", name=re.compile(f"^{pattern}$", re.I)).first
-                if btn.is_visible(timeout=2000):
-                    logger.info(f"Clicking submit button: {pattern}")
-                    btn.click()
-                    clicked = True
-                    break
+                modal = self.page.locator(modal_sel).first
+                if modal.is_visible(timeout=1000):
+                    logger.info(f"Found modal: {modal_sel}")
+                    for pattern in ["Place Order", "Submit Order", "Submit", "Confirm"]:
+                        try:
+                            btn = modal.locator(f"button:has-text('{pattern}')").first
+                            if btn.is_visible(timeout=1000):
+                                logger.info(f"Found button in modal: {pattern}")
+                                btn.click()
+                                clicked = True
+                                break
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
+        # Strategy 2: Use getByRole with exact patterns
+        if not clicked:
+            logger.info("Strategy 2: Looking for button by role...")
+            for pattern in place_patterns:
+                try:
+                    btn = self.page.get_by_role("button", name=re.compile(f"^{pattern}$", re.I)).first
+                    if btn.is_visible(timeout=2000):
+                        logger.info(f"Clicking submit button: {pattern}")
+                        btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+
+        # Strategy 3: Use has-text locator (less strict)
+        if not clicked:
+            logger.info("Strategy 3: Looking for button by has-text...")
+            for pattern in place_patterns:
+                try:
+                    btn = self.page.locator(f"button:has-text('{pattern}')").first
+                    if btn.is_visible(timeout=1500):
+                        logger.info(f"Clicking submit button via locator: {pattern}")
+                        btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+
+        # Strategy 4: Find ANY visible button with Place/Submit in text
+        if not clicked:
+            logger.info("Strategy 4: Scanning all buttons on page...")
             try:
-                btn = self.page.locator(f"button:has-text('{pattern}')").first
-                if btn.is_visible(timeout=1500):
-                    logger.info(f"Clicking submit button via locator: {pattern}")
-                    btn.click()
-                    clicked = True
-                    break
-            except Exception:
-                pass
+                buttons = self.page.locator("button:visible").all()
+                logger.info(f"Found {len(buttons)} visible buttons")
+                for btn in buttons:
+                    try:
+                        text = btn.text_content().strip().lower()
+                        logger.info(f"  Button text: '{text}'")
+                        if any(kw in text for kw in ['place', 'submit', 'confirm', 'execute']):
+                            logger.info(f"Clicking button with text: {text}")
+                            btn.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Button scan failed: {e}")
+
+        # Strategy 5: Look for button with specific CSS classes
+        if not clicked:
+            logger.info("Strategy 5: Looking for submit button by class...")
+            submit_selectors = [
+                "button.btn-primary:visible",
+                "button.btn-success:visible",
+                "button[type='submit']:visible",
+                ".modal button.btn-primary",
+                ".modal-footer button.btn-primary",
+            ]
+            for sel in submit_selectors:
+                try:
+                    btn = self.page.locator(sel).first
+                    if btn.is_visible(timeout=1000):
+                        text = btn.text_content().strip()
+                        # Make sure it's not a cancel button
+                        if 'cancel' not in text.lower() and 'close' not in text.lower():
+                            logger.info(f"Clicking button via selector {sel}: {text}")
+                            btn.click()
+                            clicked = True
+                            break
+                except Exception:
+                    pass
 
         if not clicked:
             self._take_screenshot(f"no_submit_button_{order.ticker}")
