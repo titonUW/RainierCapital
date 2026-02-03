@@ -686,336 +686,176 @@ class ExecutionPipeline:
 
     def _preview_order(self, order: TradeOrder) -> bool:
         """
-        Click Preview/Review Order button and wait for confirmation UI.
-
-        StockTrak's interface may vary - some views have Preview, others submit directly.
-        We handle both cases with maximum resilience.
+        Click Review Order button using JavaScript for maximum reliability.
         """
-        logger.info("Looking for Preview/Review Order button...")
+        logger.info("=== CLICKING REVIEW ORDER ===")
 
-        # Dismiss cookie/consent/tour overlays that block clicks
         self._dismiss_overlays()
+
+        # Scroll to bottom to reveal Review Order button
+        self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(1)
+        self._take_screenshot(f"scrolled_{order.ticker}")
 
-        # Take screenshot to see current state
-        self._take_screenshot(f"before_preview_{order.ticker}")
+        # USE JAVASCRIPT to find and click Review Order button
+        js_click_script = """
+        (function() {
+            const clickables = document.querySelectorAll('button, a, [role="button"]');
+            const reviewKeywords = ['review order', 'preview order', 'review', 'preview', 'continue', 'next'];
+            const excludeKeywords = ['cancel', 'close', 'back'];
 
-        # Scroll the form area into view - buttons may be below viewport
+            for (const element of clickables) {
+                const text = (element.textContent || '').toLowerCase().trim();
+                if (excludeKeywords.some(kw => text.includes(kw))) continue;
+
+                if (reviewKeywords.some(kw => text.includes(kw))) {
+                    const rect = element.getBoundingClientRect();
+                    const style = window.getComputedStyle(element);
+                    const isVisible = rect.width > 0 && rect.height > 0 &&
+                                     style.display !== 'none' && style.visibility !== 'hidden';
+
+                    if (isVisible) {
+                        element.scrollIntoView({behavior: 'instant', block: 'center'});
+                        element.click();
+                        return {success: true, buttonText: text};
+                    }
+                }
+            }
+
+            // Debug: list all visible buttons
+            const allButtons = [];
+            document.querySelectorAll('button').forEach(btn => {
+                if (btn.offsetParent !== null) allButtons.push(btn.textContent.trim().substring(0, 30));
+            });
+            return {success: false, visibleButtons: allButtons};
+        })();
+        """
+
+        result = self.page.evaluate(js_click_script)
+        logger.info(f"Review Order JavaScript result: {result}")
+
+        if not result.get('success'):
+            logger.error(f"Could not find Review Order button. Visible: {result.get('visibleButtons', [])}")
+            self._take_screenshot(f"no_review_btn_{order.ticker}")
+            raise RuntimeError(f"Could not find Review Order button. Visible: {result.get('visibleButtons', [])}")
+
+        logger.info(f"SUCCESS: Clicked '{result.get('buttonText')}' via JavaScript")
+
+        # Wait for confirmation UI to appear
+        logger.info("Waiting for confirmation UI...")
+        time.sleep(3)
+        self._take_screenshot(f"after_review_click_{order.ticker}")
+
+        # Verify confirmation appeared by looking for "Confirm Order" button
         try:
-            # Try to scroll ACTION or ORDER TYPE area into view
-            action_area = self.page.locator("text=ACTION, text=ORDER TYPE, text=SHARES").first
-            if action_area.is_visible(timeout=2000):
-                action_area.scroll_into_view_if_needed()
-                time.sleep(0.5)
+            confirm_btn = self.page.locator("button:has-text('Confirm Order')").first
+            if confirm_btn.is_visible(timeout=5000):
+                logger.info("SUCCESS: Confirmation UI appeared (Confirm Order button visible)")
+                return True
         except Exception:
-            # Fallback: scroll down 400px
-            self.page.evaluate("window.scrollBy(0, 400)")
-            time.sleep(0.5)
+            pass
 
-        # Try multiple button text patterns for preview step
-        preview_patterns = [
-            "Review Order",
-            "Preview Order",
-            "Preview",
-            "Continue",
-            "Next",
-            "Review",
-        ]
+        # Check for "Estimated Cost" text (appears in confirmation)
+        try:
+            if self.page.locator("text=/estimated.*cost/i").first.is_visible(timeout=2000):
+                logger.info("SUCCESS: Confirmation UI appeared (Estimated Cost visible)")
+                return True
+        except Exception:
+            pass
 
-        preview_found = False
-
-        # Strategy 1: getByRole with scroll_into_view_if_needed
-        for pattern in preview_patterns:
-            try:
-                btn = self.page.get_by_role("button", name=re.compile(pattern, re.I)).first
-                if btn.is_visible(timeout=2000):
-                    logger.info(f"Found preview button via role: {pattern}")
-                    btn.scroll_into_view_if_needed()
-                    btn.click(timeout=5000)
-                    preview_found = True
-                    break
-            except Exception:
-                pass
-
-        # Strategy 2: locator with has-text + scroll
-        if not preview_found:
-            for pattern in preview_patterns:
-                try:
-                    btn = self.page.locator(f"button:has-text('{pattern}')").first
-                    if btn.is_visible(timeout=1500):
-                        logger.info(f"Found preview button via locator: {pattern}")
-                        btn.scroll_into_view_if_needed()
-                        btn.click(timeout=5000)
-                        preview_found = True
-                        break
-                except Exception:
-                    pass
-
-        # Strategy 3: Any clickable element with review text
-        if not preview_found:
-            for pattern in preview_patterns:
-                try:
-                    elem = self.page.locator(f"text=/{pattern}/i").first
-                    if elem.is_visible(timeout=1500):
-                        logger.info(f"Found preview element via text: {pattern}")
-                        elem.scroll_into_view_if_needed()
-                        elem.click(timeout=5000)
-                        preview_found = True
-                        break
-                except Exception:
-                    pass
-
-        # Strategy 4: Scan ALL visible buttons for review/preview keywords
-        if not preview_found:
-            logger.info("Scanning all buttons for review/preview keywords...")
-            try:
-                buttons = self.page.locator("button:visible").all()
-                for btn in buttons:
-                    try:
-                        text = btn.text_content().strip().lower()
-                        if any(kw in text for kw in ['review', 'preview', 'continue', 'next']):
-                            logger.info(f"Found button with text: {text}")
-                            btn.scroll_into_view_if_needed()
-                            btn.click(timeout=5000)
-                            preview_found = True
-                            break
-                    except Exception:
-                        continue
-            except Exception as e:
-                logger.debug(f"Button scan failed: {e}")
-
-        if not preview_found:
-            # No preview button - check if Confirm/Place Order is directly visible (some UIs skip preview)
-            logger.info("No preview button - checking for direct submit...")
-            direct_patterns = ["Confirm Order", "Place Order", "Submit Order", "Submit"]
-            for pattern in direct_patterns:
-                try:
-                    btn = self.page.locator(f"button:has-text('{pattern}')").first
-                    if btn.is_visible(timeout=2000):
-                        logger.info(f"Found direct submit button: {pattern} - skipping preview")
-                        self._take_screenshot(f"direct_submit_{order.ticker}")
-                        return True  # Preview step not needed
-                except Exception:
-                    pass
-
-            # Still nothing - screenshot and fail
-            self._take_screenshot(f"no_preview_button_{order.ticker}")
-            raise RuntimeError("Could not find Review/Preview button")
-
-        # Wait for confirmation/review UI to appear
-        time.sleep(2)
-        self._dismiss_overlays()
-
-        # Verify we reached review state by looking for review signals
-        review_signals = [
-            self.page.locator("text=/confirm.*order/i"),
-            self.page.locator("text=/review.*order/i"),
-            self.page.locator("text=/order.*summary/i"),
-            self.page.locator("button:has-text('Confirm Order')"),
-            self.page.locator("button:has-text('Place Order')"),
-            self.page.locator("text=/estimated.*cost/i"),
-        ]
-
-        review_reached = False
-        for sig in review_signals:
-            try:
-                if sig.first.is_visible(timeout=3000):
-                    logger.info("Confirmed: reached review/confirmation UI")
-                    review_reached = True
-                    break
-            except Exception:
-                pass
-
-        if not review_reached:
-            logger.warning("Clicked preview but couldn't verify review UI appeared")
-            self._take_screenshot(f"review_uncertain_{order.ticker}")
-            # Continue anyway - the click may have worked
-
-        self._take_screenshot(f"preview_{order.ticker}")
-        logger.info("Preview step completed")
-        return True
+        logger.warning("Clicked Review Order but confirmation UI not verified")
+        return True  # Continue anyway
 
     def _place_order(self, order: TradeOrder) -> bool:
-        """Click Place Order and verify submission."""
-        logger.info("Clicking Place Order...")
-
-        # CRITICAL: Wait for the confirmation modal to appear after Review Order
-        # The modal takes time to render and the Place Order button is inside it
-        logger.info("Waiting for confirmation modal to appear...")
-        time.sleep(2)  # Give modal time to animate in
+        """
+        Click Confirm Order button using JavaScript for maximum reliability.
+        """
+        logger.info("=== CLICKING CONFIRM ORDER ===")
 
         self._dismiss_overlays()
+        time.sleep(2)  # Hard wait for confirmation UI to fully render
+        self._take_screenshot(f"before_confirm_{order.ticker}")
 
-        # IDEMPOTENCY: Check one more time before placing
+        # IDEMPOTENCY CHECK
         if self._check_already_placed(order):
             raise RuntimeError("Order already placed - aborting to prevent duplicate")
 
-        # Take screenshot to see what we're looking at
-        self._take_screenshot(f"before_place_{order.ticker}")
+        # USE JAVASCRIPT to find and click - most reliable method
+        js_click_script = """
+        (function() {
+            const clickables = document.querySelectorAll('button, a, [role="button"], input[type="submit"]');
+            const confirmKeywords = ['confirm order', 'place order', 'submit order', 'confirm', 'place trade'];
+            const excludeKeywords = ['cancel', 'close', 'back', 'edit'];
 
-        # Find and click Place Order using multiple strategies
-        place_patterns = [
-            "Place Order",
-            "Submit Order",
-            "Submit",
-            "Place Trade",
-            "Execute Order",
-            "Execute",
-            "Confirm Order",
-            "Confirm",
-            "Buy",  # Sometimes Buy button is the final submit
-        ]
+            for (const element of clickables) {
+                const text = (element.textContent || element.value || '').toLowerCase().trim();
+                if (excludeKeywords.some(kw => text.includes(kw))) continue;
 
-        clicked = False
+                if (confirmKeywords.some(kw => text.includes(kw))) {
+                    const rect = element.getBoundingClientRect();
+                    const style = window.getComputedStyle(element);
+                    const isVisible = rect.width > 0 && rect.height > 0 &&
+                                     style.display !== 'none' && style.visibility !== 'hidden';
 
-        # Strategy 0: DIRECT search for "Confirm Order" button (StockTrak's actual button text)
-        logger.info("Strategy 0: Looking for 'Confirm Order' button directly...")
-        try:
-            confirm_btn = self.page.locator("button:has-text('Confirm Order')").first
-            if confirm_btn.is_visible(timeout=3000):
-                logger.info("Found 'Confirm Order' button - clicking!")
-                confirm_btn.click()
-                clicked = True
-        except Exception as e:
-            logger.debug(f"Direct Confirm Order search failed: {e}")
+                    if (isVisible) {
+                        element.scrollIntoView({behavior: 'instant', block: 'center'});
+                        element.click();
+                        return {success: true, buttonText: text};
+                    }
+                }
+            }
 
-        # Strategy 1: Look for button inside modal/dialog specifically
-        if not clicked:
-            logger.info("Strategy 1: Looking inside modal for Place Order button...")
-        modal_selectors = [
-            ".modal:visible",
-            ".modal.show",
-            "[role='dialog']",
-            ".modal-content",
-            ".confirmation-modal",
-            "#orderConfirmation",
-        ]
+            // Fallback: find primary button in confirm/modal container
+            const containers = document.querySelectorAll('[class*="confirm"], [class*="modal"], [class*="order"]');
+            for (const container of containers) {
+                const style = window.getComputedStyle(container);
+                if (style.display === 'none') continue;
+                const btn = container.querySelector('.btn-primary, .btn-success, button[class*="primary"]');
+                if (btn && btn.offsetParent !== null) {
+                    const text = btn.textContent.toLowerCase();
+                    if (!excludeKeywords.some(kw => text.includes(kw))) {
+                        btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                        btn.click();
+                        return {success: true, buttonText: text, fallback: true};
+                    }
+                }
+            }
 
-        for modal_sel in modal_selectors:
-            if clicked:
-                break
-            try:
-                modal = self.page.locator(modal_sel).first
-                if modal.is_visible(timeout=1000):
-                    logger.info(f"Found modal: {modal_sel}")
-                    for pattern in ["Place Order", "Submit Order", "Submit", "Confirm"]:
-                        try:
-                            btn = modal.locator(f"button:has-text('{pattern}')").first
-                            if btn.is_visible(timeout=1000):
-                                logger.info(f"Found button in modal: {pattern}")
-                                btn.click()
-                                clicked = True
-                                break
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            // Debug: list all visible buttons
+            const allButtons = [];
+            document.querySelectorAll('button').forEach(btn => {
+                if (btn.offsetParent !== null) allButtons.push(btn.textContent.trim().substring(0, 30));
+            });
+            return {success: false, visibleButtons: allButtons};
+        })();
+        """
 
-        # Strategy 2: Use getByRole with exact patterns
-        if not clicked:
-            logger.info("Strategy 2: Looking for button by role...")
-            for pattern in place_patterns:
-                try:
-                    btn = self.page.get_by_role("button", name=re.compile(f"^{pattern}$", re.I)).first
-                    if btn.is_visible(timeout=2000):
-                        logger.info(f"Clicking submit button: {pattern}")
-                        btn.click()
-                        clicked = True
-                        break
-                except Exception:
-                    pass
+        result = self.page.evaluate(js_click_script)
+        logger.info(f"JavaScript click result: {result}")
 
-        # Strategy 3: Use has-text locator (less strict)
-        if not clicked:
-            logger.info("Strategy 3: Looking for button by has-text...")
-            for pattern in place_patterns:
-                try:
-                    btn = self.page.locator(f"button:has-text('{pattern}')").first
-                    if btn.is_visible(timeout=1500):
-                        logger.info(f"Clicking submit button via locator: {pattern}")
-                        btn.click()
-                        clicked = True
-                        break
-                except Exception:
-                    pass
+        if result.get('success'):
+            logger.info(f"SUCCESS: Clicked '{result.get('buttonText')}' via JavaScript")
+            time.sleep(3)
+            self._take_screenshot(f"after_confirm_{order.ticker}")
 
-        # Strategy 4: Find ANY visible button with Place/Submit in text
-        if not clicked:
-            logger.info("Strategy 4: Scanning all buttons on page...")
-            try:
-                buttons = self.page.locator("button:visible").all()
-                logger.info(f"Found {len(buttons)} visible buttons")
-                for btn in buttons:
-                    try:
-                        text = btn.text_content().strip().lower()
-                        logger.info(f"  Button text: '{text}'")
-                        if any(kw in text for kw in ['place', 'submit', 'confirm', 'execute']):
-                            logger.info(f"Clicking button with text: {text}")
-                            btn.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning(f"Button scan failed: {e}")
+            # Check for success
+            page_text = self.page.content().lower()
+            if any(kw in page_text for kw in ['confirmed', 'submitted', 'success', 'order placed', 'thank you']):
+                logger.info("ORDER SUBMITTED SUCCESSFULLY!")
+                return True
 
-        # Strategy 5: Look for button with specific CSS classes
-        if not clicked:
-            logger.info("Strategy 5: Looking for submit button by class...")
-            submit_selectors = [
-                "button.btn-primary:visible",
-                "button.btn-success:visible",
-                "button[type='submit']:visible",
-                ".modal button.btn-primary",
-                ".modal-footer button.btn-primary",
-            ]
-            for sel in submit_selectors:
-                try:
-                    btn = self.page.locator(sel).first
-                    if btn.is_visible(timeout=1000):
-                        text = btn.text_content().strip()
-                        # Make sure it's not a cancel button
-                        if 'cancel' not in text.lower() and 'close' not in text.lower():
-                            logger.info(f"Clicking button via selector {sel}: {text}")
-                            btn.click()
-                            clicked = True
-                            break
-                except Exception:
-                    pass
+            if any(kw in page_text for kw in ['error', 'failed', 'invalid', 'rejected']):
+                error_msg = self._extract_error_message()
+                raise RuntimeError(f"Order failed: {error_msg}")
 
-        if not clicked:
-            self._take_screenshot(f"no_submit_button_{order.ticker}")
-            raise RuntimeError("Could not find any submit/place order button")
-
-        # Wait for submission - use domcontentloaded not networkidle
-        try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=15000)
-        except Exception:
-            pass  # Continue anyway
-        time.sleep(3)
-        self._dismiss_overlays()
-
-        self._take_screenshot(f"after_place_{order.ticker}")
-
-        # Check for confirmation keywords
-        page_text = self.page.content().lower()
-        success_keywords = ['confirmed', 'submitted', 'success', 'order placed', 'order received', 'thank you']
-        error_keywords = ['error', 'failed', 'invalid', 'rejected', 'insufficient', 'cannot']
-
-        has_success = any(kw in page_text for kw in success_keywords)
-        has_error = any(kw in page_text for kw in error_keywords)
-
-        if has_error and not has_success:
-            # Try to extract error message
-            error_msg = self._extract_error_message()
-            raise RuntimeError(f"Order placement failed: {error_msg}")
-
-        if has_success:
-            logger.info("Order submission confirmed via page content")
+            logger.info("Order likely submitted - will verify in history")
+            return True
         else:
-            logger.warning("No clear confirmation - will verify in history")
-
-        return True
+            # JavaScript failed - log visible buttons for debugging
+            logger.error(f"JavaScript could not find confirm button!")
+            logger.error(f"Visible buttons on page: {result.get('visibleButtons', [])}")
+            self._take_screenshot(f"no_confirm_btn_{order.ticker}")
+            raise RuntimeError(f"Could not find Confirm Order button. Visible: {result.get('visibleButtons', [])}")
 
     def _extract_error_message(self) -> str:
         """Try to extract error message from page."""
