@@ -90,7 +90,8 @@ logger = logging.getLogger('stocktrak_bot.daily_routine')
 
 
 def execute_trade_safely(bot, state: StateManager, ticker: str, side: str,
-                         shares: int, rationale: str, dry_run: bool = False) -> Tuple[bool, str]:
+                         shares: int, rationale: str, dry_run: bool = False,
+                         portfolio_pct: float = 0.0) -> Tuple[bool, str]:
     """
     Execute a trade using the stall-proof execution pipeline.
 
@@ -109,6 +110,7 @@ def execute_trade_safely(bot, state: StateManager, ticker: str, side: str,
         shares: Number of shares
         rationale: Trade rationale for notes
         dry_run: If True, stop before placing
+        portfolio_pct: Percentage of portfolio this trade represents
 
     Returns:
         Tuple of (success, message)
@@ -117,7 +119,8 @@ def execute_trade_safely(bot, state: StateManager, ticker: str, side: str,
         ticker=ticker,
         side=side,
         shares=shares,
-        rationale=rationale
+        rationale=rationale,
+        portfolio_pct=portfolio_pct
     )
 
     pipeline = ExecutionPipeline(bot, state_manager=state, dry_run=dry_run)
@@ -719,7 +722,8 @@ def execute_day1_build():
             success, msg = execute_trade_safely(
                 bot, state, ticker, "BUY", shares,
                 rationale=f"DAY1_CORE_{target_pct*100:.0f}PCT",
-                dry_run=config.DRY_RUN_MODE
+                dry_run=config.DRY_RUN_MODE,
+                portfolio_pct=target_pct * 100
             )
 
             if success:
@@ -756,7 +760,8 @@ def execute_day1_build():
             success, msg = execute_trade_safely(
                 bot, state, ticker, "BUY", shares,
                 rationale=f"DAY1_{bucket}",
-                dry_run=config.DRY_RUN_MODE
+                dry_run=config.DRY_RUN_MODE,
+                portfolio_pct=SATELLITE_POSITION_SIZE * 100
             )
 
             if success:
