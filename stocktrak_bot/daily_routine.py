@@ -1,7 +1,7 @@
 """
 Daily Trading Routine for StockTrak Bot
 
-Contains the main trading logic executed daily at 3:55 PM ET:
+Contains the main trading logic executed daily at 9:30 AM ET (morning hours):
 - Market regime detection
 - Position evaluation
 - Entry/exit decisions
@@ -134,7 +134,7 @@ def execute_trade_safely(bot, state: StateManager, ticker: str, side: str,
 
 def execute_daily_routine():
     """
-    Main daily execution - called at 3:55 PM ET.
+    Main daily execution - called at 9:30 AM ET (morning hours).
 
     This is the heart of the trading bot. It:
     1. Logs into StockTrak

@@ -43,15 +43,15 @@ CASH_INTEREST_RATE = 0.01       # 1% annual on cash
 # =============================================================================
 MARKET_OPEN = "09:30"
 MARKET_CLOSE = "16:00"
-EXECUTION_WINDOW_START = "15:50"  # 3:50 PM ET
-EXECUTION_WINDOW_END = "15:59"    # 3:59 PM ET
+EXECUTION_WINDOW_START = "09:20"  # 9:20 AM ET (morning hours)
+EXECUTION_WINDOW_END = "09:40"    # 9:40 AM ET
 
 # =============================================================================
 # BOT SETTINGS
 # =============================================================================
 HEADLESS_MODE = True              # Set False to see browser during testing
-EXECUTION_TIME = "15:55"          # 3:55 PM ET - primary execution time
-DATA_COLLECTION_TIME = "15:30"    # 3:30 PM ET - data collection time
+EXECUTION_TIME = "09:30"          # 9:30 AM ET - primary execution time (morning hours)
+DATA_COLLECTION_TIME = "09:00"    # 9:00 AM ET - data collection time (pre-market)
 LOG_LEVEL = "INFO"
 SCREENSHOT_ON_ERROR = True
 SCREENSHOT_ON_TRADE = True

@@ -984,11 +984,24 @@ class ExecutionPipeline:
         return "Unknown error"
 
     def _verify_in_history(self, order: TradeOrder) -> bool:
-        """Verify trade appears in Transaction History or Order History."""
+        """
+        Verify trade appears in Transaction History or Order History.
+
+        NOTE: This is a NON-CRITICAL step. The order was already confirmed,
+        so verification failure doesn't mean the trade failed.
+        Uses 30-second timeout to prevent hangs.
+        """
         logger.info(f"Verifying trade in history: {order.side} {order.shares} {order.ticker}")
+
+        # Quick verification - don't spend too long on this non-critical step
+        MAX_VERIFY_TIME = 30  # seconds
+        start_time = time.time()
 
         # Try Transaction History first
         try:
+            if time.time() - start_time > MAX_VERIFY_TIME:
+                logger.warning("Verification timeout - skipping")
+                return False
             self._navigate_to_history("Transaction History")
             if self._find_trade_in_table(order):
                 logger.info("Trade found in Transaction History")
@@ -996,38 +1009,37 @@ class ExecutionPipeline:
         except Exception as e:
             logger.warning(f"Transaction History check failed: {e}")
 
-        # Fallback to Order History
-        try:
-            self._navigate_to_history("Order History")
-            if self._find_trade_in_table(order):
-                logger.info("Trade found in Order History")
-                return True
-        except Exception as e:
-            logger.warning(f"Order History check failed: {e}")
+        # Fallback to Order History (only if we have time)
+        if time.time() - start_time < MAX_VERIFY_TIME:
+            try:
+                self._navigate_to_history("Order History")
+                if self._find_trade_in_table(order):
+                    logger.info("Trade found in Order History")
+                    return True
+            except Exception as e:
+                logger.warning(f"Order History check failed: {e}")
 
-        logger.warning("Could not verify trade in history")
+        logger.warning("Could not verify trade in history (non-critical)")
         return False
 
     def _navigate_to_history(self, history_type: str):
-        """Navigate to Transaction History or Order History."""
+        """Navigate to Transaction History or Order History using direct URL."""
         self._dismiss_overlays()
 
-        # Hover My Portfolio to trigger dropdown
-        try:
-            portfolio_link = self.page.get_by_role("link", name=re.compile("My Portfolio", re.I))
-            portfolio_link.hover()
-            time.sleep(0.3)
-        except Exception as e:
-            # Menu might not need hover - continue to direct click
-            logger.debug(f"Portfolio hover failed (may be OK): {e}")
+        # USE DIRECT URL - hover menus are unreliable and can hang
+        if "transaction" in history_type.lower():
+            url = "https://app.stocktrak.com/portfolio/transactionhistory"
+        else:
+            url = "https://app.stocktrak.com/portfolio/orderhistory"
 
-        # Click history link
-        history_link = self.page.get_by_role("link", name=re.compile(history_type, re.I))
-        history_link.click()
+        logger.info(f"Navigating to history via URL: {url}")
+
         try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=15000)
-        except Exception:
-            pass
+            self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        except Exception as e:
+            logger.warning(f"History navigation timeout: {e}")
+            # Continue anyway - might have partially loaded
+
         self._dismiss_overlays()
         time.sleep(1)
 
