@@ -802,8 +802,20 @@ class ExecutionPipeline:
 
         clicked = False
 
+        # Strategy 0: DIRECT search for "Confirm Order" button (StockTrak's actual button text)
+        logger.info("Strategy 0: Looking for 'Confirm Order' button directly...")
+        try:
+            confirm_btn = self.page.locator("button:has-text('Confirm Order')").first
+            if confirm_btn.is_visible(timeout=3000):
+                logger.info("Found 'Confirm Order' button - clicking!")
+                confirm_btn.click()
+                clicked = True
+        except Exception as e:
+            logger.debug(f"Direct Confirm Order search failed: {e}")
+
         # Strategy 1: Look for button inside modal/dialog specifically
-        logger.info("Strategy 1: Looking inside modal for Place Order button...")
+        if not clicked:
+            logger.info("Strategy 1: Looking inside modal for Place Order button...")
         modal_selectors = [
             ".modal:visible",
             ".modal.show",
