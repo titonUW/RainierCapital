@@ -492,6 +492,15 @@ class ExecutionPipeline:
         Returns:
             True if clicked successfully
         """
+        # Scroll ACTION area into view first
+        try:
+            action_label = self.page.get_by_text(re.compile(r"^ACTION$", re.I)).first
+            if action_label.is_visible(timeout=2000):
+                action_label.scroll_into_view_if_needed()
+                time.sleep(0.3)
+        except Exception:
+            pass
+
         strategies = [
             # Strategy 1: Button by role with name (case-insensitive)
             lambda: self.page.get_by_role("button", name=re.compile(f"^{side}$", re.I)).first,
@@ -510,6 +519,7 @@ class ExecutionPipeline:
                 elem = strategy()
                 if elem.is_visible(timeout=3000):
                     logger.info(f"Clicking {side} button via strategy {i+1}")
+                    elem.scroll_into_view_if_needed()
                     elem.click(timeout=5000)
                     return True
             except Exception as e:
@@ -632,7 +642,12 @@ class ExecutionPipeline:
         raise RuntimeError(f"Could not fill shares input after {max_attempts} attempts")
 
     def _set_order_type(self, order_type: str = "Market"):
-        """Set order type dropdown."""
+        """
+        Set order type dropdown to Market.
+
+        CRITICAL: If order type is Limit and price is $0, the review step won't work!
+        Always ensure Market is selected.
+        """
         try:
             # Try to find and set order type dropdown
             dropdowns = self.page.locator('select')
@@ -644,33 +659,58 @@ class ExecutionPipeline:
                         if "market" in options_text or "limit" in options_text:
                             dropdown.select_option(label=order_type)
                             logger.info(f"Order type set to {order_type}")
+                            # Verify it was set
+                            time.sleep(0.3)
+                            selected = dropdown.input_value()
+                            logger.info(f"Order type verified: {selected}")
                             return
                 except:
                     continue
-            logger.warning("Could not find order type dropdown - using default")
+
+            # Fallback: try to find by label text
+            try:
+                order_type_label = self.page.locator("text=ORDER TYPE").first
+                if order_type_label.is_visible(timeout=1000):
+                    # Find the select near this label
+                    select_near_label = order_type_label.locator("xpath=following::select[1]").first
+                    if select_near_label.is_visible(timeout=1000):
+                        select_near_label.select_option(label=order_type)
+                        logger.info(f"Order type set to {order_type} via label")
+                        return
+            except Exception:
+                pass
+
+            logger.warning("Could not find order type dropdown - using default (may be Market already)")
         except Exception as e:
             logger.warning(f"Error setting order type: {e}")
 
     def _preview_order(self, order: TradeOrder) -> bool:
         """
-        Click Preview/Review Order button OR skip if StockTrak uses direct submission.
+        Click Preview/Review Order button and wait for confirmation UI.
 
         StockTrak's interface may vary - some views have Preview, others submit directly.
         We handle both cases with maximum resilience.
         """
         logger.info("Looking for Preview/Review Order button...")
 
+        # Dismiss cookie/consent/tour overlays that block clicks
         self._dismiss_overlays()
+        time.sleep(1)
 
-        # CRITICAL: Wait for page to fully render - buttons may not be visible immediately
-        time.sleep(2)
+        # Take screenshot to see current state
+        self._take_screenshot(f"before_preview_{order.ticker}")
 
-        # Scroll down to ensure button is in view
+        # Scroll the form area into view - buttons may be below viewport
         try:
-            self.page.evaluate("window.scrollBy(0, 300)")
-            time.sleep(0.5)
+            # Try to scroll ACTION or ORDER TYPE area into view
+            action_area = self.page.locator("text=ACTION, text=ORDER TYPE, text=SHARES").first
+            if action_area.is_visible(timeout=2000):
+                action_area.scroll_into_view_if_needed()
+                time.sleep(0.5)
         except Exception:
-            pass
+            # Fallback: scroll down 400px
+            self.page.evaluate("window.scrollBy(0, 400)")
+            time.sleep(0.5)
 
         # Try multiple button text patterns for preview step
         preview_patterns = [
@@ -684,91 +724,112 @@ class ExecutionPipeline:
 
         preview_found = False
 
-        # Strategy 1: getByRole with flexible regex (contains, not exact)
+        # Strategy 1: getByRole with scroll_into_view_if_needed
         for pattern in preview_patterns:
             try:
                 btn = self.page.get_by_role("button", name=re.compile(pattern, re.I)).first
                 if btn.is_visible(timeout=2000):
                     logger.info(f"Found preview button via role: {pattern}")
-                    btn.click()
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=5000)
                     preview_found = True
                     break
             except Exception:
                 pass
 
-        # Strategy 2: locator with has-text
+        # Strategy 2: locator with has-text + scroll
         if not preview_found:
             for pattern in preview_patterns:
                 try:
                     btn = self.page.locator(f"button:has-text('{pattern}')").first
                     if btn.is_visible(timeout=1500):
                         logger.info(f"Found preview button via locator: {pattern}")
-                        btn.click()
+                        btn.scroll_into_view_if_needed()
+                        btn.click(timeout=5000)
                         preview_found = True
                         break
                 except Exception:
                     pass
 
-        # Strategy 3: Any element containing the text (not just buttons)
+        # Strategy 3: Any clickable element with review text
         if not preview_found:
             for pattern in preview_patterns:
                 try:
                     elem = self.page.locator(f"text=/{pattern}/i").first
                     if elem.is_visible(timeout=1500):
                         logger.info(f"Found preview element via text: {pattern}")
-                        elem.click()
+                        elem.scroll_into_view_if_needed()
+                        elem.click(timeout=5000)
                         preview_found = True
                         break
                 except Exception:
                     pass
 
-        # Strategy 4: Look for ANY button below the shares input
+        # Strategy 4: Scan ALL visible buttons for review/preview keywords
         if not preview_found:
-            logger.info("Trying to find any action button in form area...")
+            logger.info("Scanning all buttons for review/preview keywords...")
             try:
-                # Find buttons near ORDER TYPE or SHARES
-                form_buttons = self.page.locator("button").all()
-                for btn in form_buttons:
+                buttons = self.page.locator("button:visible").all()
+                for btn in buttons:
                     try:
-                        btn_text = btn.text_content().strip().lower()
-                        if btn.is_visible() and btn_text and any(kw in btn_text for kw in ['review', 'preview', 'order', 'submit', 'continue', 'next']):
-                            logger.info(f"Found form button: {btn_text}")
-                            btn.click()
+                        text = btn.text_content().strip().lower()
+                        if any(kw in text for kw in ['review', 'preview', 'continue', 'next']):
+                            logger.info(f"Found button with text: {text}")
+                            btn.scroll_into_view_if_needed()
+                            btn.click(timeout=5000)
                             preview_found = True
                             break
                     except Exception:
                         continue
             except Exception as e:
-                logger.debug(f"Form button search failed: {e}")
+                logger.debug(f"Button scan failed: {e}")
 
         if not preview_found:
-            # No preview button - check if Place Order is directly visible
-            logger.info("No preview button found - checking for direct Place Order...")
-            place_patterns = ["Place Order", "Submit Order", "Submit", "Place Trade", "Execute"]
-            for pattern in place_patterns:
+            # No preview button - check if Confirm/Place Order is directly visible (some UIs skip preview)
+            logger.info("No preview button - checking for direct submit...")
+            direct_patterns = ["Confirm Order", "Place Order", "Submit Order", "Submit"]
+            for pattern in direct_patterns:
                 try:
-                    btn = self.page.get_by_role("button", name=re.compile(pattern, re.I)).first
+                    btn = self.page.locator(f"button:has-text('{pattern}')").first
                     if btn.is_visible(timeout=2000):
-                        logger.info(f"Found direct submit button: {pattern} - skipping preview step")
-                        self._take_screenshot(f"no_preview_{order.ticker}")
+                        logger.info(f"Found direct submit button: {pattern} - skipping preview")
+                        self._take_screenshot(f"direct_submit_{order.ticker}")
                         return True  # Preview step not needed
                 except Exception:
                     pass
 
-            # Still nothing - take screenshot and continue anyway
-            logger.warning("No preview or place button found - will try to proceed")
-            self._take_screenshot(f"no_buttons_{order.ticker}")
-            return True
+            # Still nothing - screenshot and fail
+            self._take_screenshot(f"no_preview_button_{order.ticker}")
+            raise RuntimeError("Could not find Review/Preview button")
 
-        # Wait for preview/confirmation to load
-        # NOTE: Don't use "networkidle" - StockTrak has constant network activity (ads, analytics)
-        # that prevents networkidle from ever being reached
-        try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            pass  # Continue anyway - the click worked
-        time.sleep(2)  # Give time for confirmation to appear
+        # Wait for confirmation/review UI to appear
+        time.sleep(2)
         self._dismiss_overlays()
+
+        # Verify we reached review state by looking for review signals
+        review_signals = [
+            self.page.locator("text=/confirm.*order/i"),
+            self.page.locator("text=/review.*order/i"),
+            self.page.locator("text=/order.*summary/i"),
+            self.page.locator("button:has-text('Confirm Order')"),
+            self.page.locator("button:has-text('Place Order')"),
+            self.page.locator("text=/estimated.*cost/i"),
+        ]
+
+        review_reached = False
+        for sig in review_signals:
+            try:
+                if sig.first.is_visible(timeout=3000):
+                    logger.info("Confirmed: reached review/confirmation UI")
+                    review_reached = True
+                    break
+            except Exception:
+                pass
+
+        if not review_reached:
+            logger.warning("Clicked preview but couldn't verify review UI appeared")
+            self._take_screenshot(f"review_uncertain_{order.ticker}")
+            # Continue anyway - the click may have worked
 
         self._take_screenshot(f"preview_{order.ticker}")
         logger.info("Preview step completed")
