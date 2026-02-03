@@ -686,7 +686,7 @@ class ExecutionPipeline:
 
     def _preview_order(self, order: TradeOrder) -> bool:
         """
-        Click Review Order button. SIMPLE AND DIRECT.
+        Click Review Order button using JavaScript for maximum reliability.
         """
         logger.info("=== CLICKING REVIEW ORDER ===")
 
@@ -697,44 +697,49 @@ class ExecutionPipeline:
         time.sleep(1)
         self._take_screenshot(f"scrolled_{order.ticker}")
 
-        # DIRECT: Find and click "Review Order" button
-        clicked = False
+        # USE JAVASCRIPT to find and click Review Order button
+        js_click_script = """
+        (function() {
+            const clickables = document.querySelectorAll('button, a, [role="button"]');
+            const reviewKeywords = ['review order', 'preview order', 'review', 'preview', 'continue', 'next'];
+            const excludeKeywords = ['cancel', 'close', 'back'];
 
-        # Try 1: Direct button locator
-        try:
-            btn = self.page.locator("button:has-text('Review Order')").first
-            if btn.is_visible(timeout=3000):
-                logger.info("Found 'Review Order' button - clicking with force")
-                btn.click(force=True, timeout=5000)
-                clicked = True
-        except Exception as e:
-            logger.debug(f"Review Order button attempt 1 failed: {e}")
+            for (const element of clickables) {
+                const text = (element.textContent || '').toLowerCase().trim();
+                if (excludeKeywords.some(kw => text.includes(kw))) continue;
 
-        # Try 2: Any element with "Review Order" text
-        if not clicked:
-            try:
-                elem = self.page.get_by_text("Review Order").first
-                if elem.is_visible(timeout=2000):
-                    logger.info("Found 'Review Order' text element - clicking")
-                    elem.click(force=True, timeout=5000)
-                    clicked = True
-            except Exception as e:
-                logger.debug(f"Review Order text attempt failed: {e}")
+                if (reviewKeywords.some(kw => text.includes(kw))) {
+                    const rect = element.getBoundingClientRect();
+                    const style = window.getComputedStyle(element);
+                    const isVisible = rect.width > 0 && rect.height > 0 &&
+                                     style.display !== 'none' && style.visibility !== 'hidden';
 
-        # Try 3: Button with "Review" in text
-        if not clicked:
-            try:
-                btn = self.page.locator("button:has-text('Review')").first
-                if btn.is_visible(timeout=2000):
-                    logger.info("Found 'Review' button - clicking")
-                    btn.click(force=True, timeout=5000)
-                    clicked = True
-            except Exception as e:
-                logger.debug(f"Review button attempt failed: {e}")
+                    if (isVisible) {
+                        element.scrollIntoView({behavior: 'instant', block: 'center'});
+                        element.click();
+                        return {success: true, buttonText: text};
+                    }
+                }
+            }
 
-        if not clicked:
+            // Debug: list all visible buttons
+            const allButtons = [];
+            document.querySelectorAll('button').forEach(btn => {
+                if (btn.offsetParent !== null) allButtons.push(btn.textContent.trim().substring(0, 30));
+            });
+            return {success: false, visibleButtons: allButtons};
+        })();
+        """
+
+        result = self.page.evaluate(js_click_script)
+        logger.info(f"Review Order JavaScript result: {result}")
+
+        if not result.get('success'):
+            logger.error(f"Could not find Review Order button. Visible: {result.get('visibleButtons', [])}")
             self._take_screenshot(f"no_review_btn_{order.ticker}")
-            raise RuntimeError("Could not find Review Order button")
+            raise RuntimeError(f"Could not find Review Order button. Visible: {result.get('visibleButtons', [])}")
+
+        logger.info(f"SUCCESS: Clicked '{result.get('buttonText')}' via JavaScript")
 
         # Wait for confirmation UI to appear
         logger.info("Waiting for confirmation UI...")
@@ -763,85 +768,94 @@ class ExecutionPipeline:
 
     def _place_order(self, order: TradeOrder) -> bool:
         """
-        Click Confirm Order button. SIMPLE AND DIRECT.
+        Click Confirm Order button using JavaScript for maximum reliability.
         """
         logger.info("=== CLICKING CONFIRM ORDER ===")
 
         self._dismiss_overlays()
+        time.sleep(2)  # Hard wait for confirmation UI to fully render
         self._take_screenshot(f"before_confirm_{order.ticker}")
 
         # IDEMPOTENCY CHECK
         if self._check_already_placed(order):
             raise RuntimeError("Order already placed - aborting to prevent duplicate")
 
-        clicked = False
+        # USE JAVASCRIPT to find and click - most reliable method
+        js_click_script = """
+        (function() {
+            const clickables = document.querySelectorAll('button, a, [role="button"], input[type="submit"]');
+            const confirmKeywords = ['confirm order', 'place order', 'submit order', 'confirm', 'place trade'];
+            const excludeKeywords = ['cancel', 'close', 'back', 'edit'];
 
-        # DIRECT APPROACH 1: Click "Confirm Order" button with force
-        try:
-            btn = self.page.locator("button:has-text('Confirm Order')").first
-            if btn.is_visible(timeout=5000):
-                logger.info("Found 'Confirm Order' button - clicking with force!")
-                btn.click(force=True, timeout=5000)
-                clicked = True
-        except Exception as e:
-            logger.warning(f"Confirm Order click attempt 1 failed: {e}")
+            for (const element of clickables) {
+                const text = (element.textContent || element.value || '').toLowerCase().trim();
+                if (excludeKeywords.some(kw => text.includes(kw))) continue;
 
-        # DIRECT APPROACH 2: Get by text
-        if not clicked:
-            try:
-                btn = self.page.get_by_text("Confirm Order").first
-                if btn.is_visible(timeout=3000):
-                    logger.info("Found 'Confirm Order' text - clicking with force!")
-                    btn.click(force=True, timeout=5000)
-                    clicked = True
-            except Exception as e:
-                logger.warning(f"Confirm Order click attempt 2 failed: {e}")
+                if (confirmKeywords.some(kw => text.includes(kw))) {
+                    const rect = element.getBoundingClientRect();
+                    const style = window.getComputedStyle(element);
+                    const isVisible = rect.width > 0 && rect.height > 0 &&
+                                     style.display !== 'none' && style.visibility !== 'hidden';
 
-        # DIRECT APPROACH 3: Any button with "Confirm" in text
-        if not clicked:
-            try:
-                btn = self.page.locator("button:has-text('Confirm')").first
-                if btn.is_visible(timeout=3000):
-                    logger.info("Found 'Confirm' button - clicking with force!")
-                    btn.click(force=True, timeout=5000)
-                    clicked = True
-            except Exception as e:
-                logger.warning(f"Confirm click attempt 3 failed: {e}")
+                    if (isVisible) {
+                        element.scrollIntoView({behavior: 'instant', block: 'center'});
+                        element.click();
+                        return {success: true, buttonText: text};
+                    }
+                }
+            }
 
-        # DIRECT APPROACH 4: Place Order / Submit Order
-        if not clicked:
-            for pattern in ["Place Order", "Submit Order", "Submit"]:
-                try:
-                    btn = self.page.locator(f"button:has-text('{pattern}')").first
-                    if btn.is_visible(timeout=2000):
-                        logger.info(f"Found '{pattern}' button - clicking with force!")
-                        btn.click(force=True, timeout=5000)
-                        clicked = True
-                        break
-                except Exception:
-                    pass
+            // Fallback: find primary button in confirm/modal container
+            const containers = document.querySelectorAll('[class*="confirm"], [class*="modal"], [class*="order"]');
+            for (const container of containers) {
+                const style = window.getComputedStyle(container);
+                if (style.display === 'none') continue;
+                const btn = container.querySelector('.btn-primary, .btn-success, button[class*="primary"]');
+                if (btn && btn.offsetParent !== null) {
+                    const text = btn.textContent.toLowerCase();
+                    if (!excludeKeywords.some(kw => text.includes(kw))) {
+                        btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                        btn.click();
+                        return {success: true, buttonText: text, fallback: true};
+                    }
+                }
+            }
 
-        if not clicked:
-            self._take_screenshot(f"no_confirm_btn_{order.ticker}")
-            raise RuntimeError("Could not find Confirm Order button")
+            // Debug: list all visible buttons
+            const allButtons = [];
+            document.querySelectorAll('button').forEach(btn => {
+                if (btn.offsetParent !== null) allButtons.push(btn.textContent.trim().substring(0, 30));
+            });
+            return {success: false, visibleButtons: allButtons};
+        })();
+        """
 
-        # Wait for submission
-        logger.info("Waiting for order submission...")
-        time.sleep(3)
-        self._take_screenshot(f"after_confirm_{order.ticker}")
+        result = self.page.evaluate(js_click_script)
+        logger.info(f"JavaScript click result: {result}")
 
-        # Check for success
-        page_text = self.page.content().lower()
-        if any(kw in page_text for kw in ['confirmed', 'submitted', 'success', 'order placed', 'thank you']):
-            logger.info("ORDER SUBMITTED SUCCESSFULLY!")
+        if result.get('success'):
+            logger.info(f"SUCCESS: Clicked '{result.get('buttonText')}' via JavaScript")
+            time.sleep(3)
+            self._take_screenshot(f"after_confirm_{order.ticker}")
+
+            # Check for success
+            page_text = self.page.content().lower()
+            if any(kw in page_text for kw in ['confirmed', 'submitted', 'success', 'order placed', 'thank you']):
+                logger.info("ORDER SUBMITTED SUCCESSFULLY!")
+                return True
+
+            if any(kw in page_text for kw in ['error', 'failed', 'invalid', 'rejected']):
+                error_msg = self._extract_error_message()
+                raise RuntimeError(f"Order failed: {error_msg}")
+
+            logger.info("Order likely submitted - will verify in history")
             return True
-
-        if any(kw in page_text for kw in ['error', 'failed', 'invalid', 'rejected']):
-            error_msg = self._extract_error_message()
-            raise RuntimeError(f"Order failed: {error_msg}")
-
-        logger.info("Order submission status uncertain - will verify in history")
-        return True
+        else:
+            # JavaScript failed - log visible buttons for debugging
+            logger.error(f"JavaScript could not find confirm button!")
+            logger.error(f"Visible buttons on page: {result.get('visibleButtons', [])}")
+            self._take_screenshot(f"no_confirm_btn_{order.ticker}")
+            raise RuntimeError(f"Could not find Confirm Order button. Visible: {result.get('visibleButtons', [])}")
 
     def _extract_error_message(self) -> str:
         """Try to extract error message from page."""
