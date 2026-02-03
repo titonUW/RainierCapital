@@ -61,6 +61,7 @@ class TradeOrder:
     order_type: str = "MARKET"  # "MARKET" or "LIMIT"
     limit_price: Optional[float] = None
     rationale: str = ""
+    portfolio_pct: float = 0.0  # Percentage of portfolio this trade represents
     run_id: str = ""
 
     def __post_init__(self):
@@ -766,14 +767,127 @@ class ExecutionPipeline:
         logger.warning("Clicked Review Order but confirmation UI not verified")
         return True  # Continue anyway
 
+    def _fill_trade_notes(self, order: TradeOrder):
+        """
+        Fill the TRADE NOTES field with rationale (required by StockTrak session rules).
+
+        Note format: "{TICKER} - {description}. {side} {shares} shares ({X}% of portfolio). {rationale}"
+        """
+        logger.info("Filling trade notes...")
+
+        # Build the trade note
+        ticker_descriptions = {
+            'VOO': 'Vanguard S&P 500 ETF',
+            'VTI': 'Vanguard Total Stock Market ETF',
+            'VEA': 'Vanguard Developed Markets ETF',
+            'BND': 'Vanguard Total Bond Market ETF',
+            'BNDX': 'Vanguard Total International Bond ETF',
+            'VWO': 'Vanguard Emerging Markets ETF',
+            'VNQ': 'Vanguard Real Estate ETF',
+            'VTIP': 'Vanguard Short-Term Inflation-Protected Securities ETF',
+            'SHV': 'iShares Short Treasury Bond ETF',
+            'GLD': 'SPDR Gold Shares ETF',
+            'TLT': 'iShares 20+ Year Treasury Bond ETF',
+            'HYG': 'iShares iBoxx High Yield Corporate Bond ETF',
+            'EMB': 'iShares JP Morgan Emerging Markets Bond ETF',
+            'LQD': 'iShares Investment Grade Corporate Bond ETF',
+            'MUB': 'iShares National Muni Bond ETF',
+            'SCHD': 'Schwab US Dividend Equity ETF',
+            'VIG': 'Vanguard Dividend Appreciation ETF',
+            'VXUS': 'Vanguard Total International Stock ETF',
+            'IWM': 'iShares Russell 2000 ETF',
+            'QQQ': 'Invesco QQQ Trust (Nasdaq-100)',
+            'SPY': 'SPDR S&P 500 ETF',
+            'AGG': 'iShares Core U.S. Aggregate Bond ETF',
+            'VT': 'Vanguard Total World Stock ETF',
+        }
+
+        ticker = order.ticker.upper()
+        description = ticker_descriptions.get(ticker, f'{ticker} ETF')
+
+        # Calculate percentage of portfolio (order has estimated cost info)
+        # Use the rationale from the order if available, otherwise generate one
+        pct_str = f"{order.portfolio_pct:.1f}%" if hasattr(order, 'portfolio_pct') and order.portfolio_pct else "target allocation"
+
+        # Build the note
+        if order.side.upper() == 'BUY':
+            action_desc = f"Buying {order.shares} shares"
+        else:
+            action_desc = f"Selling {order.shares} shares"
+
+        # Use order rationale if provided, otherwise use a default
+        rationale = order.rationale if hasattr(order, 'rationale') and order.rationale else "Portfolio rebalancing per investment strategy."
+
+        trade_note = f"{ticker} - {description}. {action_desc} ({pct_str} of portfolio). {rationale}"
+
+        logger.info(f"Trade note: {trade_note}")
+
+        # Find and fill the TRADE NOTES textarea using JavaScript
+        js_fill_notes = f"""
+        (function() {{
+            // Look for textarea near "TRADE NOTES" or "note" labels
+            const textareas = document.querySelectorAll('textarea');
+            for (const ta of textareas) {{
+                const rect = ta.getBoundingClientRect();
+                const style = window.getComputedStyle(ta);
+                const isVisible = rect.width > 0 && rect.height > 0 &&
+                                 style.display !== 'none' && style.visibility !== 'hidden';
+
+                if (isVisible) {{
+                    ta.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                    ta.focus();
+                    ta.value = {repr(trade_note)};
+                    // Trigger input event for React/Vue frameworks
+                    ta.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    ta.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return {{success: true, element: 'textarea'}};
+                }}
+            }}
+
+            // Fallback: look for input with placeholder containing "note"
+            const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
+            for (const inp of inputs) {{
+                const placeholder = (inp.placeholder || '').toLowerCase();
+                const name = (inp.name || '').toLowerCase();
+                if (placeholder.includes('note') || name.includes('note')) {{
+                    inp.value = {repr(trade_note)};
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return {{success: true, element: 'input'}};
+                }}
+            }}
+
+            return {{success: false, message: 'No textarea or note input found'}};
+        }})();
+        """
+
+        result = self.page.evaluate(js_fill_notes)
+        logger.info(f"Trade notes fill result: {result}")
+
+        if not result.get('success'):
+            logger.warning(f"Could not fill trade notes: {result.get('message')}")
+            # Try Playwright locator as fallback
+            try:
+                textarea = self.page.locator("textarea").first
+                if textarea.is_visible(timeout=2000):
+                    textarea.fill(trade_note)
+                    logger.info("Filled trade notes via Playwright fallback")
+            except Exception as e:
+                logger.warning(f"Playwright fallback also failed: {e}")
+
     def _place_order(self, order: TradeOrder) -> bool:
         """
-        Click Confirm Order button using JavaScript for maximum reliability.
+        Fill trade notes and click Confirm Order button.
         """
-        logger.info("=== CLICKING CONFIRM ORDER ===")
+        logger.info("=== FILLING TRADE NOTES AND CONFIRMING ORDER ===")
 
         self._dismiss_overlays()
-        time.sleep(2)  # Hard wait for confirmation UI to fully render
+        time.sleep(1)
+
+        # FILL TRADE NOTES (required by StockTrak session rules)
+        self._fill_trade_notes(order)
+        time.sleep(0.5)
+
         self._take_screenshot(f"before_confirm_{order.ticker}")
 
         # IDEMPOTENCY CHECK
