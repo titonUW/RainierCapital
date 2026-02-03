@@ -2,8 +2,8 @@
 Task Scheduler for StockTrak Bot
 
 Handles scheduling of:
-- Daily data collection (3:30 PM ET)
-- Daily execution (3:55 PM ET)
+- Daily data collection (9:00 AM ET)
+- Daily execution (9:30 AM ET - morning hours)
 - Weekly counter reset (Fridays 4:15 PM ET)
 - Hourly health checks
 """
@@ -28,8 +28,8 @@ def run_scheduler():
     Main scheduling loop.
 
     Schedules:
-    - 3:30 PM ET: Prepare for execution (weekdays)
-    - 3:55 PM ET: Execute daily routine (weekdays)
+    - 9:00 AM ET: Prepare for execution (weekdays)
+    - 9:30 AM ET: Execute daily routine (weekdays) - morning hours
     - 4:15 PM ET Friday: Weekly reset
     - Every hour: Health check
     """
@@ -41,12 +41,12 @@ def run_scheduler():
     # Clear any existing jobs
     schedule.clear()
 
-    # Daily execution at 3:55 PM ET (market days)
-    schedule.every().monday.at("15:55").do(safe_execute)
-    schedule.every().tuesday.at("15:55").do(safe_execute)
-    schedule.every().wednesday.at("15:55").do(safe_execute)
-    schedule.every().thursday.at("15:55").do(safe_execute)
-    schedule.every().friday.at("15:55").do(safe_execute)
+    # Daily execution at 9:30 AM ET (market days) - morning hours
+    schedule.every().monday.at("09:30").do(safe_execute)
+    schedule.every().tuesday.at("09:30").do(safe_execute)
+    schedule.every().wednesday.at("09:30").do(safe_execute)
+    schedule.every().thursday.at("09:30").do(safe_execute)
+    schedule.every().friday.at("09:30").do(safe_execute)
 
     # Weekly reset on Fridays at 4:15 PM ET
     schedule.every().friday.at("16:15").do(weekly_reset)
@@ -95,10 +95,8 @@ def _get_check_interval() -> int:
     hour = now.hour
     minute = now.minute
 
-    # Critical window: 3:50 PM - 4:10 PM ET (execution + buffer)
-    if hour == 15 and minute >= 50:
-        return 5  # Check every 5 seconds
-    if hour == 16 and minute <= 10:
+    # Critical window: 9:20 AM - 9:50 AM ET (execution + buffer)
+    if hour == 9 and 20 <= minute <= 50:
         return 5  # Check every 5 seconds
 
     # Market hours: 9:30 AM - 4:00 PM ET
