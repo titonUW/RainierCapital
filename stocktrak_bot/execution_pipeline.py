@@ -761,8 +761,13 @@ class ExecutionPipeline:
             return True
 
         # Wait for preview/confirmation to load
-        self.page.wait_for_load_state("networkidle", timeout=30000)
-        time.sleep(2)
+        # NOTE: Don't use "networkidle" - StockTrak has constant network activity (ads, analytics)
+        # that prevents networkidle from ever being reached
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass  # Continue anyway - the click worked
+        time.sleep(2)  # Give time for confirmation to appear
         self._dismiss_overlays()
 
         self._take_screenshot(f"preview_{order.ticker}")
@@ -921,8 +926,11 @@ class ExecutionPipeline:
             self._take_screenshot(f"no_submit_button_{order.ticker}")
             raise RuntimeError("Could not find any submit/place order button")
 
-        # Wait for submission
-        self.page.wait_for_load_state("networkidle", timeout=60000)
+        # Wait for submission - use domcontentloaded not networkidle
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass  # Continue anyway
         time.sleep(3)
         self._dismiss_overlays()
 
@@ -1001,7 +1009,10 @@ class ExecutionPipeline:
         # Click history link
         history_link = self.page.get_by_role("link", name=re.compile(history_type, re.I))
         history_link.click()
-        self.page.wait_for_load_state("networkidle", timeout=30000)
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
         self._dismiss_overlays()
         time.sleep(1)
 
