@@ -182,7 +182,7 @@ def scheduler_mode():
 
     print("\n--- SCHEDULER MODE ---")
     print(f"Competition Period: {COMPETITION_START} to {COMPETITION_END}")
-    print("The bot will execute daily at 3:55 PM ET on trading days.")
+    print("The bot will execute daily at 9:30 AM ET on trading days.")
     print("Press Ctrl+C to stop.\n")
 
     logger.info("Starting scheduler...")

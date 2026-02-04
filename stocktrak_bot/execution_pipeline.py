@@ -184,8 +184,9 @@ class ExecutionPipeline:
                     screenshots=self.screenshots
                 )
 
-            # STEP 6: Place order
-            self._run_step("place", lambda: self._place_order(order), order)
+            # STEP 6: Place order (with full retry if needed)
+            # If place fails, we need to re-run the whole flow, not just place
+            self._run_step_with_full_retry("place", order)
             self.current_state = TradeState.PLACED
 
             # STEP 7: Verify in history (CRITICAL)
@@ -305,6 +306,66 @@ class ExecutionPipeline:
         else:
             logger.warning(f"[{name}] All attempts failed (non-required step)")
             return False
+
+    def _run_step_with_full_retry(self, name: str, order: TradeOrder, max_attempts: int = 3):
+        """
+        Execute place step with FULL trade flow retry on failure.
+
+        Unlike _run_step which just resets to dashboard, this method re-runs
+        the entire navigate→fill→preview→place flow on each retry.
+
+        This is necessary because after place fails and we reset to dashboard,
+        the confirmation UI is gone and retrying just the place step won't work.
+        """
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"[{name}] Attempt {attempt}/{max_attempts}")
+                self._update_dashboard("RUNNING", name.upper(), order)
+                self._dismiss_overlays()
+
+                result = self._place_order(order)
+
+                logger.info(f"[{name}] SUCCESS")
+                return result
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[{name}] FAILED attempt {attempt}: {e}")
+                self._take_screenshot(f"{name}_fail_{attempt}_{order.ticker}")
+
+                if attempt < max_attempts:
+                    # FULL RETRY: Re-run entire trade flow, not just place
+                    logger.info(f"[{name}] Re-running full trade flow for retry...")
+                    try:
+                        # Reset to dashboard
+                        self.page.goto(
+                            "https://app.stocktrak.com/dashboard/standard",
+                            wait_until="domcontentloaded",
+                            timeout=60000
+                        )
+                        self._dismiss_overlays()
+                        time.sleep(1)
+
+                        # Re-run: navigate → fill → preview
+                        logger.info(f"[{name}] Re-navigating to trade page...")
+                        self._navigate_to_trade(order)
+
+                        logger.info(f"[{name}] Re-filling order form...")
+                        self._fill_order_form(order)
+
+                        logger.info(f"[{name}] Re-clicking Review Order...")
+                        self._preview_order(order)
+
+                        logger.info(f"[{name}] Ready for retry attempt {attempt + 1}")
+
+                    except Exception as setup_err:
+                        logger.warning(f"[{name}] Full retry setup failed: {setup_err}")
+                        # Continue to next attempt anyway
+
+        # All attempts failed
+        raise last_error
 
     # =========================================================================
     # PIPELINE STEPS
@@ -742,30 +803,49 @@ class ExecutionPipeline:
 
         logger.info(f"SUCCESS: Clicked '{result.get('buttonText')}' via JavaScript")
 
-        # Wait for confirmation UI to appear
-        logger.info("Waiting for confirmation UI...")
-        time.sleep(3)
+        # Wait for confirmation UI to appear - MUST wait for actual Confirm Order button
+        logger.info("Waiting for confirmation UI (Confirm Order button)...")
+        time.sleep(2)
+
+        # CRITICAL: Wait for the ACTUAL Confirm Order button to appear
+        # This is the definitive check that we're on the confirmation page
+        max_wait = 10  # seconds
+        confirm_found = False
+
+        for wait_sec in range(max_wait):
+            # Check for Confirm Order button using JavaScript (more reliable)
+            js_check = """
+            (function() {
+                const buttons = document.querySelectorAll('button, a, [role="button"], input[type="submit"]');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || btn.value || '').toLowerCase().trim();
+                    if (text.includes('confirm order') || text.includes('place order')) {
+                        const rect = btn.getBoundingClientRect();
+                        const style = window.getComputedStyle(btn);
+                        if (rect.width > 0 && rect.height > 0 &&
+                            style.display !== 'none' && style.visibility !== 'hidden') {
+                            return {found: true, text: text};
+                        }
+                    }
+                }
+                return {found: false};
+            })();
+            """
+            result = self.page.evaluate(js_check)
+            if result.get('found'):
+                confirm_found = True
+                logger.info(f"SUCCESS: Confirm Order button found after {wait_sec + 1}s: '{result.get('text')}'")
+                break
+            time.sleep(1)
+
         self._take_screenshot(f"after_review_click_{order.ticker}")
 
-        # Verify confirmation appeared by looking for "Confirm Order" button
-        try:
-            confirm_btn = self.page.locator("button:has-text('Confirm Order')").first
-            if confirm_btn.is_visible(timeout=5000):
-                logger.info("SUCCESS: Confirmation UI appeared (Confirm Order button visible)")
-                return True
-        except Exception:
-            pass
+        if not confirm_found:
+            # Confirmation UI didn't appear - this is a real failure
+            logger.error("FAILED: Confirm Order button NOT found after clicking Review Order")
+            raise RuntimeError("Confirmation UI did not appear - Confirm Order button not found")
 
-        # Check for "Estimated Cost" text (appears in confirmation)
-        try:
-            if self.page.locator("text=/estimated.*cost/i").first.is_visible(timeout=2000):
-                logger.info("SUCCESS: Confirmation UI appeared (Estimated Cost visible)")
-                return True
-        except Exception:
-            pass
-
-        logger.warning("Clicked Review Order but confirmation UI not verified")
-        return True  # Continue anyway
+        return True
 
     def _fill_trade_notes(self, order: TradeOrder):
         """
@@ -775,30 +855,73 @@ class ExecutionPipeline:
         """
         logger.info("Filling trade notes...")
 
-        # Build the trade note
+        # Build the trade note - includes all core and satellite ETFs
         ticker_descriptions = {
+            # Core ETFs
             'VOO': 'Vanguard S&P 500 ETF',
             'VTI': 'Vanguard Total Stock Market ETF',
             'VEA': 'Vanguard Developed Markets ETF',
+            # Space / Aerospace (A_SPACE bucket)
+            'ROKT': 'SPDR S&P Kensho Final Frontiers ETF',
+            'UFO': 'Procure Space ETF',
+            'RKLB': 'Rocket Lab USA Inc',
+            'PL': 'Planet Labs PBC',
+            'ASTS': 'AST SpaceMobile Inc',
+            'LUNR': 'Intuitive Machines Inc',
+            # Defense (B_DEFENSE bucket)
+            'PPA': 'Invesco Aerospace & Defense ETF',
+            'ITA': 'iShares U.S. Aerospace & Defense ETF',
+            'XAR': 'SPDR S&P Aerospace & Defense ETF',
+            'JEDI': 'ET Lument Specialty Finance ETF',
+            'LMT': 'Lockheed Martin Corporation',
+            'NOC': 'Northrop Grumman Corporation',
+            'RTX': 'RTX Corporation',
+            'GD': 'General Dynamics Corporation',
+            'KTOS': 'Kratos Defense & Security',
+            'AVAV': 'AeroVironment Inc',
+            # Semiconductors (C_SEMIS bucket)
+            'SMH': 'VanEck Semiconductor ETF',
+            'SOXX': 'iShares Semiconductor ETF',
+            'ASML': 'ASML Holding NV',
+            'AMAT': 'Applied Materials Inc',
+            'LRCX': 'Lam Research Corporation',
+            'KLAC': 'KLA Corporation',
+            'TER': 'Teradyne Inc',
+            'ENTG': 'Entegris Inc',
+            # Biotech (D_BIOTECH bucket)
+            'XBI': 'SPDR S&P Biotech ETF',
+            'IDNA': 'iShares Genomics Immunology and Healthcare ETF',
+            'CRSP': 'CRISPR Therapeutics AG',
+            'NTLA': 'Intellia Therapeutics Inc',
+            'BEAM': 'Beam Therapeutics Inc',
+            # Nuclear (E_NUCLEAR bucket)
+            'URNM': 'Sprott Uranium Miners ETF',
+            'URA': 'Global X Uranium ETF',
+            'NLR': 'VanEck Uranium+Nuclear Energy ETF',
+            'CCJ': 'Cameco Corporation',
+            # Energy (F_ENERGY bucket)
+            'XLE': 'Energy Select Sector SPDR Fund',
+            'XOP': 'SPDR S&P Oil & Gas Exploration ETF',
+            'XOM': 'Exxon Mobil Corporation',
+            'CVX': 'Chevron Corporation',
+            # Metals (G_METALS bucket)
+            'COPX': 'Global X Copper Miners ETF',
+            'XME': 'SPDR S&P Metals and Mining ETF',
+            'PICK': 'iShares MSCI Global Metals & Mining Producers ETF',
+            'FCX': 'Freeport-McMoRan Inc',
+            'SCCO': 'Southern Copper Corporation',
+            # Materials (H_MATERIALS bucket)
+            'DMAT': 'Global X Disruptive Materials ETF',
+            # Other common ETFs
             'BND': 'Vanguard Total Bond Market ETF',
             'BNDX': 'Vanguard Total International Bond ETF',
             'VWO': 'Vanguard Emerging Markets ETF',
             'VNQ': 'Vanguard Real Estate ETF',
-            'VTIP': 'Vanguard Short-Term Inflation-Protected Securities ETF',
-            'SHV': 'iShares Short Treasury Bond ETF',
             'GLD': 'SPDR Gold Shares ETF',
             'TLT': 'iShares 20+ Year Treasury Bond ETF',
-            'HYG': 'iShares iBoxx High Yield Corporate Bond ETF',
-            'EMB': 'iShares JP Morgan Emerging Markets Bond ETF',
-            'LQD': 'iShares Investment Grade Corporate Bond ETF',
-            'MUB': 'iShares National Muni Bond ETF',
-            'SCHD': 'Schwab US Dividend Equity ETF',
-            'VIG': 'Vanguard Dividend Appreciation ETF',
-            'VXUS': 'Vanguard Total International Stock ETF',
             'IWM': 'iShares Russell 2000 ETF',
             'QQQ': 'Invesco QQQ Trust (Nasdaq-100)',
             'SPY': 'SPDR S&P 500 ETF',
-            'AGG': 'iShares Core U.S. Aggregate Bond ETF',
             'VT': 'Vanguard Total World Stock ETF',
         }
 

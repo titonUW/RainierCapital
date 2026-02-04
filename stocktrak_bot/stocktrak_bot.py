@@ -900,7 +900,10 @@ class StockTrakBot:
 
     def get_current_holdings(self) -> Dict[str, Dict]:
         """
-        Get all current positions.
+        Get all current positions from StockTrak.
+
+        UPDATED: Uses dashboard Open Positions section which is more reliable
+        than navigating to separate holdings pages.
 
         Returns:
             Dict mapping ticker -> {shares, avg_cost, current_value, raw_data}
@@ -911,61 +914,100 @@ class StockTrakBot:
             # Ensure page is ready
             self.ensure_page_ready()
 
-            # Navigate to holdings
-            holdings_urls = [
-                f"{self.base_url}/portfolio/holdings",
-                f"{self.base_url}/portfolio",
-                f"{self.base_url}/positions",
-            ]
+            # Navigate to dashboard - Open Positions is displayed there
+            dashboard_url = f"{self.base_url}/dashboard/standard"
+            logger.info(f"Navigating to dashboard for holdings: {dashboard_url}")
 
-            for url in holdings_urls:
-                try:
-                    self.page.goto(url)
-                    self.page.wait_for_load_state('networkidle')
-                    if 'holdings' in self.page.url.lower() or 'position' in self.page.url.lower():
-                        break
-                except:
-                    continue
+            try:
+                self.page.goto(dashboard_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as nav_err:
+                logger.warning(f"Dashboard navigation issue: {nav_err}")
+                # Continue anyway - page might have loaded
 
             time.sleep(2)
-            self._screenshot('holdings_page')
+            self._screenshot('holdings_dashboard')
 
-            # Try to find holdings table
-            table_selectors = [
-                'table.holdings',
-                '.holdings-table',
-                '#holdings-table',
-                '.positions-table',
-                'table.positions',
-                'table',
-            ]
+            # METHOD 1: Use JavaScript to find Open Positions table
+            js_find_holdings = """
+            (function() {
+                const holdings = {};
 
-            for selector in table_selectors:
-                try:
-                    tables = self.page.locator(selector).all()
-                    for table in tables:
-                        rows = table.locator('tr').all()
-                        if len(rows) > 1:  # Has data rows
-                            for row in rows[1:]:  # Skip header
+                // Look for "Open Positions" section
+                const tables = document.querySelectorAll('table');
+                for (const table of tables) {
+                    // Check if this table is in/near "Open Positions" section
+                    const container = table.closest('.card, .panel, section, div');
+                    const containerText = container ? container.textContent : '';
+
+                    // Get all rows
+                    const rows = table.querySelectorAll('tr');
+                    for (const row of rows) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length >= 2) {
+                            const firstCell = cells[0].textContent.trim().toUpperCase();
+                            // Match ticker pattern (1-5 uppercase letters)
+                            const match = firstCell.match(/^([A-Z]{1,5})\\b/);
+                            if (match) {
+                                const ticker = match[1];
+                                // Try to get shares from second cell
+                                const sharesText = cells[1].textContent.replace(/[^0-9.-]/g, '');
+                                const shares = parseInt(sharesText) || 0;
+                                if (shares > 0) {
+                                    holdings[ticker] = {
+                                        shares: shares,
+                                        raw: Array.from(cells).map(c => c.textContent.trim())
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                return holdings;
+            })();
+            """
+
+            js_holdings = self.page.evaluate(js_find_holdings)
+            if js_holdings:
+                logger.info(f"Found {len(js_holdings)} holdings via JavaScript: {list(js_holdings.keys())}")
+                for ticker, data in js_holdings.items():
+                    holdings[ticker] = {
+                        'shares': data.get('shares', 0),
+                        'raw_data': data.get('raw', [])
+                    }
+
+            # METHOD 2: If JavaScript method failed, try direct table parsing
+            if not holdings:
+                logger.info("JavaScript method returned no holdings, trying direct parsing...")
+
+                # Try to find tables with ticker-like content
+                table_selectors = ['table', '.positions-table', '.holdings-table']
+
+                for selector in table_selectors:
+                    try:
+                        tables = self.page.locator(selector).all()
+                        for table in tables:
+                            rows = table.locator('tr').all()
+                            for row in rows:
                                 cells = row.locator('td').all()
                                 if len(cells) >= 2:
                                     ticker_text = cells[0].text_content().strip().upper()
-                                    # Extract ticker (first word, alphanumeric)
-                                    import re
                                     match = re.match(r'^([A-Z]{1,5})\b', ticker_text)
                                     if match:
-                                        ticker = match.group(1)
-                                        holdings[ticker] = {
-                                            'shares': parse_number(cells[1].text_content()) if len(cells) > 1 else 0,
-                                            'raw_data': [c.text_content() for c in cells]
-                                        }
+                                        ticker = match[1]
+                                        shares_text = cells[1].text_content()
+                                        shares = parse_number(shares_text)
+                                        if shares and shares > 0:
+                                            holdings[ticker] = {
+                                                'shares': int(shares),
+                                                'raw_data': [c.text_content() for c in cells]
+                                            }
                             if holdings:
                                 break
-                    if holdings:
-                        break
-                except Exception as e:
-                    logger.debug(f"Table parse error with {selector}: {e}")
-                    continue
+                        if holdings:
+                            break
+                    except Exception as e:
+                        logger.debug(f"Table parse error with {selector}: {e}")
+                        continue
 
             logger.info(f"Found {len(holdings)} holdings: {list(holdings.keys())}")
             return holdings
