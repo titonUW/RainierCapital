@@ -554,14 +554,15 @@ class StockTrakBot:
 
             # CHECKPOINT: Wait for a known logged-in element
             # "Portfolio Simulation" only exists when logged in
+            # Reduced from 90s to 20s - if we're logged in, this should appear quickly
             logger.info("Waiting for login checkpoint (Portfolio Simulation)...")
             try:
-                self.page.wait_for_selector("text=Portfolio Simulation", timeout=90000)
+                self.page.wait_for_selector("text=Portfolio Simulation", timeout=20000)
                 self.logged_in = True
                 logger.info("LOGIN CHECKPOINT PASSED: 'Portfolio Simulation' visible")
                 return True
             except Exception as e:
-                logger.warning(f"Primary checkpoint failed: {e}")
+                logger.warning(f"Primary checkpoint failed after 20s: {e}")
 
             # Fallback checkpoints
             fallback_indicators = [
@@ -932,6 +933,9 @@ class StockTrakBot:
             (function() {
                 const holdings = {};
 
+                // Placeholder words to filter out (not real tickers)
+                const PLACEHOLDER_WORDS = ['STOCK', 'TICKER', 'SYMBOL', 'NAME', 'TYPE', 'ASSET', 'EQUITY'];
+
                 // Look for "Open Positions" section
                 const tables = document.querySelectorAll('table');
                 for (const table of tables) {
@@ -949,6 +953,10 @@ class StockTrakBot:
                             const match = firstCell.match(/^([A-Z]{1,5})\\b/);
                             if (match) {
                                 const ticker = match[1];
+                                // Filter out placeholder words like "STOCK", "TICKER", etc.
+                                if (PLACEHOLDER_WORDS.includes(ticker)) {
+                                    continue;
+                                }
                                 // Try to get shares from second cell
                                 const sharesText = cells[1].textContent.replace(/[^0-9.-]/g, '');
                                 const shares = parseInt(sharesText) || 0;
@@ -979,6 +987,9 @@ class StockTrakBot:
             if not holdings:
                 logger.info("JavaScript method returned no holdings, trying direct parsing...")
 
+                # Placeholder words to filter out (not real tickers)
+                PLACEHOLDER_WORDS = {'STOCK', 'TICKER', 'SYMBOL', 'NAME', 'TYPE', 'ASSET', 'EQUITY'}
+
                 # Try to find tables with ticker-like content
                 table_selectors = ['table', '.positions-table', '.holdings-table']
 
@@ -994,6 +1005,9 @@ class StockTrakBot:
                                     match = re.match(r'^([A-Z]{1,5})\b', ticker_text)
                                     if match:
                                         ticker = match[1]
+                                        # Filter out placeholder words
+                                        if ticker in PLACEHOLDER_WORDS:
+                                            continue
                                         shares_text = cells[1].text_content()
                                         shares = parse_number(shares_text)
                                         if shares and shares > 0:

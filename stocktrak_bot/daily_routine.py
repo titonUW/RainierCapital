@@ -482,7 +482,9 @@ def execute_normal_mode(
         logger.info("Skipping profit-taking (non-Friday)")
 
     # ===== STEP 3: Look for new entry opportunities (FRIDAY ONLY for discretionary) =====
-    # Exception: If a risk exit created an empty bucket, we can replace to maintain min holdings
+    # Exceptions that allow non-Friday entries:
+    #   1. Emergency replacement if risk exit created empty bucket
+    #   2. DAY-1 CONTINUATION: If we're missing satellite buckets from incomplete Day-1 build
 
     # Check event freeze
     if datetime.now().date() in EVENT_FREEZE_DATES:
@@ -493,16 +495,36 @@ def execute_normal_mode(
     positions = state.get_positions()
     current_satellites = sum(1 for t in positions if t not in CORE_POSITIONS)
 
+    # Determine which satellite buckets we currently have filled
+    from config import SATELLITE_BUCKETS
+    filled_buckets = set()
+    for ticker in positions:
+        bucket = get_bucket_for_ticker(ticker)
+        if bucket:
+            filled_buckets.add(bucket)
+
+    all_buckets = set(SATELLITE_BUCKETS.keys())
+    missing_buckets = all_buckets - filled_buckets
+
     # Determine if we need emergency replacement (to maintain structural diversification)
     buckets_sold = [bucket for _, bucket in sells_executed if bucket]
     need_emergency_replacement = len(positions) < 4  # Below min holdings
+
+    # DAY-1 CONTINUATION: If we're missing satellite buckets from incomplete initial build
+    # This allows us to complete the Day-1 build even on non-Fridays
+    need_day1_continuation = len(missing_buckets) > 0 and current_satellites < 8
+    if need_day1_continuation:
+        logger.info(f"DAY-1 CONTINUATION MODE: {len(missing_buckets)} satellite buckets missing")
+        logger.info(f"Missing buckets: {sorted(missing_buckets)}")
 
     if friday:
         logger.info("Looking for new entry opportunities (Friday discretionary)...")
     elif need_emergency_replacement:
         logger.info("Looking for emergency replacement (maintain min holdings)...")
+    elif need_day1_continuation:
+        logger.info("Looking to complete Day-1 portfolio build (fill missing buckets)...")
     else:
-        logger.info("Skipping new entries (non-Friday, no emergency)")
+        logger.info("Skipping new entries (non-Friday, no emergency, Day-1 complete)")
         logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys (non-Friday)")
         return
 
@@ -529,6 +551,43 @@ def execute_normal_mode(
     # Get candidates - prioritize replacing sold buckets to maintain 1/N structure
     if friday:
         buy_candidates = get_double7_buy_candidates(market_data, positions, vix_level)
+    elif need_day1_continuation:
+        # DAY-1 CONTINUATION: Fill missing satellite buckets to complete initial build
+        buy_candidates = []
+        existing_tickers = set(positions.keys())
+
+        for bucket in sorted(missing_buckets):
+            # Use Day-1 lineup first choice, then fallback to scoring
+            day1_ticker = None
+            for ticker, b in DAY1_SATELLITES:
+                if b == bucket:
+                    day1_ticker = ticker
+                    break
+
+            # Check if Day-1 ticker is available
+            if day1_ticker and day1_ticker not in existing_tickers:
+                ticker_data = market_data.get(day1_ticker, {})
+                if ticker_data.get('price', 0) > 0:
+                    from scoring import ScoredCandidate
+                    buy_candidates.append(ScoredCandidate(
+                        ticker=day1_ticker,
+                        price=ticker_data['price'],
+                        score=100,  # Day-1 priority
+                        bucket=bucket,
+                        reason="DAY1_LINEUP"
+                    ))
+                    logger.info(f"Day-1 candidate for {bucket}: {day1_ticker}")
+                    continue
+
+            # Fallback: find any candidate for this bucket
+            replacement = select_replacement_satellite(
+                market_data, positions, vix_level,
+                exclude_tickers=list(existing_tickers),
+                for_bucket=bucket
+            )
+            if replacement:
+                buy_candidates.append(replacement)
+                logger.info(f"Replacement candidate for {bucket}: {replacement.ticker}")
     else:
         # Emergency replacement only - try to fill the buckets we just sold
         buy_candidates = []
@@ -566,8 +625,15 @@ def execute_normal_mode(
             continue
 
         # Execute buy using stall-proof pipeline
-        entry_type = "DISCRETIONARY" if friday else "EMERGENCY"
-        rationale = 'DOUBLE7_ENTRY' if friday else 'EMERGENCY_REPLACE'
+        if friday:
+            entry_type = "DISCRETIONARY"
+            rationale = 'DOUBLE7_ENTRY'
+        elif need_day1_continuation:
+            entry_type = "DAY1_CONTINUATION"
+            rationale = f'FILL_BUCKET_{candidate.bucket}'
+        else:
+            entry_type = "EMERGENCY"
+            rationale = 'EMERGENCY_REPLACE'
 
         success, msg = execute_trade_safely(
             bot, state, ticker, "BUY", shares,
@@ -576,10 +642,16 @@ def execute_normal_mode(
         )
 
         if success:
-            logger.info(f"BUY [{entry_type}] {ticker}: {shares} shares")
+            logger.info(f"BUY [{entry_type}] {ticker}: {shares} shares (bucket: {candidate.bucket})")
             limit_price = calculate_limit_price(price, is_buy=True)
             state.add_position(ticker, shares, limit_price, bucket=candidate.bucket)
             buys_executed.append(ticker)
+
+            # Update filled buckets for Day-1 continuation tracking
+            if candidate.bucket:
+                filled_buckets.add(candidate.bucket)
+                missing_buckets.discard(candidate.bucket)
+
             week_replacements += 1
             time.sleep(2)
 
@@ -590,7 +662,11 @@ def execute_normal_mode(
                 break
             if friday and week_replacements >= weekly_cap:
                 break
-            if not friday and len(positions) >= 4:  # Emergency replacement complete
+            if need_day1_continuation and len(missing_buckets) == 0:
+                logger.info("Day-1 portfolio build COMPLETE - all buckets filled!")
+                break
+            if not friday and not need_day1_continuation and len(positions) >= 4:
+                # Emergency replacement complete (old behavior)
                 break
 
     logger.info(f"Session summary: {len(sells_executed)} sells, {len(buys_executed)} buys")
