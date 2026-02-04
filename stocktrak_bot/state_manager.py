@@ -427,12 +427,33 @@ def sync_state_with_stocktrak(state_manager: StateManager,
 
     Called at the start of each execution to ensure state matches reality.
 
+    IMPORTANT SAFEGUARDS:
+    - If stocktrak_holdings is empty but we have local positions AND trades,
+      this is likely a scraping failure - DO NOT wipe positions.
+    - Only remove positions if we're confident the data is valid.
+
     Args:
         state_manager: StateManager instance
         stocktrak_holdings: Holdings from StockTrak
         stocktrak_trade_count: Trade count from StockTrak
     """
     logger.info("Synchronizing state with StockTrak...")
+
+    local_positions = state_manager.get_positions()
+    local_trades = state_manager.get_trades_used()
+
+    # SAFEGUARD: Detect scraping failures
+    # If we have trades and local positions but StockTrak returns empty,
+    # this is almost certainly a scraping error, not actual empty holdings
+    if not stocktrak_holdings and local_positions and local_trades > 0:
+        logger.warning("=" * 60)
+        logger.warning("SAFEGUARD TRIGGERED: StockTrak returned 0 holdings")
+        logger.warning(f"  Local positions: {len(local_positions)} ({list(local_positions.keys())})")
+        logger.warning(f"  Local trades used: {local_trades}")
+        logger.warning("  This is likely a scraping failure - NOT wiping positions")
+        logger.warning("=" * 60)
+        # DO NOT sync - keep local state intact
+        return
 
     # Update trade count if StockTrak shows different
     if stocktrak_trade_count != state_manager.get_trades_used():
@@ -442,7 +463,6 @@ def sync_state_with_stocktrak(state_manager: StateManager,
         state_manager.state['trades_remaining'] = MAX_TRADES_TOTAL - stocktrak_trade_count
 
     # Check for positions that exist in StockTrak but not locally
-    local_positions = state_manager.get_positions()
     for ticker in stocktrak_holdings:
         if ticker not in local_positions:
             logger.warning(f"Position {ticker} found in StockTrak but not in local state")
@@ -455,11 +475,16 @@ def sync_state_with_stocktrak(state_manager: StateManager,
                 bucket=None
             )
 
-    # Check for positions in local state but not in StockTrak (sold externally?)
-    for ticker in list(local_positions.keys()):
-        if ticker not in stocktrak_holdings:
-            logger.warning(f"Position {ticker} in local state but not in StockTrak - removing")
-            state_manager.remove_position(ticker)
+    # Check for positions in local state but not in StockTrak
+    # SAFEGUARD: Only remove if stocktrak_holdings has SOME data
+    # (if it's empty, we can't trust it)
+    if stocktrak_holdings:  # Only remove if we got valid data from StockTrak
+        for ticker in list(local_positions.keys()):
+            if ticker not in stocktrak_holdings:
+                logger.warning(f"Position {ticker} in local state but not in StockTrak - removing")
+                state_manager.remove_position(ticker)
+    else:
+        logger.info("Skipping position removal check - StockTrak holdings empty (may be scraping issue)")
 
     state_manager.save()
     logger.info("State synchronization complete")
