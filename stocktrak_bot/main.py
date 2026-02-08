@@ -14,6 +14,7 @@ Usage:
     python main.py --manual     # Manual execution of daily routine
     python main.py --status     # Show current bot status
     python main.py --scores     # Show satellite scoring report
+    python main.py --preflight  # Test trade flow UI without executing
 
 Competition Rules Summary:
     - Max 80 trades total
@@ -173,6 +174,176 @@ def scores_mode():
     print_scoring_report(data, positions)
 
 
+def preflight_mode():
+    """
+    UI Preflight Check - Test trade flow without executing.
+
+    This tests the full trade flow UI to catch button/selector issues early:
+    1. Login
+    2. Navigate to trade page
+    3. Fill form (1 share of VOO - minimal test)
+    4. Click Review/Preview
+    5. Verify "Confirm Order" button is found
+    6. DO NOT click Confirm - just verify it exists
+
+    This helps detect StockTrak UI changes before they cause real trade failures.
+    """
+    from stocktrak_bot import StockTrakBot, take_debug_screenshot
+
+    logger = logging.getLogger('stocktrak_bot')
+    logger.info("PREFLIGHT MODE - Testing trade flow UI without executing")
+
+    print("\n" + "=" * 60)
+    print("UI PREFLIGHT CHECK")
+    print("Testing trade flow UI without executing any trades")
+    print("=" * 60)
+
+    bot = StockTrakBot()
+    bot.start_browser(headless=False)  # Show browser for preflight
+
+    results = {
+        'login': False,
+        'navigate': False,
+        'fill_form': False,
+        'preview': False,
+        'confirm_button_found': False
+    }
+
+    try:
+        # Step 1: Login
+        print("\n[1/5] Testing login...")
+        if bot.login():
+            print("✓ Login SUCCESS")
+            results['login'] = True
+        else:
+            print("✗ Login FAILED")
+            return results
+
+        # Step 2: Navigate to trade page
+        print("\n[2/5] Testing trade page navigation...")
+        trade_url = f"{bot.base_url}/trading/equitiesaliases"
+        try:
+            bot.page.goto(trade_url, wait_until="domcontentloaded", timeout=30000)
+            import time
+            time.sleep(2)
+            take_debug_screenshot(bot.page, 'preflight_trade_page')
+            print(f"✓ Navigated to trade page: {trade_url}")
+            results['navigate'] = True
+        except Exception as e:
+            print(f"✗ Navigation failed: {e}")
+            return results
+
+        # Step 3: Fill form (1 share of VOO as test)
+        print("\n[3/5] Testing form fill...")
+        try:
+            # Ticker
+            ticker_input = bot.page.locator('input[name="symbol"], input[id="symbol"], input[placeholder*="ticker" i], input[placeholder*="symbol" i]').first
+            ticker_input.fill("VOO")
+            time.sleep(0.5)
+
+            # Quantity (1 share - minimal)
+            qty_input = bot.page.locator('input[name="quantity"], input[id="quantity"], input[placeholder*="quantity" i], input[placeholder*="shares" i]').first
+            qty_input.fill("1")
+            time.sleep(0.5)
+
+            take_debug_screenshot(bot.page, 'preflight_form_filled')
+            print("✓ Form filled (VOO, 1 share)")
+            results['fill_form'] = True
+        except Exception as e:
+            print(f"✗ Form fill failed: {e}")
+            return results
+
+        # Step 4: Click Preview/Review
+        print("\n[4/5] Testing preview button...")
+        try:
+            # Try to find and click Review Order button
+            preview_js = """
+            (function() {
+                const buttons = document.querySelectorAll('button, input[type="submit"], a');
+                for (const btn of buttons) {
+                    const text = btn.textContent.toLowerCase();
+                    if (text.includes('review') || text.includes('preview')) {
+                        btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                        btn.click();
+                        return {success: true, text: btn.textContent.trim()};
+                    }
+                }
+                return {success: false, error: 'No preview button found'};
+            })();
+            """
+            result = bot.page.evaluate(preview_js)
+            if result.get('success'):
+                print(f"✓ Preview button clicked: '{result.get('text')}'")
+                time.sleep(3)  # Wait for preview to load
+                take_debug_screenshot(bot.page, 'preflight_preview')
+                results['preview'] = True
+            else:
+                print(f"✗ Preview failed: {result.get('error')}")
+                return results
+        except Exception as e:
+            print(f"✗ Preview failed: {e}")
+            return results
+
+        # Step 5: Verify Confirm Order button exists (DO NOT CLICK!)
+        print("\n[5/5] Verifying Confirm Order button exists...")
+        try:
+            confirm_js = """
+            (function() {
+                const clickables = document.querySelectorAll('button, a, [role="button"], input[type="submit"]');
+                for (const el of clickables) {
+                    const text = el.textContent.toLowerCase();
+                    if (text.includes('confirm') && (text.includes('order') || text.includes('trade'))) {
+                        return {
+                            found: true,
+                            text: el.textContent.trim(),
+                            tag: el.tagName,
+                            visible: el.offsetParent !== null
+                        };
+                    }
+                }
+                return {found: false};
+            })();
+            """
+            result = bot.page.evaluate(confirm_js)
+            if result.get('found'):
+                print(f"✓ Confirm button FOUND: '{result.get('text')}' ({result.get('tag')})")
+                print(f"  Visible: {result.get('visible')}")
+                results['confirm_button_found'] = True
+            else:
+                print("✗ Confirm button NOT FOUND - this would cause trade failures!")
+                take_debug_screenshot(bot.page, 'preflight_no_confirm')
+        except Exception as e:
+            print(f"✗ Confirm check failed: {e}")
+
+        # Summary
+        print("\n" + "=" * 60)
+        print("PREFLIGHT RESULTS")
+        print("=" * 60)
+        all_passed = all(results.values())
+        for check, passed in results.items():
+            status = "✓" if passed else "✗"
+            print(f"  {status} {check}")
+
+        if all_passed:
+            print("\n✓ ALL CHECKS PASSED - Trade flow UI is working!")
+            print("  The bot should be able to execute trades successfully.")
+        else:
+            print("\n✗ SOME CHECKS FAILED - Trade flow may have issues!")
+            print("  Review screenshots in screenshots/ directory for debugging.")
+
+        return results
+
+    except Exception as e:
+        print(f"\n✗ Preflight error: {e}")
+        import traceback
+        traceback.print_exc()
+        return results
+
+    finally:
+        print("\nClosing browser (no trades were executed)...")
+        bot.close()
+
+
 def scheduler_mode():
     """Start the continuous scheduler."""
     from scheduler import run_with_auto_restart
@@ -201,6 +372,7 @@ Examples:
     python main.py --manual     Run daily routine manually
     python main.py --status     Show current bot status
     python main.py --scores     Show satellite scoring report
+    python main.py --preflight  Test trade flow UI without executing
     python main.py              Start continuous scheduler
         """
     )
@@ -215,6 +387,8 @@ Examples:
                         help='Show current bot status')
     parser.add_argument('--scores', action='store_true',
                         help='Show satellite scoring report')
+    parser.add_argument('--preflight', action='store_true',
+                        help='UI preflight check - test trade flow without executing')
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                         help='Logging level (default: INFO)')
@@ -245,6 +419,8 @@ Examples:
             status_mode()
         elif args.scores:
             scores_mode()
+        elif args.preflight:
+            preflight_mode()
         else:
             scheduler_mode()
 
@@ -271,6 +447,8 @@ def get_mode_name(args):
         return "STATUS"
     elif args.scores:
         return "SCORES"
+    elif args.preflight:
+        return "PREFLIGHT"
     else:
         return "SCHEDULER"
 

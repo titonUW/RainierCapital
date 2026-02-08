@@ -6,11 +6,14 @@ Handles scheduling of:
 - Daily execution (9:30 AM ET - morning hours)
 - Weekly counter reset (Fridays 4:15 PM ET)
 - Hourly health checks
+
+CRITICAL: The schedule library uses LOCAL machine time, not timezone-aware times.
+This module converts ET times to local machine time for correct scheduling.
 """
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import schedule
 import pytz
 
@@ -23,6 +26,36 @@ logger = logging.getLogger('stocktrak_bot.scheduler')
 ET = pytz.timezone('US/Eastern')
 
 
+def et_to_local_time(et_hour: int, et_minute: int) -> str:
+    """
+    Convert an ET time to local machine time.
+
+    The schedule library uses LOCAL time, not timezone-aware times.
+    This function calculates what local time corresponds to a given ET time.
+
+    Args:
+        et_hour: Hour in Eastern Time (0-23)
+        et_minute: Minute (0-59)
+
+    Returns:
+        String in HH:MM format for local time
+    """
+    # Get current date in ET
+    now_et = datetime.now(ET)
+
+    # Create a datetime for the target ET time today
+    target_et = now_et.replace(hour=et_hour, minute=et_minute, second=0, microsecond=0)
+
+    # Convert to local time (naive datetime in local timezone)
+    target_local = target_et.astimezone().replace(tzinfo=None)
+
+    # Extract the local time
+    local_time_str = target_local.strftime("%H:%M")
+
+    logger.debug(f"ET {et_hour:02d}:{et_minute:02d} -> Local {local_time_str}")
+    return local_time_str
+
+
 def run_scheduler():
     """
     Main scheduling loop.
@@ -32,24 +65,32 @@ def run_scheduler():
     - 9:30 AM ET: Execute daily routine (weekdays) - morning hours
     - 4:15 PM ET Friday: Weekly reset
     - Every hour: Health check
+
+    IMPORTANT: All times are converted from ET to local machine time.
     """
     logger.info("=" * 60)
     logger.info("STOCKTRAK BOT SCHEDULER STARTING")
     logger.info(f"Current time (ET): {datetime.now(ET)}")
+    logger.info(f"Current time (Local): {datetime.now()}")
     logger.info("=" * 60)
 
     # Clear any existing jobs
     schedule.clear()
 
+    # Convert 9:30 AM ET to local time
+    execution_time = et_to_local_time(9, 30)
+    logger.info(f"Execution time: 9:30 AM ET = {execution_time} local")
+
     # Daily execution at 9:30 AM ET (market days) - morning hours
-    schedule.every().monday.at("09:30").do(safe_execute)
-    schedule.every().tuesday.at("09:30").do(safe_execute)
-    schedule.every().wednesday.at("09:30").do(safe_execute)
-    schedule.every().thursday.at("09:30").do(safe_execute)
-    schedule.every().friday.at("09:30").do(safe_execute)
+    schedule.every().monday.at(execution_time).do(safe_execute)
+    schedule.every().tuesday.at(execution_time).do(safe_execute)
+    schedule.every().wednesday.at(execution_time).do(safe_execute)
+    schedule.every().thursday.at(execution_time).do(safe_execute)
+    schedule.every().friday.at(execution_time).do(safe_execute)
 
     # Weekly reset on Fridays at 4:15 PM ET
-    schedule.every().friday.at("16:15").do(weekly_reset)
+    weekly_reset_time = et_to_local_time(16, 15)
+    schedule.every().friday.at(weekly_reset_time).do(weekly_reset)
 
     # Health check every hour
     schedule.every().hour.do(safe_health_check)
@@ -66,13 +107,11 @@ def run_scheduler():
     log_next_runs()
 
     # Main loop with adaptive check interval
-    # CRITICAL: 30-second interval could miss the execution window
-    # Use 5-second checks during market hours, 30-second otherwise
     while True:
         try:
             schedule.run_pending()
 
-            # Adaptive sleep: shorter during execution window (3:50-4:05 PM ET)
+            # Adaptive sleep: shorter during execution window
             check_interval = _get_check_interval()
             time.sleep(check_interval)
 

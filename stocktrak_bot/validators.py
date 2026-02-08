@@ -82,6 +82,36 @@ def validate_price(ticker: str, price: float, is_buy: bool = True) -> Tuple[bool
     return True, "Price OK"
 
 
+def validate_share_quantity(shares: int, ticker: str = None) -> Tuple[bool, str]:
+    """
+    Validate share quantity is positive and reasonable.
+
+    Args:
+        shares: Number of shares
+        ticker: Optional ticker for logging
+
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    ticker_str = f" for {ticker}" if ticker else ""
+
+    if shares is None:
+        return False, f"Share quantity is None{ticker_str}"
+
+    if not isinstance(shares, (int, float)):
+        return False, f"Share quantity must be a number{ticker_str}, got {type(shares)}"
+
+    shares = int(shares)
+
+    if shares <= 0:
+        return False, f"Share quantity must be positive{ticker_str}, got {shares}"
+
+    if shares > 100000:  # Sanity check - suspiciously large order
+        return False, f"Share quantity {shares} seems too large{ticker_str} (max 100,000)"
+
+    return True, "Share quantity OK"
+
+
 def validate_position_size(
     ticker: str,
     shares: int,
@@ -102,6 +132,11 @@ def validate_position_size(
     Returns:
         Tuple of (is_valid, reason)
     """
+    # First validate share quantity
+    qty_valid, qty_reason = validate_share_quantity(shares, ticker)
+    if not qty_valid:
+        return False, qty_reason
+
     new_position_value = shares * price
 
     # Check if this purchase would exceed 25% of portfolio

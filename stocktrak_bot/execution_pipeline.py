@@ -30,8 +30,108 @@ from enum import Enum
 from dataclasses import dataclass
 
 from state_manager import StateManager
+from config import (
+    STOCKTRAK_URL, STOCKTRAK_DASHBOARD_URL, STOCKTRAK_TRADING_URL,
+    STOCKTRAK_TRADING_EQUITIES_URL, STOCKTRAK_TRANSACTION_HISTORY_URL,
+    STOCKTRAK_ORDER_HISTORY_URL, DEFAULT_TIMEOUT, PAGE_LOAD_TIMEOUT
+)
 
 logger = logging.getLogger('stocktrak_bot.execution_pipeline')
+
+
+# =============================================================================
+# CIRCUIT BREAKER - Stops execution if too many consecutive failures
+# =============================================================================
+class CircuitBreaker:
+    """
+    Circuit breaker pattern to prevent runaway failures.
+
+    If MAX_CONSECUTIVE_FAILURES trades fail in a row, the circuit opens
+    and no more trades are attempted until manually reset or timeout expires.
+    """
+    MAX_CONSECUTIVE_FAILURES = 3
+    RESET_TIMEOUT_SECONDS = 300  # 5 minutes
+
+    def __init__(self):
+        self.consecutive_failures = 0
+        self.is_open = False
+        self.last_failure_time = None
+        self.total_failures = 0
+        self.total_successes = 0
+
+    def record_success(self):
+        """Record a successful trade execution."""
+        self.consecutive_failures = 0
+        self.is_open = False
+        self.total_successes += 1
+        logger.debug(f"Circuit breaker: success recorded ({self.total_successes} total)")
+
+    def record_failure(self, reason: str = ""):
+        """Record a failed trade execution."""
+        self.consecutive_failures += 1
+        self.total_failures += 1
+        self.last_failure_time = datetime.now()
+
+        logger.warning(
+            f"Circuit breaker: failure #{self.consecutive_failures} "
+            f"(total: {self.total_failures}){': ' + reason if reason else ''}"
+        )
+
+        if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+            self.is_open = True
+            logger.error(
+                f"CIRCUIT BREAKER OPEN: {self.consecutive_failures} consecutive failures. "
+                f"No trades will be attempted for {self.RESET_TIMEOUT_SECONDS}s or until reset."
+            )
+
+    def can_execute(self) -> Tuple[bool, str]:
+        """Check if trade execution is allowed."""
+        if not self.is_open:
+            return True, "Circuit closed"
+
+        # Check if timeout has expired
+        if self.last_failure_time:
+            elapsed = (datetime.now() - self.last_failure_time).total_seconds()
+            if elapsed >= self.RESET_TIMEOUT_SECONDS:
+                logger.info(f"Circuit breaker auto-reset after {elapsed:.0f}s timeout")
+                self.reset()
+                return True, "Circuit auto-reset after timeout"
+
+        return False, (
+            f"Circuit breaker OPEN: {self.consecutive_failures} consecutive failures. "
+            f"Wait for timeout or call reset()."
+        )
+
+    def reset(self):
+        """Manually reset the circuit breaker."""
+        self.consecutive_failures = 0
+        self.is_open = False
+        logger.info("Circuit breaker manually reset")
+
+    def get_status(self) -> dict:
+        """Get current circuit breaker status."""
+        return {
+            'is_open': self.is_open,
+            'consecutive_failures': self.consecutive_failures,
+            'total_failures': self.total_failures,
+            'total_successes': self.total_successes,
+            'last_failure_time': self.last_failure_time.isoformat() if self.last_failure_time else None
+        }
+
+
+# Global circuit breaker instance
+_circuit_breaker = CircuitBreaker()
+
+
+def get_circuit_breaker_status() -> dict:
+    """Get the current circuit breaker status for external monitoring."""
+    return _circuit_breaker.get_status()
+
+
+def reset_circuit_breaker():
+    """Reset the circuit breaker after manual intervention."""
+    _circuit_breaker.reset()
+    return _circuit_breaker.get_status()
 
 
 # =============================================================================
@@ -132,6 +232,18 @@ class ExecutionPipeline:
         Returns:
             TradeResult with success/failure details
         """
+        # CHECK CIRCUIT BREAKER - abort if too many recent failures
+        can_exec, reason = _circuit_breaker.can_execute()
+        if not can_exec:
+            logger.error(f"CIRCUIT BREAKER BLOCKED: {reason}")
+            return TradeResult(
+                success=False,
+                state=TradeState.ABORTED,
+                message=f"Circuit breaker blocked execution: {reason}",
+                order=order,
+                screenshots=[]
+            )
+
         logger.info(f"=" * 60)
         logger.info(f"EXECUTION PIPELINE START: {order.side} {order.shares} {order.ticker}")
         logger.info(f"Run ID: {order.run_id}")
@@ -218,6 +330,9 @@ class ExecutionPipeline:
 
             logger.info(f"EXECUTION PIPELINE COMPLETED: {order.side} {order.shares} {order.ticker}")
 
+            # Record success for circuit breaker
+            _circuit_breaker.record_success()
+
             return TradeResult(
                 success=True,
                 state=self.current_state,
@@ -234,6 +349,9 @@ class ExecutionPipeline:
             self._update_dashboard("IDLE", "FAILED", order, error=str(e))
 
             logger.error(f"EXECUTION PIPELINE FAILED at {self.current_state}: {e}")
+
+            # Record failure for circuit breaker
+            _circuit_breaker.record_failure(f"{order.ticker}: {str(e)[:100]}")
 
             return TradeResult(
                 success=False,
@@ -291,9 +409,9 @@ class ExecutionPipeline:
                     try:
                         logger.info(f"[{name}] Resetting to dashboard...")
                         self.page.goto(
-                            "https://app.stocktrak.com/dashboard/standard",
+                            STOCKTRAK_DASHBOARD_URL,
                             wait_until="domcontentloaded",
-                            timeout=60000
+                            timeout=PAGE_LOAD_TIMEOUT
                         )
                         self._dismiss_overlays()
                         time.sleep(1)
@@ -341,9 +459,9 @@ class ExecutionPipeline:
                     try:
                         # Reset to dashboard
                         self.page.goto(
-                            "https://app.stocktrak.com/dashboard/standard",
+                            STOCKTRAK_DASHBOARD_URL,
                             wait_until="domcontentloaded",
-                            timeout=60000
+                            timeout=PAGE_LOAD_TIMEOUT
                         )
                         self._dismiss_overlays()
                         time.sleep(1)
@@ -441,10 +559,10 @@ class ExecutionPipeline:
         self._dismiss_overlays()
 
         # Method 1: Direct URL (most reliable based on testing)
-        trade_url = f"https://app.stocktrak.com/trading/equities?securitysymbol={order.ticker}&exchange=US"
+        trade_url = f"{STOCKTRAK_TRADING_EQUITIES_URL}?securitysymbol={order.ticker}&exchange=US"
         logger.info(f"Using URL: {trade_url}")
 
-        self.page.goto(trade_url, wait_until="domcontentloaded", timeout=60000)
+        self.page.goto(trade_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         time.sleep(2)  # Give page time to fully render
 
         # CRITICAL: Check if we got redirected to login (session expired)
@@ -1151,14 +1269,14 @@ class ExecutionPipeline:
 
         # USE DIRECT URL - hover menus are unreliable and can hang
         if "transaction" in history_type.lower():
-            url = "https://app.stocktrak.com/portfolio/transactionhistory"
+            url = STOCKTRAK_TRANSACTION_HISTORY_URL
         else:
-            url = "https://app.stocktrak.com/portfolio/orderhistory"
+            url = STOCKTRAK_ORDER_HISTORY_URL
 
         logger.info(f"Navigating to history via URL: {url}")
 
         try:
-            self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            self.page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
         except Exception as e:
             logger.warning(f"History navigation timeout: {e}")
             # Continue anyway - might have partially loaded
