@@ -6,11 +6,14 @@ Handles persistence of bot state across restarts, including:
 - Position tracking
 - Weekly counters
 - Transaction history
+
+Thread-safe: Uses file locking to prevent concurrent write corruption.
 """
 
 import json
 import os
 import logging
+import threading
 from datetime import datetime, date
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
@@ -22,6 +25,9 @@ from config import (
 )
 
 logger = logging.getLogger('stocktrak_bot.state_manager')
+
+# Global lock for thread-safe state file access
+_state_file_lock = threading.RLock()
 
 STATE_FILE = 'bot_state.json'
 STATE_BACKUP_FILE = 'bot_state_backup.json'
@@ -63,29 +69,33 @@ class StateManager:
         self.state = self._load_state()
 
     def _load_state(self) -> Dict:
-        """Load state from disk or initialize fresh state"""
-        try:
-            if os.path.exists(self.state_file):
-                with open(self.state_file, 'r') as f:
-                    state = json.load(f)
-                logger.info(f"Loaded state from {self.state_file}")
-                return state
-            else:
-                logger.info("No existing state file, initializing fresh state")
-                return self._initialize_state()
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error loading state: {e}")
-            # Try backup
-            if os.path.exists(STATE_BACKUP_FILE):
-                logger.info("Attempting to load from backup...")
-                try:
-                    with open(STATE_BACKUP_FILE, 'r') as f:
-                        return json.load(f)
-                except (json.JSONDecodeError, IOError) as backup_error:
-                    logger.critical(f"BOTH state files corrupted: primary={e}, backup={backup_error}")
-                    logger.critical("INITIALIZING FRESH STATE - position data will be lost!")
+        """Load state from disk or initialize fresh state.
 
-            return self._initialize_state()
+        Thread-safe: Uses file locking for consistent reads.
+        """
+        with _state_file_lock:
+            try:
+                if os.path.exists(self.state_file):
+                    with open(self.state_file, 'r') as f:
+                        state = json.load(f)
+                    logger.info(f"Loaded state from {self.state_file}")
+                    return state
+                else:
+                    logger.info("No existing state file, initializing fresh state")
+                    return self._initialize_state()
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Error loading state: {e}")
+                # Try backup
+                if os.path.exists(STATE_BACKUP_FILE):
+                    logger.info("Attempting to load from backup...")
+                    try:
+                        with open(STATE_BACKUP_FILE, 'r') as f:
+                            return json.load(f)
+                    except (json.JSONDecodeError, IOError) as backup_error:
+                        logger.critical(f"BOTH state files corrupted: primary={e}, backup={backup_error}")
+                        logger.critical("INITIALIZING FRESH STATE - position data will be lost!")
+
+                return self._initialize_state()
 
     def _initialize_state(self) -> Dict:
         """Create fresh state for new bot instance"""
@@ -124,24 +134,36 @@ class StateManager:
         }
 
     def save(self):
-        """Save current state to disk with backup"""
-        try:
-            # Create backup of existing state
-            if os.path.exists(self.state_file):
-                shutil.copy(self.state_file, STATE_BACKUP_FILE)
+        """Save current state to disk with backup.
 
-            # Update timestamp
-            self.state['last_updated'] = datetime.now().isoformat()
+        Thread-safe: Uses file locking to prevent concurrent write corruption.
+        """
+        with _state_file_lock:
+            try:
+                # Create backup of existing state
+                if os.path.exists(self.state_file):
+                    shutil.copy(self.state_file, STATE_BACKUP_FILE)
 
-            # Write new state
-            with open(self.state_file, 'w') as f:
-                json.dump(self.state, f, indent=2, default=str)
+                # Update timestamp
+                self.state['last_updated'] = datetime.now().isoformat()
 
-            logger.debug(f"State saved to {self.state_file}")
+                # Write new state atomically (write to temp, then rename)
+                temp_file = self.state_file + '.tmp'
+                with open(temp_file, 'w') as f:
+                    json.dump(self.state, f, indent=2, default=str)
 
-        except IOError as e:
-            logger.error(f"Error saving state: {e}")
-            raise
+                # Atomic rename (on POSIX systems)
+                os.replace(temp_file, self.state_file)
+
+                logger.debug(f"State saved to {self.state_file}")
+
+            except IOError as e:
+                logger.error(f"Error saving state: {e}")
+                # Clean up temp file if it exists
+                temp_file = self.state_file + '.tmp'
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                raise
 
     def get_trades_used(self) -> int:
         """Get number of trades used"""

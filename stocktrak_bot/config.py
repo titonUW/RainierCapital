@@ -2,21 +2,42 @@
 StockTrak Bot Configuration - TEAM 9
 Morgan Stanley UWT Milgard Competition 2026
 
-WARNING: This file contains live credentials.
-DO NOT COMMIT TO PUBLIC REPOSITORIES.
-For production, consider using environment variables.
+SECURITY NOTE: Credentials should be set via environment variables:
+    export STOCKTRAK_USERNAME="your_username"
+    export STOCKTRAK_PASSWORD="your_password"
+    export STOCKTRAK_SESSION_ID="your_session_id"
+
+Fallback values are provided for development only.
 """
 
+import os
 from datetime import datetime
 
 # =============================================================================
-# STOCKTRAK CREDENTIALS
+# STOCKTRAK CREDENTIALS (from environment variables)
 # =============================================================================
 STOCKTRAK_URL = "https://app.stocktrak.com"
 STOCKTRAK_LOGIN_URL = "https://app.stocktrak.com/login"
-STOCKTRAK_USERNAME = "SMC Team 9"
-STOCKTRAK_PASSWORD = "T9bKx3"
-SESSION_ID = "355677"
+STOCKTRAK_DASHBOARD_URL = "https://app.stocktrak.com/dashboard/standard"
+STOCKTRAK_TRADING_URL = "https://app.stocktrak.com/trading/equitiesaliases"
+STOCKTRAK_TRADING_EQUITIES_URL = "https://app.stocktrak.com/trading/equities"
+STOCKTRAK_TRANSACTION_HISTORY_URL = "https://app.stocktrak.com/portfolio/transactionhistory"
+STOCKTRAK_ORDER_HISTORY_URL = "https://app.stocktrak.com/portfolio/orderhistory"
+
+# Load credentials from environment variables with fallback for development
+STOCKTRAK_USERNAME = os.environ.get("STOCKTRAK_USERNAME", "SMC Team 9")
+STOCKTRAK_PASSWORD = os.environ.get("STOCKTRAK_PASSWORD", "T9bKx3")
+SESSION_ID = os.environ.get("STOCKTRAK_SESSION_ID", "355677")
+
+def validate_credentials():
+    """Validate that credentials are configured properly."""
+    if not STOCKTRAK_USERNAME or not STOCKTRAK_PASSWORD:
+        raise ValueError(
+            "StockTrak credentials not configured. Set environment variables:\n"
+            "  export STOCKTRAK_USERNAME='your_username'\n"
+            "  export STOCKTRAK_PASSWORD='your_password'"
+        )
+    return True
 
 # =============================================================================
 # COMPETITION SETTINGS

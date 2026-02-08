@@ -258,6 +258,11 @@ def _execute_daily_routine_inner(bot, state: StateManager):
     if not _verify_market_data(market_data):
         raise RuntimeError("Market data fetch failed - cannot proceed safely")
 
+    # Verify data freshness (especially important for weekend/holiday detection)
+    if not collector.validate_data_freshness(market_data):
+        logger.warning("Market data may be stale (not from today's session)")
+        # Continue with warning - could be pre-market or weekend
+
     # Print market summary
     print_market_summary(market_data)
 
