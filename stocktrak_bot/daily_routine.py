@@ -574,12 +574,17 @@ def execute_normal_mode(
                 ticker_data = market_data.get(day1_ticker, {})
                 if ticker_data.get('price', 0) > 0:
                     from scoring import ScoredCandidate
+                    # Use high rel_r21 to prioritize Day-1 lineup
                     buy_candidates.append(ScoredCandidate(
                         ticker=day1_ticker,
-                        price=ticker_data['price'],
-                        score=100,  # Day-1 priority
                         bucket=bucket,
-                        reason="DAY1_LINEUP"
+                        rel_r21=1.0,  # High priority for Day-1 lineup
+                        rel_r63=1.0,
+                        vol_21=0.01,  # Low vol = good
+                        price=ticker_data['price'],
+                        is_qualified=True,
+                        is_etf=day1_ticker in ['SMH', 'XBI', 'URNM', 'XLE', 'COPX', 'DMAT', 'ROKT', 'PPA'],
+                        disqualification_reason=None
                     ))
                     logger.info(f"Day-1 candidate for {bucket}: {day1_ticker}")
                     continue
