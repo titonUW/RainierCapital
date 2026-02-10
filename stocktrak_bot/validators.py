@@ -352,7 +352,8 @@ def can_buy(
     week_replacements: int,
     vix_level: float,
     current_positions: Dict,
-    market_data: Dict
+    market_data: Dict,
+    bypass_weekly_cap: bool = False
 ) -> Tuple[bool, Dict[str, Tuple[bool, str]]]:
     """
     Complete buy validation - all checks must pass
@@ -367,6 +368,7 @@ def can_buy(
         vix_level: Current VIX
         current_positions: Current holdings
         market_data: Full market data dict
+        bypass_weekly_cap: If True, skip weekly cap check (for Day-1 continuation/emergency)
 
     Returns:
         Tuple of (all_passed, detailed_results)
@@ -381,7 +383,12 @@ def can_buy(
     checks['trade_count'] = validate_trade_count(trades_used, is_new_buy=True)
     checks['bucket_limits'] = validate_bucket_limits(ticker, current_positions)
     checks['event_freeze'] = validate_event_freeze()
-    checks['weekly_cap'] = validate_weekly_cap(week_replacements, vix_level)
+
+    # Weekly cap - bypass for Day-1 continuation and emergency buys
+    if bypass_weekly_cap:
+        checks['weekly_cap'] = (True, "Weekly cap bypassed (Day-1 continuation/emergency)")
+    else:
+        checks['weekly_cap'] = validate_weekly_cap(week_replacements, vix_level)
 
     # Trend validation
     ticker_data = market_data.get(ticker, {})
