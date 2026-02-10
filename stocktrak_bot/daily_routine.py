@@ -624,14 +624,18 @@ def execute_normal_mode(
             continue
 
         # Full validation
+        # Bypass weekly cap for Day-1 continuation and emergency buys
+        bypass_cap = need_day1_continuation or need_emergency_replacement
         all_valid, checks = can_buy(
             ticker, price, shares, portfolio_value,
             state.get_trades_used(), week_replacements,
-            vix_level, positions, market_data
+            vix_level, positions, market_data,
+            bypass_weekly_cap=bypass_cap
         )
 
         if not all_valid:
-            logger.debug(f"{ticker}: Failed validation - {checks}")
+            # Log at INFO level so we can see what's failing
+            logger.info(f"{ticker}: Failed validation - {[k for k, v in checks.items() if not v[0]]}")
             continue
 
         # Execute buy using stall-proof pipeline
