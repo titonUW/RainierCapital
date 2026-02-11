@@ -291,7 +291,7 @@ def _execute_daily_routine_inner(bot, state: StateManager):
     if market_regime == 'RISK_OFF':
         execute_risk_off_mode(bot, state, market_data, portfolio_value, vix_level)
     else:
-        execute_normal_mode(bot, state, market_data, portfolio_value, vix_level)
+        execute_normal_mode(bot, state, market_data, portfolio_value, vix_level, buying_power)
 
     # Log daily value
     state.log_daily_value(portfolio_value, vix_level)
@@ -341,7 +341,8 @@ def execute_normal_mode(
     state: StateManager,
     market_data: Dict,
     portfolio_value: float,
-    vix_level: float
+    vix_level: float,
+    buying_power: float = None
 ):
     """
     Normal trading mode (RISK_ON regime).
@@ -610,6 +611,9 @@ def execute_normal_mode(
             if replacement:
                 buy_candidates.append(replacement)
 
+    # Track available buying power for cost validation
+    available_buying_power = buying_power
+
     for candidate in buy_candidates:
         ticker = candidate.ticker
         price = candidate.price
@@ -621,6 +625,12 @@ def execute_normal_mode(
 
         if shares < 1:
             logger.debug(f"{ticker}: Position too small")
+            continue
+
+        # Check if we have enough buying power for this trade
+        estimated_cost = shares * price * 1.01  # Add 1% buffer for price movement
+        if available_buying_power is not None and estimated_cost > available_buying_power:
+            logger.info(f"{ticker}: Skipping - estimated cost ${estimated_cost:,.2f} exceeds buying power ${available_buying_power:,.2f}")
             continue
 
         # Full validation
@@ -667,7 +677,22 @@ def execute_normal_mode(
                 missing_buckets.discard(candidate.bucket)
 
             week_replacements += 1
-            time.sleep(2)
+
+            # Longer delay between trades to avoid StockTrak rate limiting
+            # and allow UI to fully settle before next trade
+            time.sleep(5)
+
+            # Refresh buying power after each trade to catch depletion early
+            # This prevents failed trades due to insufficient funds
+            try:
+                _, _, current_buying_power = bot.get_capital_from_trade_kpis("VOO")
+                available_buying_power = current_buying_power  # Update for next iteration
+                logger.info(f"Buying power after trade: ${available_buying_power:,.2f}")
+                if available_buying_power < 10000:
+                    logger.warning("Buying power below $10,000 - stopping buys to avoid failed orders")
+                    break
+            except Exception as bp_err:
+                logger.warning(f"Could not refresh buying power: {bp_err}")
 
             # Check limits
             if len(buys_executed) >= (max_satellites - current_satellites):

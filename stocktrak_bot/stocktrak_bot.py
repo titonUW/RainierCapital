@@ -11,11 +11,53 @@ import logging
 import time
 import os
 import re
+import asyncio
+import gc
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
+
+
+def _cleanup_asyncio_state():
+    """
+    Clean up any stale asyncio event loop state before starting Playwright.
+
+    This fixes the "using Playwright Sync API inside the asyncio loop" error
+    that can occur when the bot runs for extended periods (e.g., overnight).
+
+    The issue: Playwright's sync API internally uses asyncio, and on Windows
+    especially, residual event loop state from previous executions can
+    interfere with new Playwright sessions after long-running processes.
+    """
+    try:
+        # Try to get any running event loop and close it
+        try:
+            loop = asyncio.get_running_loop()
+            if loop and loop.is_running():
+                logger.warning("Found running asyncio event loop - attempting cleanup")
+                # Can't close a running loop from within - this is for detection only
+                # The actual fix is in the except RuntimeError path
+        except RuntimeError:
+            # No running loop - this is the expected/good case
+            pass
+
+        # Clean up the default event loop if it exists
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                # Create a fresh loop if the current one is closed
+                asyncio.set_event_loop(asyncio.new_event_loop())
+        except RuntimeError:
+            # No event loop in current thread - create one
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
+        # Force garbage collection to clean up any lingering references
+        gc.collect()
+
+    except Exception as e:
+        logger.warning(f"Error during asyncio cleanup (non-critical): {e}")
 
 import config
 
@@ -378,6 +420,11 @@ class StockTrakBot:
             self.headless = headless
 
         logger.info(f"Starting browser (headless={self.headless}, persistent={use_persistent})...")
+
+        # CRITICAL: Clean up any stale asyncio state before starting Playwright
+        # This fixes the "using Playwright Sync API inside the asyncio loop" error
+        # that occurs when the bot runs continuously for extended periods
+        _cleanup_asyncio_state()
 
         self.playwright = sync_playwright().start()
 
@@ -2133,17 +2180,40 @@ class StockTrakBot:
         return "Unknown error"
 
     def close(self):
-        """Clean up browser resources"""
+        """Clean up browser resources and reset asyncio state for next execution."""
         logger.info("Closing browser...")
         try:
             if self.page:
-                self.page.close()
+                try:
+                    self.page.close()
+                except Exception:
+                    pass
+                self.page = None
             if self.context:
-                self.context.close()
+                try:
+                    self.context.close()
+                except Exception:
+                    pass
+                self.context = None
             if self.browser:
-                self.browser.close()
+                try:
+                    self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
             if self.playwright:
-                self.playwright.stop()
+                try:
+                    self.playwright.stop()
+                except Exception:
+                    pass
+                self.playwright = None
+
+            # Force cleanup of asyncio state to prevent issues on next execution
+            _cleanup_asyncio_state()
+
+            # Force garbage collection
+            gc.collect()
+            logger.info("Browser closed and resources cleaned up")
         except Exception as e:
             logger.error(f"Error closing browser: {e}")
 

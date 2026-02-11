@@ -925,28 +925,74 @@ class ExecutionPipeline:
         logger.info("Waiting for confirmation UI (Confirm Order button)...")
         time.sleep(2)
 
+        # First, check for any error messages that might indicate why confirm isn't showing
+        error_check_js = """
+        (function() {
+            const errorSelectors = ['.error', '.alert-danger', '.alert-error', '.error-message',
+                                   '[class*="error"]', '[class*="alert"]', '.toast-error'];
+            for (const sel of errorSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) {
+                    const text = el.textContent.trim();
+                    if (text.length > 5 && text.length < 500) {
+                        return {hasError: true, message: text};
+                    }
+                }
+            }
+            // Also check for "insufficient" or similar text anywhere visible
+            const body = document.body.innerText.toLowerCase();
+            if (body.includes('insufficient') || body.includes('not enough') ||
+                body.includes('exceeds') || body.includes('limit reached') ||
+                body.includes('buying power')) {
+                return {hasError: true, message: 'Possible buying power or limit issue detected'};
+            }
+            return {hasError: false};
+        })();
+        """
+        error_result = self.page.evaluate(error_check_js)
+        if error_result.get('hasError'):
+            logger.warning(f"Possible error on page: {error_result.get('message')}")
+
         # CRITICAL: Wait for the ACTUAL Confirm Order button to appear
         # This is the definitive check that we're on the confirmation page
-        max_wait = 10  # seconds
+        max_wait = 15  # Increased from 10 to 15 seconds for slower page loads
         confirm_found = False
 
         for wait_sec in range(max_wait):
             # Check for Confirm Order button using JavaScript (more reliable)
+            # Added more button text patterns for StockTrak UI variations
             js_check = """
             (function() {
                 const buttons = document.querySelectorAll('button, a, [role="button"], input[type="submit"]');
+                const confirmPatterns = [
+                    'confirm order', 'place order', 'confirm trade', 'submit order',
+                    'execute order', 'confirm', 'place trade', 'submit'
+                ];
                 for (const btn of buttons) {
                     const text = (btn.textContent || btn.value || '').toLowerCase().trim();
-                    if (text.includes('confirm order') || text.includes('place order')) {
-                        const rect = btn.getBoundingClientRect();
-                        const style = window.getComputedStyle(btn);
-                        if (rect.width > 0 && rect.height > 0 &&
-                            style.display !== 'none' && style.visibility !== 'hidden') {
-                            return {found: true, text: text};
+                    // Skip navigation/cancel buttons
+                    if (text.includes('cancel') || text.includes('back') ||
+                        text.includes('close') || text.includes('review')) continue;
+
+                    for (const pattern of confirmPatterns) {
+                        if (text.includes(pattern)) {
+                            const rect = btn.getBoundingClientRect();
+                            const style = window.getComputedStyle(btn);
+                            if (rect.width > 0 && rect.height > 0 &&
+                                style.display !== 'none' && style.visibility !== 'hidden') {
+                                return {found: true, text: text};
+                            }
                         }
                     }
                 }
-                return {found: false};
+                // Debug: return all visible button texts
+                const allBtns = [];
+                buttons.forEach(btn => {
+                    if (btn.offsetParent !== null) {
+                        allBtns.push((btn.textContent || btn.value || '').trim().substring(0, 40));
+                    }
+                });
+                return {found: false, visibleButtons: allBtns};
             })();
             """
             result = self.page.evaluate(js_check)
@@ -954,13 +1000,17 @@ class ExecutionPipeline:
                 confirm_found = True
                 logger.info(f"SUCCESS: Confirm Order button found after {wait_sec + 1}s: '{result.get('text')}'")
                 break
+            if wait_sec == 5:
+                # Log intermediate state at 5 seconds
+                logger.info(f"Still waiting for Confirm... visible buttons: {result.get('visibleButtons', [])[:5]}")
             time.sleep(1)
 
         self._take_screenshot(f"after_review_click_{order.ticker}")
 
         if not confirm_found:
-            # Confirmation UI didn't appear - this is a real failure
+            # Log all visible buttons for debugging
             logger.error("FAILED: Confirm Order button NOT found after clicking Review Order")
+            logger.error(f"Visible buttons on page: {result.get('visibleButtons', [])}")
             raise RuntimeError("Confirmation UI did not appear - Confirm Order button not found")
 
         return True
