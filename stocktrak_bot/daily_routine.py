@@ -172,7 +172,8 @@ def execute_daily_routine():
     try:
         # WRAP ENTIRE EXECUTION IN TIMEOUT
         with execution_timeout(EXECUTION_TIMEOUT_SECONDS, "Daily routine exceeded timeout"):
-            _execute_daily_routine_inner(bot, state)
+            # NOTE: bot is returned from inner function so it can be closed in finally
+            bot = _execute_daily_routine_inner(state)
 
     except ExecutionTimeoutError as e:
         logger.critical(f"EXECUTION TIMEOUT: {e}")
@@ -186,11 +187,13 @@ def execute_daily_routine():
             state.log_error(str(e))
 
     finally:
+        # CRITICAL: Always close the browser to prevent asyncio loop leaks
         if bot:
             try:
+                logger.info("Closing browser in finally block...")
                 bot.close()
-            except Exception:
-                pass
+            except Exception as close_err:
+                logger.warning(f"Error closing browser: {close_err}")
 
 
 def _verify_state_integrity(state: StateManager) -> bool:
@@ -220,15 +223,19 @@ def _verify_state_integrity(state: StateManager) -> bool:
     return True
 
 
-def _execute_daily_routine_inner(bot, state: StateManager):
+def _execute_daily_routine_inner(state: StateManager) -> 'StockTrakBot':
     """
     Inner execution logic (wrapped in timeout by caller).
+
+    Returns:
+        StockTrakBot: The bot instance so caller can close it in finally block.
     """
     # Initialize bot
     bot = StockTrakBot()
     bot.start_browser(headless=True)
 
     if not bot.login():
+        bot.close()  # Close on login failure
         raise Exception("Login failed - cannot proceed")
 
     # Get capital from trade page KPIs (robust, fail-closed)
@@ -291,7 +298,7 @@ def _execute_daily_routine_inner(bot, state: StateManager):
     if market_regime == 'RISK_OFF':
         execute_risk_off_mode(bot, state, market_data, portfolio_value, vix_level)
     else:
-        execute_normal_mode(bot, state, market_data, portfolio_value, vix_level)
+        execute_normal_mode(bot, state, market_data, portfolio_value, vix_level, buying_power)
 
     # Log daily value
     state.log_daily_value(portfolio_value, vix_level)
@@ -300,6 +307,9 @@ def _execute_daily_routine_inner(bot, state: StateManager):
     state.mark_execution()
 
     logger.info("Daily routine completed successfully")
+
+    # Return bot so caller can close it
+    return bot
 
 
 def _verify_market_data(market_data: Dict) -> bool:
@@ -341,7 +351,8 @@ def execute_normal_mode(
     state: StateManager,
     market_data: Dict,
     portfolio_value: float,
-    vix_level: float
+    vix_level: float,
+    buying_power: float = None
 ):
     """
     Normal trading mode (RISK_ON regime).
@@ -444,7 +455,8 @@ def execute_normal_mode(
                 logger.info(f"SELL [{exit_type}] {ticker}: {shares} shares ({sell_reason})")
                 state.remove_position(ticker)
                 sells_executed.append((ticker, position.get('bucket')))
-                time.sleep(2)
+                # Increased delay between trades to prevent StockTrak rate limiting
+                time.sleep(5)
 
     # ===== STEP 2: Check for profit-taking (FRIDAY ONLY) =====
     if friday:
@@ -482,7 +494,8 @@ def execute_normal_mode(
                 state.increment_week_replacements()
                 state.remove_position(ticker)
                 sells_executed.append((ticker, position.get('bucket')))
-                time.sleep(2)
+                # Increased delay between trades to prevent StockTrak rate limiting
+                time.sleep(5)
     else:
         logger.info("Skipping profit-taking (non-Friday)")
 
@@ -610,6 +623,9 @@ def execute_normal_mode(
             if replacement:
                 buy_candidates.append(replacement)
 
+    # Track available buying power for cost validation
+    available_buying_power = buying_power
+
     for candidate in buy_candidates:
         ticker = candidate.ticker
         price = candidate.price
@@ -621,6 +637,12 @@ def execute_normal_mode(
 
         if shares < 1:
             logger.debug(f"{ticker}: Position too small")
+            continue
+
+        # Check if we have enough buying power for this trade
+        estimated_cost = shares * price * 1.01  # Add 1% buffer for price movement
+        if available_buying_power is not None and estimated_cost > available_buying_power:
+            logger.info(f"{ticker}: Skipping - estimated cost ${estimated_cost:,.2f} exceeds buying power ${available_buying_power:,.2f}")
             continue
 
         # Full validation
@@ -667,7 +689,22 @@ def execute_normal_mode(
                 missing_buckets.discard(candidate.bucket)
 
             week_replacements += 1
-            time.sleep(2)
+
+            # Longer delay between trades to avoid StockTrak rate limiting
+            # and allow UI to fully settle before next trade
+            time.sleep(5)
+
+            # Refresh buying power after each trade to catch depletion early
+            # This prevents failed trades due to insufficient funds
+            try:
+                _, _, current_buying_power = bot.get_capital_from_trade_kpis("VOO")
+                available_buying_power = current_buying_power  # Update for next iteration
+                logger.info(f"Buying power after trade: ${available_buying_power:,.2f}")
+                if available_buying_power < 10000:
+                    logger.warning("Buying power below $10,000 - stopping buys to avoid failed orders")
+                    break
+            except Exception as bp_err:
+                logger.warning(f"Could not refresh buying power: {bp_err}")
 
             # Check limits
             if len(buys_executed) >= (max_satellites - current_satellites):
@@ -740,7 +777,8 @@ def execute_risk_off_mode(
             if success:
                 logger.info(f"RISK-OFF SELL {ticker}: {shares} shares")
                 state.remove_position(ticker)
-                time.sleep(2)
+                # Increased delay between trades to prevent StockTrak rate limiting
+                time.sleep(5)
 
     logger.info("Risk-off mode complete - no new buys permitted")
 

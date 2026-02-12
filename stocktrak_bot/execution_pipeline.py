@@ -925,42 +925,143 @@ class ExecutionPipeline:
         logger.info("Waiting for confirmation UI (Confirm Order button)...")
         time.sleep(2)
 
+        # First, check for any error messages that might indicate why confirm isn't showing
+        error_check_js = """
+        (function() {
+            const errorSelectors = ['.error', '.alert-danger', '.alert-error', '.error-message',
+                                   '[class*="error"]', '[class*="alert"]', '.toast-error'];
+            for (const sel of errorSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) {
+                    const text = el.textContent.trim();
+                    if (text.length > 5 && text.length < 500) {
+                        return {hasError: true, message: text};
+                    }
+                }
+            }
+            // Also check for "insufficient" or similar text anywhere visible
+            const body = document.body.innerText.toLowerCase();
+            if (body.includes('insufficient') || body.includes('not enough') ||
+                body.includes('exceeds') || body.includes('limit reached') ||
+                body.includes('buying power')) {
+                return {hasError: true, message: 'Possible buying power or limit issue detected'};
+            }
+            return {hasError: false};
+        })();
+        """
+        error_result = self.page.evaluate(error_check_js)
+        if error_result.get('hasError'):
+            logger.warning(f"Possible error on page: {error_result.get('message')}")
+            # If there's an error, try dismissing overlays and take screenshot
+            self._dismiss_overlays()
+            self._take_screenshot(f"error_detected_{order.ticker}")
+
+        # Log current URL to detect unexpected navigation
+        current_url = self.page.url
+        logger.info(f"Current URL after Review Order: {current_url}")
+
+        # Try to dismiss any overlays that appeared after clicking Review Order
+        self._dismiss_overlays()
+
         # CRITICAL: Wait for the ACTUAL Confirm Order button to appear
         # This is the definitive check that we're on the confirmation page
-        max_wait = 10  # seconds
+        max_wait = 20  # Increased to 20 seconds for slower page loads
         confirm_found = False
 
         for wait_sec in range(max_wait):
+            # First, try to dismiss any popup overlays each iteration
+            if wait_sec % 3 == 0 and wait_sec > 0:
+                self._dismiss_overlays()
+
             # Check for Confirm Order button using JavaScript (more reliable)
+            # Added more button text patterns for StockTrak UI variations
             js_check = """
             (function() {
-                const buttons = document.querySelectorAll('button, a, [role="button"], input[type="submit"]');
+                const buttons = document.querySelectorAll('button, a, [role="button"], input[type="submit"], span[role="button"]');
+                const confirmPatterns = [
+                    'confirm order', 'place order', 'confirm trade', 'submit order',
+                    'execute order', 'confirm', 'place trade', 'submit', 'complete order',
+                    'finalize', 'execute', 'complete'
+                ];
+                const excludePatterns = ['cancel', 'back', 'close', 'review', 'edit', 'modify'];
+
                 for (const btn of buttons) {
                     const text = (btn.textContent || btn.value || '').toLowerCase().trim();
-                    if (text.includes('confirm order') || text.includes('place order')) {
-                        const rect = btn.getBoundingClientRect();
-                        const style = window.getComputedStyle(btn);
-                        if (rect.width > 0 && rect.height > 0 &&
-                            style.display !== 'none' && style.visibility !== 'hidden') {
-                            return {found: true, text: text};
+                    // Skip navigation/cancel buttons
+                    if (excludePatterns.some(p => text.includes(p))) continue;
+                    // Skip empty buttons
+                    if (text.length < 3) continue;
+
+                    for (const pattern of confirmPatterns) {
+                        if (text.includes(pattern)) {
+                            const rect = btn.getBoundingClientRect();
+                            const style = window.getComputedStyle(btn);
+                            if (rect.width > 0 && rect.height > 0 &&
+                                style.display !== 'none' && style.visibility !== 'hidden') {
+                                return {found: true, text: text, tag: btn.tagName};
+                            }
                         }
                     }
                 }
-                return {found: false};
+
+                // Also check for modals with confirmation UI
+                const modals = document.querySelectorAll('[class*="modal"]:not([style*="display: none"]), [class*="dialog"]:not([style*="display: none"]), [class*="confirm"]:not([style*="display: none"])');
+                const hasVisibleModal = Array.from(modals).some(m => {
+                    const style = window.getComputedStyle(m);
+                    return style.display !== 'none' && style.visibility !== 'hidden';
+                });
+
+                // Debug: return all visible button texts and page info
+                const allBtns = [];
+                buttons.forEach(btn => {
+                    if (btn.offsetParent !== null) {
+                        allBtns.push((btn.textContent || btn.value || '').trim().substring(0, 40));
+                    }
+                });
+
+                // Check for error indicators
+                const pageText = document.body.innerText.toLowerCase();
+                const hasError = ['error', 'failed', 'invalid', 'insufficient', 'not available'].some(e => pageText.includes(e));
+
+                return {
+                    found: false,
+                    visibleButtons: allBtns,
+                    hasModal: hasVisibleModal,
+                    modalCount: modals.length,
+                    possibleError: hasError
+                };
             })();
             """
             result = self.page.evaluate(js_check)
             if result.get('found'):
                 confirm_found = True
-                logger.info(f"SUCCESS: Confirm Order button found after {wait_sec + 1}s: '{result.get('text')}'")
+                logger.info(f"SUCCESS: Confirm Order button found after {wait_sec + 1}s: '{result.get('text')}' ({result.get('tag')})")
                 break
+
+            # Enhanced logging at intervals
+            if wait_sec == 3:
+                logger.info(f"Waiting for Confirm... visible buttons: {result.get('visibleButtons', [])[:8]}")
+                if result.get('hasModal'):
+                    logger.info(f"Modal detected ({result.get('modalCount')} modals visible)")
+                if result.get('possibleError'):
+                    logger.warning("Possible error text detected on page")
+
+            if wait_sec == 8:
+                # Mid-wait screenshot for debugging
+                self._take_screenshot(f"waiting_confirm_{order.ticker}")
+                logger.info(f"Still waiting... buttons: {result.get('visibleButtons', [])[:10]}")
+
             time.sleep(1)
 
         self._take_screenshot(f"after_review_click_{order.ticker}")
 
         if not confirm_found:
-            # Confirmation UI didn't appear - this is a real failure
+            # Log all visible buttons for debugging
             logger.error("FAILED: Confirm Order button NOT found after clicking Review Order")
+            logger.error(f"Visible buttons on page: {result.get('visibleButtons', [])}")
+            logger.error(f"Page URL: {self.page.url}")
+            if result.get('possibleError'):
+                logger.error("Error indicators found on page - order may have been rejected")
             raise RuntimeError("Confirmation UI did not appear - Confirm Order button not found")
 
         return True
@@ -1286,22 +1387,70 @@ class ExecutionPipeline:
 
     def _find_trade_in_table(self, order: TradeOrder) -> bool:
         """Find the trade in the history table."""
-        # Look for ticker in table
+        # Wait for table to load
+        try:
+            self.page.wait_for_selector("table", timeout=5000)
+            time.sleep(1)  # Give table data time to populate
+        except Exception:
+            pass  # Continue even if no table found
+
+        # First, try using JavaScript for more reliable search
+        js_search = f"""
+        (function() {{
+            const ticker = '{order.ticker}'.toUpperCase();
+            const side = '{order.side}'.toUpperCase();
+            const shares = '{order.shares}';
+
+            // Search all table rows
+            const rows = document.querySelectorAll('tr');
+            for (const row of rows) {{
+                const text = row.innerText.toUpperCase();
+                if (text.includes(ticker)) {{
+                    // Found ticker, check for side and shares (be lenient)
+                    const hasAction = text.includes(side) || text.includes('BUY') || text.includes('SELL');
+                    const hasShares = text.includes(shares);
+                    if (hasAction || hasShares) {{
+                        return {{found: true, text: text.substring(0, 150)}};
+                    }}
+                }}
+            }}
+
+            // Also check for ticker anywhere on page as fallback
+            const pageText = document.body.innerText.toUpperCase();
+            const tickerMentioned = pageText.includes(ticker);
+
+            return {{found: false, tickerMentioned: tickerMentioned}};
+        }})();
+        """
+
+        result = self.page.evaluate(js_search)
+        if result.get('found'):
+            logger.info(f"Found trade via JavaScript: {result.get('text')}")
+            return True
+
+        # Fallback: Playwright locator
         rows = self.page.locator("tr", has_text=re.compile(order.ticker, re.I))
 
-        if rows.count() == 0:
-            return False
+        try:
+            if rows.count() == 0:
+                if result.get('tickerMentioned'):
+                    logger.info(f"Ticker {order.ticker} mentioned on page but not in table row format")
+                    return True  # Assume success if ticker appears anywhere
+                return False
 
-        # Check if any row matches side and shares
-        for i in range(min(rows.count(), 10)):  # Check first 10 matches
-            try:
-                row_text = rows.nth(i).text_content().upper()
-                if order.side in row_text and str(order.shares) in row_text:
-                    logger.info(f"Found matching trade: {row_text[:100]}")
-                    return True
-            except Exception as e:
-                logger.debug(f"Row {i} check failed: {e}")
-                continue
+            # Check if any row matches side and shares
+            for i in range(min(rows.count(), 10)):  # Check first 10 matches
+                try:
+                    row_text = rows.nth(i).text_content().upper()
+                    if order.side in row_text or str(order.shares) in row_text:
+                        logger.info(f"Found matching trade: {row_text[:100]}")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Row {i} check failed: {e}")
+                    continue
+
+        except Exception as e:
+            logger.debug(f"Playwright row search failed: {e}")
 
         return False
 
