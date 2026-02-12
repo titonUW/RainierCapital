@@ -172,7 +172,8 @@ def execute_daily_routine():
     try:
         # WRAP ENTIRE EXECUTION IN TIMEOUT
         with execution_timeout(EXECUTION_TIMEOUT_SECONDS, "Daily routine exceeded timeout"):
-            _execute_daily_routine_inner(bot, state)
+            # NOTE: bot is returned from inner function so it can be closed in finally
+            bot = _execute_daily_routine_inner(state)
 
     except ExecutionTimeoutError as e:
         logger.critical(f"EXECUTION TIMEOUT: {e}")
@@ -186,11 +187,13 @@ def execute_daily_routine():
             state.log_error(str(e))
 
     finally:
+        # CRITICAL: Always close the browser to prevent asyncio loop leaks
         if bot:
             try:
+                logger.info("Closing browser in finally block...")
                 bot.close()
-            except Exception:
-                pass
+            except Exception as close_err:
+                logger.warning(f"Error closing browser: {close_err}")
 
 
 def _verify_state_integrity(state: StateManager) -> bool:
@@ -220,15 +223,19 @@ def _verify_state_integrity(state: StateManager) -> bool:
     return True
 
 
-def _execute_daily_routine_inner(bot, state: StateManager):
+def _execute_daily_routine_inner(state: StateManager) -> 'StockTrakBot':
     """
     Inner execution logic (wrapped in timeout by caller).
+
+    Returns:
+        StockTrakBot: The bot instance so caller can close it in finally block.
     """
     # Initialize bot
     bot = StockTrakBot()
     bot.start_browser(headless=True)
 
     if not bot.login():
+        bot.close()  # Close on login failure
         raise Exception("Login failed - cannot proceed")
 
     # Get capital from trade page KPIs (robust, fail-closed)
@@ -300,6 +307,9 @@ def _execute_daily_routine_inner(bot, state: StateManager):
     state.mark_execution()
 
     logger.info("Daily routine completed successfully")
+
+    # Return bot so caller can close it
+    return bot
 
 
 def _verify_market_data(market_data: Dict) -> bool:
@@ -445,7 +455,8 @@ def execute_normal_mode(
                 logger.info(f"SELL [{exit_type}] {ticker}: {shares} shares ({sell_reason})")
                 state.remove_position(ticker)
                 sells_executed.append((ticker, position.get('bucket')))
-                time.sleep(2)
+                # Increased delay between trades to prevent StockTrak rate limiting
+                time.sleep(5)
 
     # ===== STEP 2: Check for profit-taking (FRIDAY ONLY) =====
     if friday:
@@ -483,7 +494,8 @@ def execute_normal_mode(
                 state.increment_week_replacements()
                 state.remove_position(ticker)
                 sells_executed.append((ticker, position.get('bucket')))
-                time.sleep(2)
+                # Increased delay between trades to prevent StockTrak rate limiting
+                time.sleep(5)
     else:
         logger.info("Skipping profit-taking (non-Friday)")
 
@@ -765,7 +777,8 @@ def execute_risk_off_mode(
             if success:
                 logger.info(f"RISK-OFF SELL {ticker}: {shares} shares")
                 state.remove_position(ticker)
-                time.sleep(2)
+                # Increased delay between trades to prevent StockTrak rate limiting
+                time.sleep(5)
 
     logger.info("Risk-off mode complete - no new buys permitted")
 

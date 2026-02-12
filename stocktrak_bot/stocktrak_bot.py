@@ -31,33 +31,71 @@ def _cleanup_asyncio_state():
     especially, residual event loop state from previous executions can
     interfere with new Playwright sessions after long-running processes.
     """
+    # Use print for logging since logger may not be initialized yet
+    def _log(msg):
+        try:
+            logger.debug(msg)
+        except:
+            pass  # Logger not ready - silent
+
     try:
-        # Try to get any running event loop and close it
+        # STEP 1: Check for running event loop
+        has_running_loop = False
         try:
             loop = asyncio.get_running_loop()
             if loop and loop.is_running():
-                logger.warning("Found running asyncio event loop - attempting cleanup")
-                # Can't close a running loop from within - this is for detection only
-                # The actual fix is in the except RuntimeError path
+                has_running_loop = True
+                _log("WARNING: Found running asyncio event loop")
         except RuntimeError:
             # No running loop - this is the expected/good case
             pass
 
-        # Clean up the default event loop if it exists
+        # STEP 2: If there's a running loop, we're inside an async context
+        # This shouldn't happen with proper bot.close() calls, but handle it
+        if has_running_loop:
+            # We can't clean up from inside a running loop, but we can
+            # set a new policy to create a fresh loop on next access
+            if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
+                # Windows-specific: use selector event loop for better cleanup
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            _log("Set new event loop policy due to running loop")
+
+        # STEP 3: Clean up the default event loop if it exists
         try:
             loop = asyncio.get_event_loop()
             if loop.is_closed():
                 # Create a fresh loop if the current one is closed
-                asyncio.set_event_loop(asyncio.new_event_loop())
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                _log("Created fresh event loop (previous was closed)")
+            elif not loop.is_running():
+                # Loop exists but not running - close it and create fresh
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                _log("Closed stale event loop and created fresh one")
         except RuntimeError:
             # No event loop in current thread - create one
-            asyncio.set_event_loop(asyncio.new_event_loop())
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            _log("Created new event loop (none existed)")
 
-        # Force garbage collection to clean up any lingering references
+        # STEP 4: Force garbage collection to clean up any lingering references
         gc.collect()
 
+        # STEP 5: Small delay to let resources settle
+        import time
+        time.sleep(0.1)
+
     except Exception as e:
-        logger.warning(f"Error during asyncio cleanup (non-critical): {e}")
+        # Don't fail startup due to cleanup issues
+        try:
+            logger.warning(f"Error during asyncio cleanup (non-critical): {e}")
+        except:
+            pass
 
 import config
 
