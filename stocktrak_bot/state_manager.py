@@ -131,6 +131,19 @@ class StateManager:
             # Error tracking
             'error_count': 0,
             'last_error': None,
+
+            # SPRINT3 state tracking
+            'sprint3': {
+                'mode': None,           # 'SPRINT3' when active
+                'sprint_day': 0,        # 1, 2, or 3
+                'trades_used_sprint': 0,
+                'last_run_time': None,
+                'last_run_day': None,
+                'satellites_held': [],  # List of satellite tickers
+                'last_result': None,
+                'last_error': None,
+                'last_screenshot': None,
+            },
         }
 
     def save(self):
@@ -408,6 +421,78 @@ class StateManager:
         except Exception as e:
             logger.warning(f"Could not write dashboard state: {e}")
 
+    # =========================================================================
+    # SPRINT3 STATE MANAGEMENT
+    # =========================================================================
+    def get_sprint3_state(self) -> Dict:
+        """Get sprint3 state dict."""
+        # Initialize sprint3 state if not present
+        if 'sprint3' not in self.state:
+            self.state['sprint3'] = {
+                'mode': None,
+                'sprint_day': 0,
+                'trades_used_sprint': 0,
+                'last_run_time': None,
+                'last_run_day': None,
+                'satellites_held': [],
+                'last_result': None,
+                'last_error': None,
+                'last_screenshot': None,
+            }
+        return self.state['sprint3']
+
+    def update_sprint3_state(self, **kwargs):
+        """Update sprint3 state fields."""
+        sprint3 = self.get_sprint3_state()
+        sprint3.update(kwargs)
+        self.save()
+
+    def is_sprint3_active(self) -> bool:
+        """Check if sprint3 mode is active."""
+        return self.get_sprint3_state().get('mode') == 'SPRINT3'
+
+    def start_sprint3(self):
+        """Initialize sprint3 mode."""
+        self.update_sprint3_state(
+            mode='SPRINT3',
+            sprint_day=0,
+            trades_used_sprint=0,
+            last_run_time=datetime.now().isoformat(),
+            satellites_held=[],
+            last_result=None,
+            last_error=None
+        )
+        logger.info("Sprint3 mode initialized")
+
+    def reset_sprint3(self):
+        """Reset sprint3 state."""
+        self.state['sprint3'] = {
+            'mode': None,
+            'sprint_day': 0,
+            'trades_used_sprint': 0,
+            'last_run_time': None,
+            'last_run_day': None,
+            'satellites_held': [],
+            'last_result': None,
+            'last_error': None,
+            'last_screenshot': None,
+        }
+        self.save()
+        logger.info("Sprint3 state reset")
+
+    def get_sprint3_trades_remaining(self) -> int:
+        """Get remaining trades in sprint3 budget."""
+        sprint3 = self.get_sprint3_state()
+        SPRINT3_TRADE_CAP = 65
+        SPRINT3_BUFFER = 5
+
+        # Cap is either 65 or remaining trades - buffer, whichever is smaller
+        trades_remaining = self.get_trades_remaining()
+        effective_cap = min(SPRINT3_TRADE_CAP, trades_remaining - SPRINT3_BUFFER)
+        sprint_used = sprint3.get('trades_used_sprint', 0)
+
+        return max(0, effective_cap - sprint_used)
+
     def print_status(self):
         """Print current bot status"""
         print("\n" + "=" * 60)
@@ -421,6 +506,18 @@ class StateManager:
         print(f"Last Execution: {self.state.get('last_execution_date')}")
         print(f"Error Count: {self.state.get('error_count', 0)}")
         print("=" * 60)
+
+        # Print sprint3 status if active
+        sprint3 = self.get_sprint3_state()
+        if sprint3.get('mode') == 'SPRINT3':
+            print("\nSPRINT3 STATUS:")
+            print(f"  Sprint Day: {sprint3.get('sprint_day', 0)}/3")
+            print(f"  Sprint Trades Used: {sprint3.get('trades_used_sprint', 0)}")
+            print(f"  Sprint Trades Remaining: {self.get_sprint3_trades_remaining()}")
+            print(f"  Satellites: {len(sprint3.get('satellites_held', []))}")
+            print(f"  Last Run: {sprint3.get('last_run_time')}")
+            if sprint3.get('last_error'):
+                print(f"  Last Error: {sprint3.get('last_error')}")
 
         # Print positions
         positions = self.get_positions()
