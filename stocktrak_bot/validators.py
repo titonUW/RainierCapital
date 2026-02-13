@@ -18,7 +18,7 @@ from config import (
     MIN_PRICE_AT_BUY, MAX_SINGLE_POSITION_PCT, MIN_HOLDINGS,
     MAX_TRADES_TOTAL, HARD_STOP_TRADES, MIN_HOLD_SECONDS, HOLD_BUFFER_SECONDS,
     CORE_POSITIONS, SATELLITE_BUCKETS, MAX_PER_BUCKET, MIN_BUCKETS,
-    EVENT_FREEZE_DATES, REGIME_PARAMS, get_bucket_for_ticker
+    EVENT_FREEZE_DATES, REGIME_PARAMS, get_bucket_for_ticker, HOLD_MODE
 )
 from utils import is_trading_day, get_trading_days_between
 
@@ -259,6 +259,112 @@ def validate_holding_period(position: Dict, now_utc: datetime = None) -> Tuple[b
     return True, f"24h hold met: {hours_held:.2f} hours since last buy"
 
 
+def can_sell_with_lots(
+    ticker: str,
+    desired_qty: int,
+    state_manager,
+    now_utc: datetime = None
+) -> Tuple[bool, int, str]:
+    """
+    Validate if a SELL is allowed based on lot-based 24h hold compliance.
+
+    Supports two modes (configured via config.HOLD_MODE):
+    - LOT_FIFO: Allows selling eligible shares (lots held >= 24h + buffer)
+    - STRICT_TICKER: Blocks ALL sells if ANY lot is younger than 24h + buffer
+
+    Args:
+        ticker: Stock ticker symbol
+        desired_qty: Number of shares caller wants to sell
+        state_manager: StateManager instance with position/lot data
+        now_utc: Current UTC time (defaults to now, useful for testing)
+
+    Returns:
+        Tuple of (can_sell, allowed_qty, reason)
+        - can_sell: True if any sell is allowed
+        - allowed_qty: Number of shares allowed to sell (may be < desired_qty in LOT_FIFO)
+        - reason: Human-readable explanation
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    # Check if position exists
+    positions = state_manager.get_positions()
+    pos = positions.get(ticker)
+    if not pos:
+        return False, 0, f"No position found for {ticker}"
+
+    # Get total shares
+    total_shares = state_manager.get_total_shares(ticker)
+    if total_shares <= 0:
+        return False, 0, f"No shares held for {ticker}"
+
+    if desired_qty > total_shares:
+        return False, 0, f"Cannot sell {desired_qty} shares, only hold {total_shares}"
+
+    # Apply HOLD_MODE logic
+    if HOLD_MODE == "STRICT_TICKER":
+        # STRICT_TICKER: If ANY lot is younger than 24h + buffer, block ALL sells
+        has_recent, reason = state_manager.has_any_recent_buy(ticker, now_utc)
+        if has_recent:
+            earliest = state_manager.earliest_eligible_time(ticker, now_utc)
+            earliest_str = f" Earliest eligible: {earliest}" if earliest else ""
+            return False, 0, f"STRICT_TICKER: {reason}.{earliest_str}"
+
+        # All lots are old enough - allow full sell
+        return True, desired_qty, f"STRICT_TICKER: All lots older than 24h + buffer"
+
+    else:  # LOT_FIFO (default)
+        # LOT_FIFO: Allow selling only from eligible lots (oldest first)
+        eligible_qty = state_manager.eligible_sell_qty(ticker, now_utc)
+
+        if eligible_qty <= 0:
+            earliest = state_manager.earliest_eligible_time(ticker, now_utc)
+            earliest_str = f" Earliest eligible: {earliest}" if earliest else ""
+            return False, 0, f"LOT_FIFO: 0 shares eligible (need 24h + buffer hold).{earliest_str}"
+
+        if eligible_qty >= desired_qty:
+            return True, desired_qty, f"LOT_FIFO: {eligible_qty} shares eligible, allowing {desired_qty}"
+
+        # Partial sell allowed
+        return True, eligible_qty, (
+            f"LOT_FIFO: Only {eligible_qty}/{desired_qty} shares eligible. "
+            f"Reducing sell to {eligible_qty} shares."
+        )
+
+
+def validate_holding_period_lots(
+    ticker: str,
+    state_manager,
+    now_utc: datetime = None
+) -> Tuple[bool, str]:
+    """
+    Check if ANY shares can be sold for a ticker (for display/logging purposes).
+
+    This is a simplified wrapper around can_sell_with_lots for use in
+    position evaluation loops where we just need a yes/no.
+
+    Args:
+        ticker: Stock ticker symbol
+        state_manager: StateManager instance
+        now_utc: Current UTC time (defaults to now)
+
+    Returns:
+        Tuple of (can_sell_any, reason)
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    total_shares = state_manager.get_total_shares(ticker)
+    if total_shares <= 0:
+        return False, "No shares held"
+
+    can_sell, allowed_qty, reason = can_sell_with_lots(
+        ticker, total_shares, state_manager, now_utc
+    )
+
+    return can_sell, reason
+
+
 def validate_holding_period_legacy(position: Dict, current_date=None) -> Tuple[bool, str]:
     """
     DEPRECATED: Legacy T+2 trading days validation.
@@ -489,23 +595,40 @@ def can_sell(
     ticker: str,
     position: Dict,
     current_holdings: Dict,
-    trades_used: int
+    trades_used: int,
+    state_manager=None,
+    desired_qty: int = None,
+    now_utc: datetime = None
 ) -> Tuple[bool, Dict[str, Tuple[bool, str]]]:
     """
-    Complete sell validation
+    Complete sell validation with optional lot-based holding period enforcement.
 
     Args:
         ticker: Ticker to sell
         position: Position data
         current_holdings: All current holdings
         trades_used: Trades already used
+        state_manager: Optional StateManager for lot-based validation (new)
+        desired_qty: Optional desired sell quantity (for partial sell support)
+        now_utc: Optional UTC timestamp for testing
 
     Returns:
         Tuple of (all_passed, detailed_results)
     """
     checks = {}
 
-    checks['holding_period'] = validate_holding_period(position)
+    # Use lot-based validation if state_manager is provided
+    if state_manager is not None:
+        total_shares = position.get('shares', 0)
+        sell_qty = desired_qty if desired_qty else total_shares
+        can_sell_lots, allowed_qty, reason = can_sell_with_lots(
+            ticker, sell_qty, state_manager, now_utc
+        )
+        checks['holding_period'] = (can_sell_lots, reason)
+    else:
+        # Legacy validation (fallback)
+        checks['holding_period'] = validate_holding_period(position, now_utc)
+
     checks['min_holdings'] = validate_min_holdings(current_holdings, ticker)
     checks['trade_count'] = validate_trade_count(trades_used, is_new_buy=False)
 

@@ -64,7 +64,21 @@ MIN_HOLD_HOURS = 24
 MIN_HOLD_SECONDS = MIN_HOLD_HOURS * 3600  # 86400 seconds
 
 # Safety buffer so you never accidentally sell at 23:59:59
-HOLD_BUFFER_SECONDS = 120  # 2 minutes
+# Using 5 minutes (300s) for safety margin at 24h boundary
+HOLD_BUFFER_SECONDS = 300  # 5 minutes
+
+# =============================================================================
+# HOLDING PERIOD ENFORCEMENT MODE
+# =============================================================================
+# LOT_FIFO: Each BUY creates a timestamped lot. SELLs consume eligible lots FIFO.
+#           A lot is eligible when: now_utc >= buy_ts_utc + 24h + buffer
+#           This allows selling old shares even after buying new shares.
+#
+# STRICT_TICKER: If ANY buy occurred within 24h, block ALL sells for that ticker.
+#                Safer interpretation if judges are strict about the rule.
+#
+# Set HOLD_MODE to control which enforcement is used.
+HOLD_MODE = "LOT_FIFO"  # Options: "LOT_FIFO" or "STRICT_TICKER"
 
 # Legacy constant - kept for backwards compatibility but not used for compliance
 MIN_HOLD_TRADING_DAYS = 2       # DEPRECATED: Use MIN_HOLD_SECONDS instead

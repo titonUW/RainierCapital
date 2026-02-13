@@ -274,8 +274,9 @@ class ExecutionPipeline:
 
             # STEP 2.5: HARD GUARD - 24-hour minimum hold enforcement for SELLs
             # CRITICAL: This is a last-line-of-defense block to prevent violations
+            # Uses lot-based FIFO or STRICT_TICKER mode depending on config.HOLD_MODE
             if order.side == "SELL":
-                can_sell, hold_reason = self._check_24h_hold(order.ticker)
+                can_sell, allowed_qty, hold_reason = self._check_24h_hold(order.ticker, order.shares)
                 if not can_sell:
                     logger.error(f"SELL BLOCKED by 24h hold rule: {hold_reason}")
                     self.current_state = TradeState.ABORTED
@@ -286,6 +287,23 @@ class ExecutionPipeline:
                         order=order,
                         screenshots=self.screenshots
                     )
+                # Check if we need to reduce the order size (LOT_FIFO partial sell)
+                if allowed_qty < order.shares:
+                    logger.warning(
+                        f"SELL reduced from {order.shares} to {allowed_qty} shares "
+                        f"(lot-based eligibility): {hold_reason}"
+                    )
+                    order.shares = allowed_qty
+                    if order.shares <= 0:
+                        logger.error("No shares eligible for sale after reduction")
+                        self.current_state = TradeState.ABORTED
+                        return TradeResult(
+                            success=False,
+                            state=self.current_state,
+                            message="No eligible shares to sell",
+                            order=order,
+                            screenshots=self.screenshots
+                        )
                 logger.info(f"24h hold check passed: {hold_reason}")
 
             # STEP 3: Navigate to trade page
@@ -343,6 +361,23 @@ class ExecutionPipeline:
                 reason=order.rationale
             )
             self.state_manager.increment_trade_count()
+
+            # Update lots based on trade type
+            from datetime import datetime, timezone
+            now_utc = datetime.now(timezone.utc)
+
+            if order.side == "SELL":
+                # Consume shares from eligible lots FIFO
+                try:
+                    self.state_manager.consume_sell_fifo(order.ticker, order.shares, now_utc)
+                    logger.info(f"Lots updated: consumed {order.shares} shares from {order.ticker}")
+                except ValueError as e:
+                    logger.error(f"Failed to update lots after SELL: {e}")
+                    # Trade already executed, log error but don't fail
+            elif order.side == "BUY":
+                # add_position is called by the caller (daily_routine), which now creates lots
+                # Just log for clarity
+                logger.info(f"BUY executed - caller should call add_position to create lot")
 
             logger.info(f"EXECUTION PIPELINE COMPLETED: {order.side} {order.shares} {order.ticker}")
 
@@ -568,28 +603,45 @@ class ExecutionPipeline:
             price=order.limit_price or 0
         )
 
-    def _check_24h_hold(self, ticker: str) -> tuple:
+    def _check_24h_hold(self, ticker: str, shares: int = None) -> tuple:
         """
-        HARD GUARD: Check 24-hour + buffer holding period before SELL.
+        HARD GUARD: Check 24-hour + buffer holding period before SELL using lot-based validation.
 
         This is a last-line-of-defense check to prevent accidental violations
-        even if upstream logic has bugs. Uses timestamp-based validation.
+        even if upstream logic has bugs. Uses lot-based FIFO or STRICT_TICKER mode
+        depending on config.HOLD_MODE.
 
         Args:
             ticker: Ticker to sell
+            shares: Number of shares to sell (optional, defaults to full position)
 
         Returns:
-            Tuple of (can_sell, reason)
+            Tuple of (can_sell, allowed_qty, reason)
+            - can_sell: True if any sell is allowed
+            - allowed_qty: Number of shares allowed (may be < requested in LOT_FIFO mode)
+            - reason: Human-readable explanation
         """
-        from validators import validate_holding_period
+        from validators import can_sell_with_lots
+        from datetime import datetime, timezone
 
         positions = self.state_manager.get_positions()
         pos = positions.get(ticker)
 
         if not pos:
-            return False, f"No position state found for {ticker}"
+            return False, 0, f"No position state found for {ticker}"
 
-        return validate_holding_period(pos)
+        # Get total shares if not specified
+        if shares is None:
+            shares = self.state_manager.get_total_shares(ticker)
+
+        now_utc = datetime.now(timezone.utc)
+
+        # Use lot-based validation
+        can_sell, allowed_qty, reason = can_sell_with_lots(
+            ticker, shares, self.state_manager, now_utc
+        )
+
+        return can_sell, allowed_qty, reason
 
     def _navigate_to_trade(self, order: TradeOrder) -> bool:
         """Navigate to the equity trade ticket."""
