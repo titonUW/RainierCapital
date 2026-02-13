@@ -45,7 +45,9 @@ stocktrak_bot/.pw_profile/
 
 # State files (contains position data)
 bot_state.json
+bot_state_backup.json
 stocktrak_bot/bot_state.json
+stocktrak_bot/bot_state_backup.json
 
 # Credentials - DO NOT COMMIT
 # Note: config.py contains credentials but is needed for the bot
