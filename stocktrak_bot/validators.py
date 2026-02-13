@@ -2,26 +2,61 @@
 Pre-Trade Validation for StockTrak Bot
 Ensures all competition rules are followed before executing trades.
 
-UPDATED (Perfection Patch):
+UPDATED (24-Hour Hold Patch):
+- Timestamp-based 24-hour holding period enforcement (not date-based)
 - Structural 1/N diversification: exactly 1 satellite per bucket
 - 8 buckets × 5% = 40% satellite allocation
-- No position exceeds 25% at buy (max is 20% core, 5% satellite)
+- No position exceeds 25% at buy (max is 25% core, 5% satellite)
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, List
 
 from config import (
     PROHIBITED_TICKERS, PROHIBITED_SUFFIXES, SAFETY_BUFFER_PRICE,
     MIN_PRICE_AT_BUY, MAX_SINGLE_POSITION_PCT, MIN_HOLDINGS,
-    MAX_TRADES_TOTAL, HARD_STOP_TRADES, MIN_HOLD_TRADING_DAYS,
+    MAX_TRADES_TOTAL, HARD_STOP_TRADES, MIN_HOLD_SECONDS, HOLD_BUFFER_SECONDS,
     CORE_POSITIONS, SATELLITE_BUCKETS, MAX_PER_BUCKET, MIN_BUCKETS,
     EVENT_FREEZE_DATES, REGIME_PARAMS, get_bucket_for_ticker
 )
 from utils import is_trading_day, get_trading_days_between
 
 logger = logging.getLogger('stocktrak_bot.validators')
+
+
+def _parse_timestamp_utc(ts: str) -> Optional[datetime]:
+    """
+    Parse a timestamp string to UTC datetime.
+
+    Handles:
+    - ISO format with timezone
+    - ISO format with Z suffix
+    - Naive timestamps (assumed local, converted to UTC)
+
+    Args:
+        ts: Timestamp string
+
+    Returns:
+        datetime in UTC or None if unparseable
+    """
+    if not ts:
+        return None
+
+    # Handle trailing Z (e.g., 2026-01-20T14:30:00Z)
+    ts = ts.replace("Z", "+00:00")
+
+    try:
+        dt = datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+    # If naive, assume local system timezone (safe for historical logs)
+    if dt.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo
+        dt = dt.replace(tzinfo=local_tz)
+
+    return dt.astimezone(timezone.utc)
 
 
 def is_prohibited(ticker: str) -> bool:
@@ -178,9 +213,58 @@ def validate_trade_count(trades_used: int, is_new_buy: bool = True) -> Tuple[boo
     return True, f"Trades OK ({trades_used} used, {remaining} remaining)"
 
 
-def validate_holding_period(position: Dict, current_date=None) -> Tuple[bool, str]:
+def validate_holding_period(position: Dict, now_utc: datetime = None) -> Tuple[bool, str]:
     """
-    Validate T+2 holding period has passed
+    Validate 24-hour + buffer holding period has passed (timestamp-based).
+
+    CRITICAL: This is the competition's actual rule - 24 hours minimum hold.
+    Uses actual timestamps, not trading days.
+
+    Args:
+        position: Position dict with 'last_buy_timestamp' or 'entry_timestamp'
+        now_utc: Current UTC time (defaults to now, for testing)
+
+    Returns:
+        Tuple of (can_sell, reason)
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    # Get the most recent buy timestamp (critical for 24h enforcement)
+    ts_str = position.get('last_buy_timestamp') or position.get('entry_timestamp')
+
+    if not ts_str:
+        # Fail-closed for compliance: if no timestamp, don't allow sell
+        return False, "No buy timestamp recorded (fail-closed for compliance)"
+
+    buy_ts = _parse_timestamp_utc(ts_str)
+    if not buy_ts:
+        return False, f"Unparseable buy timestamp: {ts_str}"
+
+    # Calculate elapsed time
+    elapsed = (now_utc - buy_ts).total_seconds()
+    required = MIN_HOLD_SECONDS + HOLD_BUFFER_SECONDS
+
+    if elapsed < required:
+        remaining_seconds = required - elapsed
+        remaining_minutes = remaining_seconds / 60
+        remaining_hours = remaining_seconds / 3600
+
+        if remaining_hours >= 1:
+            return False, f"24h hold not met: {remaining_hours:.1f} hours remaining"
+        else:
+            return False, f"24h hold not met: {remaining_minutes:.1f} minutes remaining"
+
+    hours_held = elapsed / 3600
+    return True, f"24h hold met: {hours_held:.2f} hours since last buy"
+
+
+def validate_holding_period_legacy(position: Dict, current_date=None) -> Tuple[bool, str]:
+    """
+    DEPRECATED: Legacy T+2 trading days validation.
+
+    This function is kept for backwards compatibility but should NOT be used
+    for compliance. Use validate_holding_period() instead.
 
     Args:
         position: Position dict with 'entry_date'
@@ -204,8 +288,8 @@ def validate_holding_period(position: Dict, current_date=None) -> Tuple[bool, st
     # Count trading days since entry
     trading_days = get_trading_days_between(entry_date, current_date)
 
-    if trading_days < MIN_HOLD_TRADING_DAYS:
-        return False, f"Holding period not met: {trading_days}/{MIN_HOLD_TRADING_DAYS} trading days"
+    if trading_days < 2:  # T+2
+        return False, f"Holding period not met: {trading_days}/2 trading days"
 
     return True, f"Holding period met ({trading_days} trading days)"
 

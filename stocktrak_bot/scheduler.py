@@ -2,13 +2,15 @@
 Task Scheduler for StockTrak Bot
 
 Handles scheduling of:
-- Daily data collection (9:00 AM ET)
-- Daily execution (9:30 AM ET - morning hours)
+- Daily data collection (pre-market)
+- Daily execution (morning hours, configurable via EXECUTION_TIME)
 - Weekly counter reset (Fridays 4:15 PM ET)
 - Hourly health checks
 
 CRITICAL: The schedule library uses LOCAL machine time, not timezone-aware times.
 This module converts ET times to local machine time for correct scheduling.
+
+IMPORTANT: All times are now configurable via config.py for consistency.
 """
 
 import logging
@@ -20,10 +22,25 @@ import pytz
 from daily_routine import execute_daily_routine, health_check
 from state_manager import StateManager
 from utils import is_trading_day, is_market_hours
+from config import EXECUTION_TIME, DATA_COLLECTION_TIME, EXECUTION_WINDOW_START, EXECUTION_WINDOW_END
 
 logger = logging.getLogger('stocktrak_bot.scheduler')
 
 ET = pytz.timezone('US/Eastern')
+
+
+def _parse_time_string(time_str: str) -> tuple:
+    """
+    Parse a time string in HH:MM format to (hour, minute) tuple.
+
+    Args:
+        time_str: Time string like "09:45" or "15:30"
+
+    Returns:
+        Tuple of (hour, minute) as integers
+    """
+    parts = time_str.split(":")
+    return int(parts[0]), int(parts[1])
 
 
 def et_to_local_time(et_hour: int, et_minute: int) -> str:
@@ -61,27 +78,32 @@ def run_scheduler():
     Main scheduling loop.
 
     Schedules:
-    - 9:00 AM ET: Prepare for execution (weekdays)
-    - 9:30 AM ET: Execute daily routine (weekdays) - morning hours
+    - DATA_COLLECTION_TIME ET: Prepare for execution (weekdays)
+    - EXECUTION_TIME ET: Execute daily routine (weekdays) - morning hours
     - 4:15 PM ET Friday: Weekly reset
     - Every hour: Health check
 
     IMPORTANT: All times are converted from ET to local machine time.
+    Times are configurable via config.py for consistency across modules.
     """
     logger.info("=" * 60)
     logger.info("STOCKTRAK BOT SCHEDULER STARTING")
     logger.info(f"Current time (ET): {datetime.now(ET)}")
     logger.info(f"Current time (Local): {datetime.now()}")
+    logger.info(f"Configured execution time: {EXECUTION_TIME} ET")
+    logger.info(f"Configured execution window: {EXECUTION_WINDOW_START} - {EXECUTION_WINDOW_END} ET")
     logger.info("=" * 60)
 
     # Clear any existing jobs
     schedule.clear()
 
-    # Convert 9:30 AM ET to local time
-    execution_time = et_to_local_time(9, 30)
-    logger.info(f"Execution time: 9:30 AM ET = {execution_time} local")
+    # Parse and convert EXECUTION_TIME from config to local time
+    et_hour, et_minute = _parse_time_string(EXECUTION_TIME)
+    execution_time = et_to_local_time(et_hour, et_minute)
+    logger.info(f"Execution time: {EXECUTION_TIME} ET = {execution_time} local")
 
-    # Daily execution at 9:30 AM ET (market days) - morning hours
+    # Daily execution at EXECUTION_TIME ET (market days) - morning hours
+    # Time is configurable via config.py EXECUTION_TIME
     schedule.every().monday.at(execution_time).do(safe_execute)
     schedule.every().tuesday.at(execution_time).do(safe_execute)
     schedule.every().wednesday.at(execution_time).do(safe_execute)
@@ -129,14 +151,25 @@ def _get_check_interval() -> int:
     Get adaptive check interval based on time of day.
 
     Returns shorter interval during critical execution window.
+    Window is configured via EXECUTION_WINDOW_START and EXECUTION_WINDOW_END.
     """
     now = datetime.now(ET)
     hour = now.hour
     minute = now.minute
+    current_time_str = f"{hour:02d}:{minute:02d}"
 
-    # Critical window: 9:20 AM - 9:50 AM ET (execution + buffer)
-    if hour == 9 and 20 <= minute <= 50:
-        return 5  # Check every 5 seconds
+    # Critical window: EXECUTION_WINDOW with buffer
+    # Parse window times
+    start_h, start_m = _parse_time_string(EXECUTION_WINDOW_START)
+    end_h, end_m = _parse_time_string(EXECUTION_WINDOW_END)
+
+    # Add 10-minute buffer on each side
+    buffer_start = start_h * 60 + start_m - 10
+    buffer_end = end_h * 60 + end_m + 10
+    current_minutes = hour * 60 + minute
+
+    if buffer_start <= current_minutes <= buffer_end:
+        return 5  # Check every 5 seconds during execution window
 
     # Market hours: 9:30 AM - 4:00 PM ET
     if 9 <= hour < 16:

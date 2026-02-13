@@ -272,6 +272,22 @@ class ExecutionPipeline:
                     screenshots=self.screenshots
                 )
 
+            # STEP 2.5: HARD GUARD - 24-hour minimum hold enforcement for SELLs
+            # CRITICAL: This is a last-line-of-defense block to prevent violations
+            if order.side == "SELL":
+                can_sell, hold_reason = self._check_24h_hold(order.ticker)
+                if not can_sell:
+                    logger.error(f"SELL BLOCKED by 24h hold rule: {hold_reason}")
+                    self.current_state = TradeState.ABORTED
+                    return TradeResult(
+                        success=False,
+                        state=self.current_state,
+                        message=f"SELL blocked by 24h hold rule: {hold_reason}",
+                        order=order,
+                        screenshots=self.screenshots
+                    )
+                logger.info(f"24h hold check passed: {hold_reason}")
+
             # STEP 3: Navigate to trade page
             self._run_step("navigate_trade", lambda: self._navigate_to_trade(order), order)
             self.current_state = TradeState.ON_TRADE_PAGE
@@ -551,6 +567,29 @@ class ExecutionPipeline:
             shares=order.shares,
             price=order.limit_price or 0
         )
+
+    def _check_24h_hold(self, ticker: str) -> tuple:
+        """
+        HARD GUARD: Check 24-hour + buffer holding period before SELL.
+
+        This is a last-line-of-defense check to prevent accidental violations
+        even if upstream logic has bugs. Uses timestamp-based validation.
+
+        Args:
+            ticker: Ticker to sell
+
+        Returns:
+            Tuple of (can_sell, reason)
+        """
+        from validators import validate_holding_period
+
+        positions = self.state_manager.get_positions()
+        pos = positions.get(ticker)
+
+        if not pos:
+            return False, f"No position state found for {ticker}"
+
+        return validate_holding_period(pos)
 
     def _navigate_to_trade(self, order: TradeOrder) -> bool:
         """Navigate to the equity trade ticket."""
@@ -1565,6 +1604,203 @@ class ExecutionPipeline:
             )
         except Exception as e:
             logger.debug(f"Dashboard update failed (non-critical): {e}")
+
+
+# =============================================================================
+# TRADE TICKET HEALTH CHECK (PREFLIGHT)
+# =============================================================================
+def run_trade_ticket_health_check(bot, test_ticker: str = "VOO") -> Tuple[bool, str]:
+    """
+    Pre-flight check to verify the trade ticket is functional.
+
+    This function navigates to a trade page and verifies all the critical
+    form elements are accessible WITHOUT actually submitting the trade.
+
+    Run this before live trading to catch:
+    - Session expiration
+    - UI changes that break automation
+    - Popup/overlay issues
+    - Missing form elements
+
+    Args:
+        bot: StockTrakBot instance (must have page attribute)
+        test_ticker: A known safe ticker to test with (default: VOO)
+
+    Returns:
+        Tuple of (success: bool, details: str)
+    """
+    from stocktrak_bot import dismiss_stocktrak_overlays, ensure_clean_ui
+
+    checks_passed = []
+    checks_failed = []
+
+    logger.info("=" * 60)
+    logger.info(f"TRADE TICKET HEALTH CHECK: Testing with {test_ticker}")
+    logger.info("=" * 60)
+
+    try:
+        page = bot.page
+        state_manager = StateManager()
+
+        # Step 1: Verify logged in
+        logger.info("[PREFLIGHT] Step 1: Checking login status...")
+        try:
+            url = page.url.lower()
+            if '/login' in url:
+                logger.info("[PREFLIGHT] On login page - attempting login...")
+                if not bot.login():
+                    checks_failed.append("Login failed")
+                    return False, "Login failed during preflight"
+                checks_passed.append("Login successful")
+            else:
+                # Check for logout link
+                logout = page.get_by_role("link", name=re.compile("logout", re.I))
+                if logout.count() > 0:
+                    checks_passed.append("Already logged in")
+                else:
+                    # Try to find authenticated indicators
+                    if page.locator("text=PORTFOLIO VALUE").first.is_visible(timeout=3000):
+                        checks_passed.append("Already logged in (via portfolio value)")
+                    else:
+                        checks_failed.append("Login status unclear")
+        except Exception as e:
+            logger.warning(f"[PREFLIGHT] Login check error: {e}")
+            checks_failed.append(f"Login check error: {str(e)[:50]}")
+
+        # Step 2: Navigate to trade page
+        logger.info(f"[PREFLIGHT] Step 2: Navigating to trade page for {test_ticker}...")
+        try:
+            trade_url = f"{STOCKTRAK_TRADING_EQUITIES_URL}?securitysymbol={test_ticker}&exchange=US"
+            page.goto(trade_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            time.sleep(2)
+
+            # Clear popups
+            ensure_clean_ui(page, timeout_ms=5000)
+
+            # Verify we're on trade page
+            if "trading" in page.url.lower():
+                checks_passed.append("Trade page navigation successful")
+            else:
+                checks_failed.append(f"Unexpected URL: {page.url}")
+        except Exception as e:
+            checks_failed.append(f"Navigation failed: {str(e)[:50]}")
+            return False, f"Could not navigate to trade page: {e}"
+
+        # Step 3: Find Buy button
+        logger.info("[PREFLIGHT] Step 3: Looking for BUY button...")
+        try:
+            buy_found = False
+            buy_selectors = [
+                lambda: page.get_by_role("button", name=re.compile("^Buy$", re.I)).first,
+                lambda: page.locator("button:has-text('Buy')").first,
+                lambda: page.get_by_text("Buy", exact=True).first,
+            ]
+            for sel in buy_selectors:
+                try:
+                    if sel().is_visible(timeout=2000):
+                        buy_found = True
+                        break
+                except:
+                    pass
+
+            if buy_found:
+                checks_passed.append("BUY button found")
+            else:
+                checks_failed.append("BUY button not found")
+        except Exception as e:
+            checks_failed.append(f"BUY button search error: {str(e)[:50]}")
+
+        # Step 4: Find Shares input
+        logger.info("[PREFLIGHT] Step 4: Looking for SHARES input...")
+        try:
+            shares_found = False
+            shares_selectors = [
+                lambda: page.locator("text=SHARES").locator("..").locator("input").first,
+                lambda: page.locator('input[name="shares"]').first,
+                lambda: page.locator('input[type="number"]').first,
+            ]
+            for sel in shares_selectors:
+                try:
+                    if sel().is_visible(timeout=2000):
+                        shares_found = True
+                        break
+                except:
+                    pass
+
+            if shares_found:
+                checks_passed.append("SHARES input found")
+            else:
+                checks_failed.append("SHARES input not found")
+        except Exception as e:
+            checks_failed.append(f"SHARES input search error: {str(e)[:50]}")
+
+        # Step 5: Find Review Order button
+        logger.info("[PREFLIGHT] Step 5: Looking for REVIEW ORDER button...")
+        try:
+            review_found = False
+            js_check = """
+            (function() {
+                const buttons = document.querySelectorAll('button, a, [role="button"]');
+                const patterns = ['review order', 'preview order', 'review', 'preview'];
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').toLowerCase().trim();
+                    if (patterns.some(p => text.includes(p))) {
+                        const rect = btn.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return {found: true, text: text};
+                        }
+                    }
+                }
+                return {found: false};
+            })();
+            """
+            result = page.evaluate(js_check)
+            if result.get('found'):
+                checks_passed.append(f"REVIEW ORDER button found: '{result.get('text')}'")
+                review_found = True
+            else:
+                checks_failed.append("REVIEW ORDER button not found")
+        except Exception as e:
+            checks_failed.append(f"REVIEW ORDER search error: {str(e)[:50]}")
+
+        # Step 6: Take screenshot for reference
+        logger.info("[PREFLIGHT] Step 6: Taking verification screenshot...")
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            screenshot_path = f"logs/preflight_check_{timestamp}.png"
+            page.screenshot(path=screenshot_path, full_page=True)
+            checks_passed.append(f"Screenshot saved: {screenshot_path}")
+        except Exception as e:
+            logger.warning(f"Screenshot failed: {e}")
+
+        # Step 7: Navigate back to dashboard (cleanup)
+        logger.info("[PREFLIGHT] Step 7: Returning to dashboard...")
+        try:
+            page.goto(STOCKTRAK_DASHBOARD_URL, wait_until="domcontentloaded", timeout=30000)
+            ensure_clean_ui(page, timeout_ms=3000)
+            checks_passed.append("Dashboard return successful")
+        except Exception as e:
+            logger.warning(f"Dashboard return failed: {e}")
+
+        # Summary
+        logger.info("=" * 60)
+        logger.info("PREFLIGHT CHECK SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"PASSED: {len(checks_passed)}")
+        for check in checks_passed:
+            logger.info(f"  ✓ {check}")
+        logger.info(f"FAILED: {len(checks_failed)}")
+        for check in checks_failed:
+            logger.error(f"  ✗ {check}")
+
+        if checks_failed:
+            return False, f"Preflight failed: {'; '.join(checks_failed)}"
+        else:
+            return True, f"Preflight passed: All {len(checks_passed)} checks OK"
+
+    except Exception as e:
+        logger.error(f"PREFLIGHT EXCEPTION: {e}")
+        return False, f"Preflight exception: {e}"
 
 
 # =============================================================================

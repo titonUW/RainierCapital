@@ -132,6 +132,9 @@ class MarketDataCollector:
 
         Returns:
             Dict with price, SMAs, returns, volatility, etc.
+
+        UPDATED: Now calculates actual r1, r3, r10 returns and vol10 for accurate
+        SPRINT3 scoring (replaces approximations with real values).
         """
         try:
             stock = yf.Ticker(ticker)
@@ -143,7 +146,8 @@ class MarketDataCollector:
 
             current_price = hist['Close'].iloc[-1]
 
-            # Calculate SMAs
+            # Calculate SMAs (actual, not approximations)
+            sma20 = hist['Close'].tail(20).mean() if len(hist) >= 20 else None
             sma50 = hist['Close'].tail(50).mean()
             sma100 = hist['Close'].tail(100).mean() if len(hist) >= 100 else None
             sma200 = hist['Close'].tail(200).mean() if len(hist) >= 200 else sma100
@@ -153,12 +157,22 @@ class MarketDataCollector:
             highs_7d = hist['High'].tail(7).tolist()
             lows_7d = hist['Low'].tail(7).tolist()
 
-            # Calculate returns
+            # Calculate actual returns for SPRINT3 scoring (not approximations!)
+            # r1 = 1-day return
+            # r3 = 3-day return
+            # r10 = 10-day return
+            return_1d = self._calc_return(hist, 1)
+            return_3d = self._calc_return(hist, 3)
+            return_10d = self._calc_return(hist, 10)
             return_21d = self._calc_return(hist, 21)
             return_63d = self._calc_return(hist, 63)
 
-            # Calculate volatility (standard deviation of daily returns)
-            volatility_21d = hist['Close'].tail(21).pct_change().std()
+            # Calculate actual volatility
+            # vol10 = 10-day volatility (standard deviation of daily returns)
+            # volatility_21d = 21-day volatility
+            daily_returns_10d = hist['Close'].tail(11).pct_change().dropna()
+            vol10 = daily_returns_10d.std() if len(daily_returns_10d) >= 10 else None
+            volatility_21d = hist['Close'].tail(22).pct_change().dropna().std()
 
             # Volume
             volume = hist['Volume'].iloc[-1]
@@ -167,15 +181,25 @@ class MarketDataCollector:
             return {
                 'ticker': ticker,
                 'price': current_price,
+                # SMAs (actual values)
+                'sma20': sma20,  # NEW: Actual SMA20 for trend filter
                 'sma50': sma50,
                 'sma100': sma100,
                 'sma200': sma200,
+                # Recent closes
                 'closes_7d': closes_7d,
                 'highs_7d': highs_7d,
                 'lows_7d': lows_7d,
+                # Returns (actual, not approximations)
+                'return_1d': return_1d,   # NEW: 1-day return
+                'return_3d': return_3d,   # NEW: 3-day return (replaces r21*3/21 approximation)
+                'return_10d': return_10d, # NEW: 10-day return (replaces r21*10/21 approximation)
                 'return_21d': return_21d,
                 'return_63d': return_63d,
+                # Volatility (actual, not approximations)
+                'vol10': vol10,           # NEW: 10-day volatility for SPRINT3 scoring
                 'volatility_21d': volatility_21d,
+                # Volume
                 'volume': volume,
                 'avg_volume_20d': avg_volume_20d,
                 'last_updated': datetime.now().isoformat(),

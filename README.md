@@ -24,7 +24,7 @@ playwright install chromium
 # 4. Test the bot (verify login works)
 python main.py --test
 
-# 5. On January 20 at 3:50 PM ET - Build initial portfolio
+# 5. On January 20 at 9:45 AM ET - Build initial portfolio
 python main.py --day1
 
 # 6. Start continuous operation
@@ -49,16 +49,16 @@ python main.py
 ## Competition Rules (Hard Constraints)
 
 - **Max 80 trades total** for the entire competition
-- **Max 25% per position** at time of purchase
+- **Max 25% per position** at time of purchase (CRITICAL: No position may exceed 25% at buy time)
 - **Min 4 holdings** at all times
 - **No stocks below $5**
-- **T+2 holding period** (can't sell until 2 trading days after purchase)
+- **24-hour minimum holding period** (cannot sell until 24h after buy)
 - **No leveraged/inverse/crypto ETFs**
 
 ## Strategy
 
 ### Portfolio Structure (60/40)
-- **Core (60%)**: VOO (35%), VTI (15%), VEA (10%)
+- **Core (60%)**: VOO (25%), VTI (20%), VEA (15%)
 - **Satellites (40%)**: 8 positions at ~5% each from thematic buckets
 
 ### Thematic Buckets
@@ -153,9 +153,10 @@ SPRINT3 is a high-intensity 3-day trading mode designed for end-of-competition c
 | Day 2 | Rotate ALL 16 satellites | 32 trades |
 | Day 3 | Rotate remaining budget | Up to 14 trades |
 
-**CRITICAL: Execute only in the 3:55-4:00 PM ET window!**
+**CRITICAL: Execute only in the 9:40-10:05 AM ET window!**
 
-If you trade outside this window and positions fill at next market open, you will violate the 24-hour hold rule when you try to sell the next day.
+Trading in a consistent morning window (09:40-10:05 AM ET) provides stable execution.
+The bot enforces 24-hour + buffer holding period using actual timestamps.
 
 ### SPRINT3 Scoring Algorithm
 
@@ -184,7 +185,7 @@ python main.py --sprint3-status
 # 2. Dry run to see planned trades
 python main.py --sprint3-dry-run
 
-# 3. At 3:55 PM ET, execute
+# 3. At 9:45 AM ET, execute
 python main.py --sprint3
 
 # 4. Type "SPRINT1" to confirm
@@ -192,7 +193,7 @@ python main.py --sprint3
 
 **Day 2 (Full Rotation):**
 ```bash
-# At 3:55 PM ET (24h+ after Day 1)
+# At 9:45 AM ET (24h+ after Day 1)
 python main.py --sprint3
 
 # Type "SPRINT2" to confirm
@@ -200,7 +201,7 @@ python main.py --sprint3
 
 **Day 3 (Final Rotation):**
 ```bash
-# At 3:55 PM ET (24h+ after Day 2)
+# At 9:45 AM ET (24h+ after Day 2)
 python main.py --sprint3
 
 # Type "SPRINT3" to confirm
@@ -210,7 +211,7 @@ python main.py --sprint3
 
 Before executing any sprint day:
 1. Verify market is OPEN (check for "market closed" banner)
-2. Verify you're in the 3:55-4:00 PM ET window
+2. Verify you're in the 9:40-10:05 AM ET window
 3. Run `--sprint3-dry-run` to review planned trades
 4. Confirm trade count is under budget
 

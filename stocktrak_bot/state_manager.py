@@ -14,7 +14,7 @@ import json
 import os
 import logging
 import threading
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 import shutil
@@ -67,6 +67,8 @@ class StateManager:
     def __init__(self, state_file: str = STATE_FILE):
         self.state_file = state_file
         self.state = self._load_state()
+        # Migrate positions to include timestamps (one-time migration)
+        self._migrate_position_timestamps()
 
     def _load_state(self) -> Dict:
         """Load state from disk or initialize fresh state.
@@ -146,6 +148,86 @@ class StateManager:
             },
         }
 
+    def _parse_timestamp_utc(self, ts: str) -> Optional[datetime]:
+        """
+        Parse a timestamp string to UTC datetime.
+
+        Handles:
+        - ISO format with timezone
+        - ISO format with Z suffix
+        - Naive timestamps (assumed local, converted to UTC)
+
+        Args:
+            ts: Timestamp string
+
+        Returns:
+            datetime in UTC or None if unparseable
+        """
+        if not ts:
+            return None
+
+        # Handle trailing Z (e.g., 2026-01-20T14:30:00Z)
+        ts = ts.replace("Z", "+00:00")
+
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            return None
+
+        # If naive, assume local system timezone (safe for historical logs)
+        if dt.tzinfo is None:
+            local_tz = datetime.now().astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
+
+        return dt.astimezone(timezone.utc)
+
+    def _migrate_position_timestamps(self):
+        """
+        Migrate existing positions to include timestamp-based holding period fields.
+
+        This one-time migration:
+        1. Looks for positions missing last_buy_timestamp
+        2. Tries to find the timestamp from trade_log
+        3. Falls back to current time (fail-safe: won't violate 24h)
+
+        Called automatically in __init__.
+        """
+        changed = False
+        trade_log = self.state.get('trade_log', [])
+
+        # Build lookup of last BUY timestamp per ticker from trade_log
+        last_buy_by_ticker = {}
+        for tr in reversed(trade_log):
+            if tr.get('action') == 'BUY' and tr.get('ticker'):
+                if tr['ticker'] not in last_buy_by_ticker:
+                    last_buy_by_ticker[tr['ticker']] = tr.get('timestamp')
+
+        positions = self.state.get('positions', {})
+        for ticker, pos in positions.items():
+            # Migrate last_buy_timestamp if missing
+            if 'last_buy_timestamp' not in pos or not pos.get('last_buy_timestamp'):
+                ts = last_buy_by_ticker.get(ticker)
+                if ts:
+                    pos['last_buy_timestamp'] = ts
+                    logger.info(f"Migrated {ticker}: last_buy_timestamp from trade_log")
+                else:
+                    # Fail-safe: if we truly don't know, set to NOW so we DON'T violate 24h
+                    # This means position won't be sellable for 24h, which is safe
+                    pos['last_buy_timestamp'] = datetime.now(timezone.utc).isoformat()
+                    pos['last_buy_timestamp_inferred'] = True
+                    logger.warning(f"Migrated {ticker}: last_buy_timestamp inferred (set to now for safety)")
+                changed = True
+
+            # Migrate entry_timestamp if missing
+            if 'entry_timestamp' not in pos or not pos.get('entry_timestamp'):
+                # Use last_buy_timestamp as fallback (safe)
+                pos['entry_timestamp'] = pos.get('last_buy_timestamp')
+                changed = True
+
+        if changed:
+            self.save()
+            logger.info("Position timestamp migration complete")
+
     def save(self):
         """Save current state to disk with backup.
 
@@ -214,7 +296,13 @@ class StateManager:
 
     def add_position(self, ticker: str, shares: int, price: float,
                      entry_date: str = None, bucket: str = None):
-        """Add or update a position"""
+        """
+        Add or update a position with timestamp tracking.
+
+        CRITICAL: Stores both entry_timestamp (first buy) and last_buy_timestamp
+        (most recent buy) for proper 24-hour holding period enforcement.
+        """
+        now_utc = datetime.now(timezone.utc).isoformat()
         if entry_date is None:
             entry_date = datetime.now().date().isoformat()
 
@@ -229,7 +317,10 @@ class StateManager:
             self.state['positions'][ticker] = {
                 'shares': new_total_shares,
                 'entry_price': new_avg_cost,
-                'entry_date': existing['entry_date'],  # Keep original date
+                'entry_date': existing.get('entry_date', entry_date),  # Keep original date
+                'entry_timestamp': existing.get('entry_timestamp', now_utc),  # Keep original timestamp
+                # CRITICAL: Update last_buy_timestamp on EVERY buy for 24h enforcement
+                'last_buy_timestamp': now_utc,
                 'bucket': bucket or existing.get('bucket'),
             }
         else:
@@ -238,11 +329,13 @@ class StateManager:
                 'shares': shares,
                 'entry_price': price,
                 'entry_date': entry_date,
+                'entry_timestamp': now_utc,  # First buy timestamp
+                'last_buy_timestamp': now_utc,  # Same as entry for new position
                 'bucket': bucket,
             }
 
         self.save()
-        logger.info(f"Position added/updated: {ticker}")
+        logger.info(f"Position added/updated: {ticker} (last_buy_timestamp: {now_utc})")
 
     def remove_position(self, ticker: str):
         """Remove a position (after selling)"""
@@ -262,9 +355,9 @@ class StateManager:
 
     def log_trade(self, ticker: str, action: str, shares: int,
                   price: float, reason: str = ''):
-        """Log a completed trade"""
+        """Log a completed trade with UTC timestamp for compliance."""
         trade = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),  # UTC for consistency
             'ticker': ticker,
             'action': action,
             'shares': shares,
