@@ -41,6 +41,10 @@ python main.py
 | `python main.py --manual` | Run daily routine manually |
 | `python main.py --status` | Show current bot status |
 | `python main.py --scores` | Show satellite scoring report |
+| `python main.py --sprint3` | Execute SPRINT3 mode (high-intensity catch-up) |
+| `python main.py --sprint3-status` | Show SPRINT3 status |
+| `python main.py --sprint3-dry-run` | Plan SPRINT3 trades without executing |
+| `python main.py --sprint3-reset` | Reset SPRINT3 state |
 
 ## Competition Rules (Hard Constraints)
 
@@ -120,6 +124,111 @@ stocktrak_bot/
 - Screenshot capture on every trade attempt
 - Comprehensive logging
 - Sync with StockTrak data at each execution
+
+---
+
+## SPRINT3 Mode - End-of-Competition Catch-Up Strategy
+
+SPRINT3 is a high-intensity 3-day trading mode designed for end-of-competition catch-up scenarios. It uses up to 65 trades to aggressively rotate a momentum-based satellite portfolio.
+
+### SPRINT3 Strategy
+
+**Portfolio Structure:**
+- **Core (60%)**: VOO 25%, VTI 20%, VEA 15% - stable, low turnover
+- **Satellites (40%)**: 16 positions at 2.5% each - rotated daily for momentum capture
+
+**Key Constraints (enforced):**
+- Max 65 trades in sprint (leaves 5 trade buffer)
+- 24-hour minimum hold period (enforced with 2-minute buffer)
+- Market hours only (9:30 AM - 4:00 PM ET)
+- BUY price >= $5 (use $6 safety buffer)
+- Max 25% per position
+- Min 4 holdings at all times
+
+### SPRINT3 Execution Plan
+
+| Day | Action | Trades |
+|-----|--------|--------|
+| Day 1 | Build core + 16 satellites | ~19 trades |
+| Day 2 | Rotate ALL 16 satellites | 32 trades |
+| Day 3 | Rotate remaining budget | Up to 14 trades |
+
+**CRITICAL: Execute only in the 3:55-4:00 PM ET window!**
+
+If you trade outside this window and positions fill at next market open, you will violate the 24-hour hold rule when you try to sell the next day.
+
+### SPRINT3 Scoring Algorithm
+
+For each satellite candidate, we compute:
+
+```
+ForecastScore = 0.55 * rr3 + 0.35 * rr10 - 0.25 * vol10
+
+Where:
+- rr3 = 3-day return relative to VOO
+- rr10 = 10-day return relative to VOO
+- vol10 = 10-day volatility (standard deviation)
+```
+
+**Trend Filter**: Only buy if Close > SMA20 AND SMA20 > SMA50
+
+**Universe**: SMH, SOXX, XLK, NVDA, AMD, AVGO, ASML, AMAT, LRCX, KLAC, PPA, ITA, XAR, LMT, NOC, RTX, GD, KTOS, AVAV, XLE, XOP, XOM, CVX, COPX, XME, PICK, FCX, SCCO, URA, URNM, NLR, CCJ, XBI, IDNA, CRSP, NTLA, BEAM, UFO, ROKT, RKLB, ASTS, LUNR, RDW
+
+### SPRINT3 Runbook
+
+**Day 1 (Build):**
+```bash
+# 1. Check status first
+python main.py --sprint3-status
+
+# 2. Dry run to see planned trades
+python main.py --sprint3-dry-run
+
+# 3. At 3:55 PM ET, execute
+python main.py --sprint3
+
+# 4. Type "SPRINT1" to confirm
+```
+
+**Day 2 (Full Rotation):**
+```bash
+# At 3:55 PM ET (24h+ after Day 1)
+python main.py --sprint3
+
+# Type "SPRINT2" to confirm
+```
+
+**Day 3 (Final Rotation):**
+```bash
+# At 3:55 PM ET (24h+ after Day 2)
+python main.py --sprint3
+
+# Type "SPRINT3" to confirm
+```
+
+### SPRINT3 Safety Checks
+
+Before executing any sprint day:
+1. Verify market is OPEN (check for "market closed" banner)
+2. Verify you're in the 3:55-4:00 PM ET window
+3. Run `--sprint3-dry-run` to review planned trades
+4. Confirm trade count is under budget
+
+If something goes wrong:
+- Use `--sprint3-reset` to reset sprint state
+- Trades already made will NOT be reversed
+- State file is backed up before each save
+
+### SPRINT3 Files
+
+```
+stocktrak_bot/
+├── sprint3_strategy.py  # Sprint3 algorithm and execution
+├── state/
+│   └── bot_state.json   # Includes sprint3 state
+└── logs/
+    └── sprint3_*.png    # Sprint execution screenshots
+```
 
 ---
 

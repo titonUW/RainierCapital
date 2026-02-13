@@ -344,6 +344,207 @@ def preflight_mode():
         bot.close()
 
 
+def sprint3_mode(dry_run: bool = False, force_day: int = None):
+    """
+    Execute SPRINT3 trading mode.
+
+    Sprint3 is a high-intensity 3-day trading strategy for end-of-competition catch-up:
+    - Day 1: Build core positions (60%) + 16 satellite positions (40%)
+    - Day 2: Rotate all 16 satellites
+    - Day 3: Rotate remaining budget trades
+
+    Args:
+        dry_run: If True, print planned trades without executing
+        force_day: Force a specific sprint day (1, 2, or 3)
+    """
+    from sprint3_strategy import (
+        Sprint3Executor, plan_sprint3, print_sprint3_plan, print_sprint3_scoring_report,
+        is_market_open, is_in_execution_window, SPRINT3_SATELLITE_UNIVERSE, SPRINT3_CORE
+    )
+    from market_data import MarketDataCollector
+    from stocktrak_bot import StockTrakBot
+    from state_manager import StateManager
+
+    logger = logging.getLogger('stocktrak_bot')
+
+    print("\n" + "!" * 70)
+    print("SPRINT3 MODE - High Intensity End-of-Competition Trading")
+    print("!" * 70)
+
+    state = StateManager()
+
+    # Check market status
+    market_open, market_reason = is_market_open()
+    in_window, window_reason = is_in_execution_window()
+
+    print(f"\nMarket: {market_reason}")
+    print(f"Execution Window: {window_reason}")
+
+    if not market_open and not dry_run:
+        print("\nERROR: Market is closed. Sprint3 must be run during market hours (3:55-4:00 PM ET).")
+        print("Use --sprint3-dry-run to test without executing trades.")
+        return
+
+    if not in_window and not dry_run:
+        print("\nWARNING: Outside optimal execution window (3:55-4:00 PM ET).")
+        print("Trading outside this window may cause 24h hold violations.")
+        confirm = input("Continue anyway? (yes/no): ")
+        if confirm.lower() != 'yes':
+            print("Cancelled.")
+            return
+
+    if dry_run:
+        print("\n--- DRY RUN MODE ---")
+        print("Will print planned trades without executing.\n")
+
+        # Fetch market data
+        collector = MarketDataCollector()
+        all_tickers = list(SPRINT3_CORE.keys()) + SPRINT3_SATELLITE_UNIVERSE
+        market_data = collector.get_all_data(all_tickers)
+
+        # Print scoring report
+        print_sprint3_scoring_report(market_data)
+
+        # Plan for each day
+        positions = state.get_positions()
+        sprint_state = state.get_sprint3_state()
+        current_day = sprint_state.get('sprint_day', 0)
+
+        plan_day = force_day or (current_day + 1 if current_day < 3 else 1)
+        plan = plan_sprint3(market_data, positions, sprint_day=plan_day)
+        print_sprint3_plan(plan)
+
+        return
+
+    # Initialize sprint if not already active
+    if not state.is_sprint3_active():
+        print("\nInitializing SPRINT3 mode...")
+        state.start_sprint3()
+
+    # Confirm execution
+    sprint_state = state.get_sprint3_state()
+    next_day = force_day or (sprint_state.get('sprint_day', 0) + 1)
+
+    if next_day > 3:
+        print("\nSPRINT3 already complete (all 3 days executed).")
+        print("Use --sprint3-reset to start a new sprint.")
+        return
+
+    print(f"\nAbout to execute SPRINT3 Day {next_day}")
+    print(f"Trades used: {state.get_trades_used()}/80")
+    print(f"Sprint trades remaining: {state.get_sprint3_trades_remaining()}")
+
+    confirm = input(f"\nType 'SPRINT{next_day}' to execute: ")
+    if confirm != f'SPRINT{next_day}':
+        print("Cancelled.")
+        return
+
+    # Execute
+    bot = None
+    try:
+        bot = StockTrakBot()
+        bot.start_browser(headless=False)  # Show browser for sprint
+
+        if not bot.login():
+            raise Exception("Login failed")
+
+        executor = Sprint3Executor(bot, state, dry_run=False)
+        result = executor.execute_sprint_day(force_day=force_day)
+
+        print("\n" + "=" * 70)
+        if result['success']:
+            print(f"SPRINT3 DAY {next_day} COMPLETED!")
+            print(f"Trades executed: {result.get('trades_executed', 0)}")
+        else:
+            print(f"SPRINT3 DAY {next_day} FAILED!")
+            print(f"Error: {result.get('error')}")
+        print("=" * 70)
+
+        # Print updated status
+        executor.print_status()
+
+    except Exception as e:
+        logger.critical(f"SPRINT3 ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        state.update_sprint3_state(last_error=str(e))
+
+    finally:
+        if bot:
+            input("\nPress Enter to close browser...")
+            bot.close()
+
+
+def sprint3_status_mode():
+    """Show current SPRINT3 status."""
+    from sprint3_strategy import is_market_open, is_in_execution_window
+    from state_manager import StateManager
+
+    state = StateManager()
+    sprint3 = state.get_sprint3_state()
+
+    print("\n" + "=" * 70)
+    print("SPRINT3 STATUS")
+    print("=" * 70)
+
+    # Mode status
+    if sprint3.get('mode') == 'SPRINT3':
+        print(f"Mode:              SPRINT3 (ACTIVE)")
+    else:
+        print(f"Mode:              Not active")
+
+    print(f"Sprint Day:        {sprint3.get('sprint_day', 0)}/3")
+    print(f"Sprint Trades Used: {sprint3.get('trades_used_sprint', 0)}")
+    print(f"Sprint Remaining:  {state.get_sprint3_trades_remaining()}")
+    print(f"Last Run:          {sprint3.get('last_run_time') or 'Never'}")
+    print(f"Last Run Day:      {sprint3.get('last_run_day') or 'Never'}")
+
+    print("-" * 70)
+    print(f"Total Trades Used: {state.get_trades_used()}/80")
+    print(f"Total Remaining:   {state.get_trades_remaining()}")
+
+    # Market status
+    market_open, market_reason = is_market_open()
+    in_window, window_reason = is_in_execution_window()
+
+    print("-" * 70)
+    print(f"Market:            {market_reason}")
+    print(f"Execution Window:  {window_reason}")
+
+    # Satellites
+    satellites = sprint3.get('satellites_held', [])
+    print("-" * 70)
+    print(f"Satellites Held:   {len(satellites)}")
+    if satellites:
+        print(f"  {', '.join(satellites)}")
+
+    # Last error
+    if sprint3.get('last_error'):
+        print("-" * 70)
+        print(f"Last Error:        {sprint3.get('last_error')}")
+
+    print("=" * 70)
+
+
+def sprint3_reset_mode():
+    """Reset SPRINT3 state."""
+    from state_manager import StateManager
+
+    state = StateManager()
+
+    print("\n--- SPRINT3 RESET ---")
+    print("This will reset all sprint3 state (day counter, satellites, etc.)")
+    print("Trade count will NOT be reset (use StockTrak admin for that).")
+
+    confirm = input("\nType 'RESET' to confirm: ")
+    if confirm != 'RESET':
+        print("Cancelled.")
+        return
+
+    state.reset_sprint3()
+    print("Sprint3 state reset successfully.")
+
+
 def scheduler_mode():
     """Start the continuous scheduler."""
     from scheduler import run_with_auto_restart
@@ -367,13 +568,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python main.py --test       Test login and data fetching
-    python main.py --day1       Build initial portfolio (Day 1 only)
-    python main.py --manual     Run daily routine manually
-    python main.py --status     Show current bot status
-    python main.py --scores     Show satellite scoring report
-    python main.py --preflight  Test trade flow UI without executing
-    python main.py              Start continuous scheduler
+    python main.py --test           Test login and data fetching
+    python main.py --day1           Build initial portfolio (Day 1 only)
+    python main.py --manual         Run daily routine manually
+    python main.py --status         Show current bot status
+    python main.py --scores         Show satellite scoring report
+    python main.py --preflight      Test trade flow UI without executing
+    python main.py --sprint3        Execute SPRINT3 mode (3-day high-intensity trading)
+    python main.py --sprint3-status Show SPRINT3 status
+    python main.py --sprint3-dry-run Plan SPRINT3 trades without executing
+    python main.py                  Start continuous scheduler
         """
     )
 
@@ -389,6 +593,19 @@ Examples:
                         help='Show satellite scoring report')
     parser.add_argument('--preflight', action='store_true',
                         help='UI preflight check - test trade flow without executing')
+
+    # SPRINT3 options
+    parser.add_argument('--sprint3', action='store_true',
+                        help='Execute SPRINT3 mode (3-day high-intensity trading)')
+    parser.add_argument('--sprint3-status', action='store_true',
+                        help='Show SPRINT3 status')
+    parser.add_argument('--sprint3-dry-run', action='store_true',
+                        help='Plan SPRINT3 trades without executing')
+    parser.add_argument('--sprint3-reset', action='store_true',
+                        help='Reset SPRINT3 state')
+    parser.add_argument('--sprint3-day', type=int, choices=[1, 2, 3],
+                        help='Force specific sprint day (1, 2, or 3)')
+
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                         help='Logging level (default: INFO)')
@@ -421,6 +638,14 @@ Examples:
             scores_mode()
         elif args.preflight:
             preflight_mode()
+        elif args.sprint3:
+            sprint3_mode(dry_run=False, force_day=args.sprint3_day)
+        elif args.sprint3_status:
+            sprint3_status_mode()
+        elif args.sprint3_dry_run:
+            sprint3_mode(dry_run=True, force_day=args.sprint3_day)
+        elif args.sprint3_reset:
+            sprint3_reset_mode()
         else:
             scheduler_mode()
 
@@ -449,6 +674,14 @@ def get_mode_name(args):
         return "SCORES"
     elif args.preflight:
         return "PREFLIGHT"
+    elif args.sprint3:
+        return "SPRINT3"
+    elif args.sprint3_status:
+        return "SPRINT3-STATUS"
+    elif args.sprint3_dry_run:
+        return "SPRINT3-DRY-RUN"
+    elif args.sprint3_reset:
+        return "SPRINT3-RESET"
     else:
         return "SCHEDULER"
 
