@@ -159,9 +159,10 @@ def execute_daily_routine():
         logger.critical("STATE INTEGRITY CHECK FAILED - aborting execution")
         return
 
-    # Check if already ran today
-    if state.already_executed_today():
-        logger.info("Already executed today - skipping")
+    # FIX: Use atomic check-and-mark to prevent race condition
+    # If bot runs twice simultaneously, only one will proceed
+    if not state.check_and_mark_execution():
+        logger.info("Already executed today (atomic check) - skipping")
         return
 
     # Check if trading day
@@ -304,8 +305,8 @@ def _execute_daily_routine_inner(state: StateManager) -> 'StockTrakBot':
     # Log daily value
     state.log_daily_value(portfolio_value, vix_level)
 
-    # Mark execution complete
-    state.mark_execution()
+    # NOTE: Execution already marked at start via check_and_mark_execution()
+    # (FIX: atomic check-and-mark prevents race condition)
 
     logger.info("Daily routine completed successfully")
 
@@ -541,10 +542,22 @@ def execute_normal_mode(
 
     # DAY-1 CONTINUATION: If we're missing satellite buckets from incomplete initial build
     # This allows us to complete the Day-1 build even on non-Fridays
+    # CRITICAL FIX: Add explicit Day-1 deadline boundary check
+    # Day-1 build must complete on Day-1 (competition start date) only
+    day1_deadline = datetime.fromisoformat(config.COMPETITION_START).date()
+    today = datetime.now().date()
+
     need_day1_continuation = len(missing_buckets) > 0 and current_satellites < 8
     if need_day1_continuation:
-        logger.info(f"DAY-1 CONTINUATION MODE: {len(missing_buckets)} satellite buckets missing")
-        logger.info(f"Missing buckets: {sorted(missing_buckets)}")
+        if today > day1_deadline:
+            # Past Day-1 deadline - do NOT continue building, only allow Friday rotations
+            logger.warning(f"DAY-1 BUILD INCOMPLETE but past Day-1 deadline ({day1_deadline})")
+            logger.warning(f"Missing buckets: {sorted(missing_buckets)} - will NOT auto-fill")
+            logger.warning("Use Friday discretionary rotation to fill missing buckets")
+            need_day1_continuation = False  # Disable auto-fill past Day-1
+        else:
+            logger.info(f"DAY-1 CONTINUATION MODE: {len(missing_buckets)} satellite buckets missing")
+            logger.info(f"Missing buckets: {sorted(missing_buckets)}")
 
     if friday:
         logger.info("Looking for new entry opportunities (Friday discretionary)...")
