@@ -555,6 +555,29 @@ class Sprint3Executor:
             logger.warning(f"Outside execution window: {window_reason}")
             # Continue with warning - allow for testing
 
+        # ==========================================================================
+        # QUEUE MANAGEMENT: Clean up duplicates before sprint execution
+        # ==========================================================================
+        if not self.dry_run:
+            logger.info("Checking and organizing order queue...")
+            try:
+                from queue_manager import QueueManager
+                queue_manager = QueueManager(self.bot, self.state)
+                queue_healthy, audit_result = queue_manager.organize_queue(
+                    auto_cancel_duplicates=True,
+                    auto_cancel_invalid=False
+                )
+
+                if audit_result.duplicate_orders:
+                    logger.info(f"Cleaned up {len(audit_result.duplicate_orders)} duplicate orders")
+
+                if not queue_healthy:
+                    logger.warning(f"Queue issues: {len(audit_result.warnings)} warnings")
+
+                logger.info(f"Queue: {audit_result.total_orders} pending orders")
+            except Exception as e:
+                logger.warning(f"Queue management failed (non-critical): {e}")
+
         # Determine sprint day
         sprint_state = self.get_sprint_state()
         current_day = sprint_state['sprint_day']
