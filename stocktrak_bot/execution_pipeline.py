@@ -260,6 +260,17 @@ class ExecutionPipeline:
             self._run_step("verify_login", lambda: self._verify_logged_in(), order)
             self.current_state = TradeState.LOGGED_IN
 
+            # STEP 1.5: Get pre-trade transaction count for external verification
+            # CRITICAL: This MUST happen BEFORE navigating to trade page, otherwise
+            # the navigation will destroy the confirmation UI later in the flow.
+            # Bug fix: Previously this was called in _place_order() which navigated
+            # away from the confirmation page right before clicking Confirm Order.
+            self._pre_trade_count = self._get_external_trade_count()
+            if self._pre_trade_count is not None:
+                logger.info(f"Pre-trade transaction count (for verification): {self._pre_trade_count}")
+            else:
+                logger.warning("Could not get pre-trade count - external verification will be skipped")
+
             # STEP 2: Idempotency check
             if self._check_already_placed(order):
                 logger.warning(f"Order already placed today - aborting")
@@ -938,34 +949,49 @@ class ExecutionPipeline:
 
         for attempt in range(max_attempts):
             try:
-                # AGGRESSIVE CLEAR: Multiple methods to ensure field is empty
-                input_elem.click()
+                # AGGRESSIVE CLEAR: Use JavaScript first for guaranteed clearing
+                # This is most reliable because it bypasses any input masks or React state
+                input_elem.evaluate("el => { el.value = ''; el.dispatchEvent(new Event('input', {bubbles: true})); }")
                 time.sleep(0.2)
 
-                # Method 1: Triple-click to select all
-                input_elem.click(click_count=3)
+                # Focus and click to ensure we're in the field
+                input_elem.click()
                 time.sleep(0.1)
 
-                # Method 2: Ctrl+A to select all
-                input_elem.press("Control+a")
-                time.sleep(0.1)
-
-                # Method 3: Delete/Backspace
-                input_elem.press("Delete")
-                input_elem.press("Backspace")
-                time.sleep(0.1)
-
-                # Verify field is now empty
+                # Double-check it's empty, if not use keyboard methods too
                 current_value = input_elem.input_value().strip()
                 if current_value:
-                    logger.warning(f"Field not empty after clear (has: '{current_value}'), trying again...")
-                    # Try clearing with JavaScript
-                    input_elem.evaluate("el => el.value = ''")
+                    logger.debug(f"Field still has value after JS clear: '{current_value}', using keyboard")
+                    # Method 1: Triple-click to select all
+                    input_elem.click(click_count=3)
                     time.sleep(0.1)
 
-                # Now type the new value character by character
-                input_elem.type(str(shares), delay=50)
-                time.sleep(0.3)
+                    # Method 2: Ctrl+A to select all
+                    input_elem.press("Control+a")
+                    time.sleep(0.1)
+
+                    # Method 3: Delete/Backspace multiple times
+                    input_elem.press("Delete")
+                    input_elem.press("Backspace")
+                    input_elem.press("Delete")
+                    input_elem.press("Backspace")
+                    time.sleep(0.1)
+
+                    # Final JS clear
+                    input_elem.evaluate("el => { el.value = ''; el.dispatchEvent(new Event('input', {bubbles: true})); }")
+                    time.sleep(0.1)
+
+                # Verify field is now empty before typing
+                current_value = input_elem.input_value().strip()
+                if current_value:
+                    logger.warning(f"Field not empty after clear (has: '{current_value}'), will overwrite with JS")
+                    # Use JavaScript to set value directly - most reliable method
+                    input_elem.evaluate(f"el => {{ el.value = '{shares}'; el.dispatchEvent(new Event('input', {{bubbles: true}})); }}")
+                    time.sleep(0.2)
+                else:
+                    # Field is empty, type the value character by character
+                    input_elem.type(str(shares), delay=50)
+                    time.sleep(0.2)
 
                 # Verify the value
                 actual = input_elem.input_value().strip()
@@ -977,7 +1003,7 @@ class ExecutionPipeline:
                     return
                 else:
                     logger.warning(f"Shares mismatch attempt {attempt+1}: expected {shares}, got '{actual}'")
-                    # Clear via JavaScript and retry
+                    # Use JavaScript direct set for next attempt
                     input_elem.evaluate("el => el.value = ''")
 
             except Exception as e:
@@ -1400,16 +1426,14 @@ class ExecutionPipeline:
         if self._check_already_placed(order):
             raise RuntimeError("Order already placed - aborting to prevent duplicate")
 
-        # IDEMPOTENCY CHECK 2 (FIX): External verification against StockTrak's actual count
-        # This guards against state file corruption causing duplicate submissions
-        pre_trade_count = self._get_external_trade_count()
-        if pre_trade_count is not None:
-            logger.info(f"Pre-trade transaction count from StockTrak: {pre_trade_count}")
-            # Store for post-trade verification
-            self._pre_trade_count = pre_trade_count
+        # IDEMPOTENCY CHECK 2: Use pre-trade count captured at pipeline start
+        # NOTE: We do NOT call _get_external_trade_count() here because that would
+        # navigate away from the confirmation page and destroy the Confirm Order button!
+        # The pre-trade count was captured in execute() before navigating to the trade page.
+        if hasattr(self, '_pre_trade_count') and self._pre_trade_count is not None:
+            logger.info(f"Using pre-captured trade count for verification: {self._pre_trade_count}")
         else:
-            logger.warning("Could not get external trade count - proceeding with local check only")
-            self._pre_trade_count = None
+            logger.warning("No pre-trade count available - external verification will be skipped")
 
         # USE JAVASCRIPT to find and click - most reliable method
         js_click_script = """
