@@ -35,6 +35,7 @@ from config import (
     STOCKTRAK_TRADING_EQUITIES_URL, STOCKTRAK_TRANSACTION_HISTORY_URL,
     STOCKTRAK_ORDER_HISTORY_URL, DEFAULT_TIMEOUT, PAGE_LOAD_TIMEOUT
 )
+from utils import is_market_hours
 
 logger = logging.getLogger('stocktrak_bot.execution_pipeline')
 
@@ -248,6 +249,14 @@ class ExecutionPipeline:
         logger.info(f"EXECUTION PIPELINE START: {order.side} {order.shares} {order.ticker}")
         logger.info(f"Run ID: {order.run_id}")
         logger.info(f"=" * 60)
+
+        # FIX: Warn if market is closed - orders will be queued
+        if not is_market_hours():
+            logger.warning(
+                "MARKET CLOSED: Order will be QUEUED for execution at market open. "
+                "Trade count verification will be skipped since queued orders don't "
+                "increment the count until they execute."
+            )
 
         self.screenshots = []
         self.current_state = TradeState.INIT
@@ -723,6 +732,12 @@ class ExecutionPipeline:
         """
         if not hasattr(self, '_pre_trade_count') or self._pre_trade_count is None:
             return True, "External verification skipped (no pre-trade count)"
+
+        # FIX: Skip verification when market is closed - orders are queued, not executed
+        # Trade count only increments when orders actually execute at market open
+        if not is_market_hours():
+            logger.info("Market is closed - order queued for market open, skipping trade count verification")
+            return True, "External verification skipped (market closed - order queued)"
 
         try:
             post_trade_count = self._get_external_trade_count()
