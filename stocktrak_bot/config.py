@@ -56,23 +56,47 @@ HARD_STOP_TRADES = 70           # Stop new trades after 70
 MIN_PRICE_AT_BUY = 5.00         # Cannot buy stocks below $5
 SAFETY_BUFFER_PRICE = 6.00      # Only buy if price >= $6 (safety margin)
 COMMISSION_PER_TRADE = 5.00     # $5 per trade
-MIN_HOLD_TRADING_DAYS = 2       # T+2 holding period (cannot sell until T+2)
 CASH_INTEREST_RATE = 0.01       # 1% annual on cash
+
+# 24-hour minimum holding period (timestamp-based, NOT date-based)
+# CRITICAL: The competition requires 24-hour hold, not T+2 trading days
+MIN_HOLD_HOURS = 24
+MIN_HOLD_SECONDS = MIN_HOLD_HOURS * 3600  # 86400 seconds
+
+# Safety buffer so you never accidentally sell at 23:59:59
+# Using 5 minutes (300s) for safety margin at 24h boundary
+HOLD_BUFFER_SECONDS = 300  # 5 minutes
+
+# =============================================================================
+# HOLDING PERIOD ENFORCEMENT MODE
+# =============================================================================
+# LOT_FIFO: Each BUY creates a timestamped lot. SELLs consume eligible lots FIFO.
+#           A lot is eligible when: now_utc >= buy_ts_utc + 24h + buffer
+#           This allows selling old shares even after buying new shares.
+#
+# STRICT_TICKER: If ANY buy occurred within 24h, block ALL sells for that ticker.
+#                Safer interpretation if judges are strict about the rule.
+#
+# Set HOLD_MODE to control which enforcement is used.
+HOLD_MODE = "LOT_FIFO"  # Options: "LOT_FIFO" or "STRICT_TICKER"
+
+# Legacy constant - kept for backwards compatibility but not used for compliance
+MIN_HOLD_TRADING_DAYS = 2       # DEPRECATED: Use MIN_HOLD_SECONDS instead
 
 # =============================================================================
 # MARKET HOURS (Eastern Time)
 # =============================================================================
 MARKET_OPEN = "09:30"
 MARKET_CLOSE = "16:00"
-EXECUTION_WINDOW_START = "09:20"  # 9:20 AM ET (morning hours)
-EXECUTION_WINDOW_END = "09:40"    # 9:40 AM ET
+EXECUTION_WINDOW_START = "09:40"  # 9:40 AM ET (after initial volatility)
+EXECUTION_WINDOW_END = "10:05"    # 10:05 AM ET
 
 # =============================================================================
 # BOT SETTINGS
 # =============================================================================
 HEADLESS_MODE = True              # Set False to see browser during testing
-EXECUTION_TIME = "09:30"          # 9:30 AM ET - primary execution time (morning hours)
-DATA_COLLECTION_TIME = "09:00"    # 9:00 AM ET - data collection time (pre-market)
+EXECUTION_TIME = "09:45"          # 9:45 AM ET - primary execution time (after initial volatility)
+DATA_COLLECTION_TIME = "09:30"    # 9:30 AM ET - data collection time (market open)
 LOG_LEVEL = "INFO"
 SCREENSHOT_ON_ERROR = True
 SCREENSHOT_ON_TRADE = True
@@ -115,11 +139,12 @@ DISCORD_WEBHOOK_URL = ""
 # =============================================================================
 # PORTFOLIO ALLOCATION (1/N Strategy - DeMiguel et al.)
 # =============================================================================
-# Core Holdings - 60% total (equal-weighted 1/N within core sleeve)
+# Core Holdings - 60% total (max 25% per position)
+# CRITICAL: No position may exceed 25% at time of purchase
 CORE_POSITIONS = {
-    'VOO': 0.20,  # Vanguard S&P 500 - 20%
+    'VOO': 0.25,  # Vanguard S&P 500 - 25% (max allowed)
     'VTI': 0.20,  # Vanguard Total Market - 20%
-    'VEA': 0.20,  # Vanguard Developed Markets - 20%
+    'VEA': 0.15,  # Vanguard Developed Markets - 15%
 }
 
 # Satellite Buckets (8 buckets × 1 position each = 40% total)

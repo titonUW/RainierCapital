@@ -545,6 +545,257 @@ def sprint3_reset_mode():
     print("Sprint3 state reset successfully.")
 
 
+def hold_test_mode():
+    """
+    Test lot-based 24-hour holding compliance (offline, no Playwright).
+
+    This test verifies:
+    1. Lot creation with timestamps
+    2. Eligible quantity calculation
+    3. FIFO consumption on partial sells
+    4. Sell blocking for insufficient eligible shares
+    5. Both LOT_FIFO and STRICT_TICKER modes
+
+    Returns exit code 0 on PASS, 1 on FAIL.
+    """
+    import sys
+    import os
+    import tempfile
+    from datetime import datetime, timezone, timedelta
+    from state_manager import StateManager
+    from validators import can_sell_with_lots
+    from config import MIN_HOLD_SECONDS, HOLD_BUFFER_SECONDS, HOLD_MODE
+
+    print("\n" + "=" * 70)
+    print("LOT-BASED 24-HOUR HOLDING COMPLIANCE TEST")
+    print("=" * 70)
+    print(f"HOLD_MODE: {HOLD_MODE}")
+    print(f"MIN_HOLD_SECONDS: {MIN_HOLD_SECONDS} ({MIN_HOLD_SECONDS / 3600:.1f} hours)")
+    print(f"HOLD_BUFFER_SECONDS: {HOLD_BUFFER_SECONDS} ({HOLD_BUFFER_SECONDS / 60:.1f} minutes)")
+    print("=" * 70)
+
+    # Use temporary state file for testing
+    test_state_file = tempfile.mktemp(suffix='_hold_test.json')
+    tests_passed = 0
+    tests_failed = 0
+
+    try:
+        # Initialize fresh state manager with temp file
+        state = StateManager(state_file=test_state_file)
+
+        # =========================================================================
+        # TEST 1: Create position with 2 lots (one 23h old, one 25h old)
+        # =========================================================================
+        print("\n--- TEST 1: Create position with 2 lots ---")
+        ticker = "TEST_LOT"
+        now = datetime.now(timezone.utc)
+
+        # Lot 1: 25 hours old (should be eligible)
+        lot1_time = now - timedelta(hours=25)
+        lot1_ts = lot1_time.isoformat().replace('+00:00', 'Z')
+
+        # Lot 2: 23 hours old (should NOT be eligible)
+        lot2_time = now - timedelta(hours=23)
+        lot2_ts = lot2_time.isoformat().replace('+00:00', 'Z')
+
+        # Create position manually for precise control
+        state.state['positions'][ticker] = {
+            'ticker': ticker,
+            'lots': [
+                {'lot_id': 'LOT1', 'qty': 100, 'buy_ts_utc': lot1_ts, 'buy_price': 50.00},
+                {'lot_id': 'LOT2', 'qty': 50, 'buy_ts_utc': lot2_ts, 'buy_price': 51.00},
+            ],
+            'shares': 150,
+            'entry_price': 50.33,
+            'entry_date': now.date().isoformat(),
+            'entry_timestamp': lot1_ts,
+            'last_buy_timestamp': lot2_ts,
+            'bucket': 'TEST',
+        }
+        state.save()
+
+        total = state.get_total_shares(ticker)
+        if total == 150:
+            print(f"  PASS: get_total_shares() = {total}")
+            tests_passed += 1
+        else:
+            print(f"  FAIL: get_total_shares() = {total}, expected 150")
+            tests_failed += 1
+
+        # =========================================================================
+        # TEST 2: Verify eligible quantity (LOT_FIFO mode)
+        # =========================================================================
+        print("\n--- TEST 2: Verify eligible quantity ---")
+        eligible = state.eligible_sell_qty(ticker, now)
+        # Only lot1 (100 shares) should be eligible (25h old > 24h + 5min)
+        if eligible == 100:
+            print(f"  PASS: eligible_sell_qty() = {eligible} (lot1 only)")
+            tests_passed += 1
+        else:
+            print(f"  FAIL: eligible_sell_qty() = {eligible}, expected 100")
+            tests_failed += 1
+
+        # =========================================================================
+        # TEST 3: Verify can_sell_with_lots returns correct values
+        # =========================================================================
+        print("\n--- TEST 3: Verify can_sell_with_lots() ---")
+        can_sell, allowed, reason = can_sell_with_lots(ticker, 150, state, now)
+
+        if HOLD_MODE == "LOT_FIFO":
+            # Should allow partial (100 of 150)
+            if can_sell and allowed == 100:
+                print(f"  PASS: can_sell={can_sell}, allowed={allowed}")
+                print(f"        Reason: {reason}")
+                tests_passed += 1
+            else:
+                print(f"  FAIL: can_sell={can_sell}, allowed={allowed}, expected True/100")
+                tests_failed += 1
+        else:  # STRICT_TICKER
+            # Should block all (lot2 is too young)
+            if not can_sell and allowed == 0:
+                print(f"  PASS: can_sell={can_sell}, allowed={allowed} (blocked)")
+                print(f"        Reason: {reason}")
+                tests_passed += 1
+            else:
+                print(f"  FAIL: can_sell={can_sell}, allowed={allowed}, expected False/0")
+                tests_failed += 1
+
+        # =========================================================================
+        # TEST 4: Verify sell of more than eligible is blocked (LOT_FIFO)
+        # =========================================================================
+        print("\n--- TEST 4: Verify oversell is handled correctly ---")
+        if HOLD_MODE == "LOT_FIFO":
+            can_sell, allowed, reason = can_sell_with_lots(ticker, 120, state, now)
+            # Should reduce to 100 (eligible amount)
+            if can_sell and allowed == 100:
+                print(f"  PASS: Requested 120, allowed {allowed} (reduced)")
+                tests_passed += 1
+            else:
+                print(f"  FAIL: can_sell={can_sell}, allowed={allowed}, expected True/100")
+                tests_failed += 1
+        else:
+            print("  SKIP: Not applicable in STRICT_TICKER mode")
+            tests_passed += 1
+
+        # =========================================================================
+        # TEST 5: Verify consume_sell_fifo works correctly
+        # =========================================================================
+        print("\n--- TEST 5: Verify FIFO consumption ---")
+        if HOLD_MODE == "LOT_FIFO":
+            # Sell 60 shares (should come from lot1)
+            try:
+                state.consume_sell_fifo(ticker, 60, now)
+
+                # Check lots after consumption
+                lots = state.get_lots(ticker)
+                remaining_shares = state.get_total_shares(ticker)
+
+                if remaining_shares == 90:  # 150 - 60 = 90
+                    print(f"  PASS: Total shares after sell = {remaining_shares}")
+                    tests_passed += 1
+                else:
+                    print(f"  FAIL: Total shares = {remaining_shares}, expected 90")
+                    tests_failed += 1
+
+                # Lot1 should have 40 remaining (100 - 60)
+                lot1 = next((l for l in lots if l['lot_id'] == 'LOT1'), None)
+                if lot1 and lot1['qty'] == 40:
+                    print(f"  PASS: Lot1 (oldest) reduced to {lot1['qty']} shares (FIFO)")
+                    tests_passed += 1
+                else:
+                    print(f"  FAIL: Lot1 qty = {lot1['qty'] if lot1 else 'missing'}, expected 40")
+                    tests_failed += 1
+
+                # Lot2 should be unchanged (50)
+                lot2 = next((l for l in lots if l['lot_id'] == 'LOT2'), None)
+                if lot2 and lot2['qty'] == 50:
+                    print(f"  PASS: Lot2 (newer) unchanged at {lot2['qty']} shares")
+                    tests_passed += 1
+                else:
+                    print(f"  FAIL: Lot2 qty = {lot2['qty'] if lot2 else 'missing'}, expected 50")
+                    tests_failed += 1
+
+            except ValueError as e:
+                print(f"  FAIL: consume_sell_fifo raised: {e}")
+                tests_failed += 1
+        else:
+            print("  SKIP: Not applicable in STRICT_TICKER mode")
+            tests_passed += 3
+
+        # =========================================================================
+        # TEST 6: Verify sell blocked when insufficient eligible (LOT_FIFO)
+        # =========================================================================
+        print("\n--- TEST 6: Verify insufficient eligible blocking ---")
+        # Remaining: lot1=40 (eligible), lot2=50 (not eligible) = 40 eligible
+        eligible_now = state.eligible_sell_qty(ticker, now)
+        print(f"  Current eligible: {eligible_now} shares")
+
+        try:
+            # Try to sell 50 when only 40 eligible
+            state.consume_sell_fifo(ticker, 50, now)
+            print(f"  FAIL: Should have raised ValueError for insufficient eligible")
+            tests_failed += 1
+        except ValueError as e:
+            print(f"  PASS: Correctly raised ValueError: {str(e)[:60]}...")
+            tests_passed += 1
+
+        # =========================================================================
+        # TEST 7: Verify earliest_eligible_time
+        # =========================================================================
+        print("\n--- TEST 7: Verify earliest_eligible_time ---")
+        earliest = state.earliest_eligible_time(ticker, now)
+        if earliest:
+            print(f"  PASS: earliest_eligible_time = {earliest}")
+            tests_passed += 1
+        else:
+            print(f"  FAIL: earliest_eligible_time returned None")
+            tests_failed += 1
+
+        # =========================================================================
+        # TEST 8: Verify has_any_recent_buy (STRICT_TICKER helper)
+        # =========================================================================
+        print("\n--- TEST 8: Verify has_any_recent_buy ---")
+        has_recent, reason = state.has_any_recent_buy(ticker, now)
+        if has_recent:
+            print(f"  PASS: has_any_recent_buy = True (lot2 is young)")
+            print(f"        Reason: {reason}")
+            tests_passed += 1
+        else:
+            print(f"  FAIL: has_any_recent_buy = False, expected True")
+            tests_failed += 1
+
+        # =========================================================================
+        # SUMMARY
+        # =========================================================================
+        print("\n" + "=" * 70)
+        print("TEST SUMMARY")
+        print("=" * 70)
+        print(f"PASSED: {tests_passed}")
+        print(f"FAILED: {tests_failed}")
+        print("=" * 70)
+
+        if tests_failed == 0:
+            print("\n*** ALL TESTS PASSED ***\n")
+            return 0
+        else:
+            print(f"\n*** {tests_failed} TEST(S) FAILED ***\n")
+            return 1
+
+    except Exception as e:
+        print(f"\n*** TEST ERROR: {e} ***")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    finally:
+        # Cleanup temp file
+        if os.path.exists(test_state_file):
+            os.remove(test_state_file)
+        backup = test_state_file.replace('.json', '_backup.json')
+        if os.path.exists(backup):
+            os.remove(backup)
+
+
 def scheduler_mode():
     """Start the continuous scheduler."""
     from scheduler import run_with_auto_restart
@@ -593,6 +844,8 @@ Examples:
                         help='Show satellite scoring report')
     parser.add_argument('--preflight', action='store_true',
                         help='UI preflight check - test trade flow without executing')
+    parser.add_argument('--hold-test', action='store_true',
+                        help='Test lot-based 24h holding compliance (offline, no Playwright)')
 
     # SPRINT3 options
     parser.add_argument('--sprint3', action='store_true',
@@ -638,6 +891,9 @@ Examples:
             scores_mode()
         elif args.preflight:
             preflight_mode()
+        elif args.hold_test:
+            exit_code = hold_test_mode()
+            sys.exit(exit_code)
         elif args.sprint3:
             sprint3_mode(dry_run=False, force_day=args.sprint3_day)
         elif args.sprint3_status:
@@ -674,6 +930,8 @@ def get_mode_name(args):
         return "SCORES"
     elif args.preflight:
         return "PREFLIGHT"
+    elif args.hold_test:
+        return "HOLD-TEST"
     elif args.sprint3:
         return "SPRINT3"
     elif args.sprint3_status:

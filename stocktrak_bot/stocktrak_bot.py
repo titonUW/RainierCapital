@@ -397,6 +397,117 @@ def verify_page_ready(page, expected_url_contains: str = None, required_element:
         return False, f"Verification error: {e}"
 
 
+def ensure_clean_ui(page, timeout_ms: int = 15000) -> bool:
+    """
+    Centralized Popup Manager - ensures the UI is clean for interaction.
+
+    This function is designed to be called:
+    - After login
+    - After every navigation
+    - Before every click
+    - After every click that should open a modal
+
+    It combines multiple approaches for maximum reliability:
+    1. Dismiss visible modals using known selectors
+    2. Click dismiss buttons using safe patterns
+    3. Press Escape key to close modals
+    4. Remove blocking overlays via JavaScript if needed
+    5. Verify the trade ticket area is interactable
+
+    Args:
+        page: Playwright page object
+        timeout_ms: Maximum time to spend clearing popups
+
+    Returns:
+        True if UI is clean, False if blocking elements remain
+    """
+    start_time = time.time()
+    end_time = start_time + (timeout_ms / 1000)
+    dismissed = 0
+
+    # Round 1: Use the existing comprehensive dismiss function
+    try:
+        dismissed = dismiss_stocktrak_overlays(page, total_ms=min(5000, timeout_ms // 2))
+    except Exception as e:
+        logger.warning(f"dismiss_stocktrak_overlays error: {e}")
+
+    # Round 2: Press Escape twice (handles many modal types)
+    if time.time() < end_time:
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.1)
+            page.keyboard.press("Escape")
+            time.sleep(0.2)
+        except:
+            pass
+
+    # Round 3: Try to click outside any modal (common dismiss pattern)
+    if time.time() < end_time:
+        try:
+            # Click on the body to dismiss modals
+            page.evaluate("document.body.click()")
+            time.sleep(0.1)
+        except:
+            pass
+
+    # Round 4: Remove blocking overlays via JavaScript (last resort)
+    if time.time() < end_time:
+        try:
+            js_remove_overlays = """
+            (function() {
+                // Remove common overlay classes that block interaction
+                const overlaySelectors = [
+                    '.modal-backdrop',
+                    '.introjs-overlay',
+                    '.shepherd-modal-overlay',
+                    '.tour-backdrop',
+                    '.popup-overlay',
+                    '[class*="overlay"]:not([class*="chart"]):not([class*="button"])',
+                ];
+
+                let removed = 0;
+                for (const sel of overlaySelectors) {
+                    const elements = document.querySelectorAll(sel);
+                    for (const el of elements) {
+                        // Only remove if it's actually blocking (high z-index)
+                        const style = window.getComputedStyle(el);
+                        const zIndex = parseInt(style.zIndex) || 0;
+                        if (zIndex > 100 || style.position === 'fixed') {
+                            // Don't delete - just make it non-blocking
+                            el.style.pointerEvents = 'none';
+                            el.style.display = 'none';
+                            removed++;
+                        }
+                    }
+                }
+                return removed;
+            })();
+            """
+            removed = page.evaluate(js_remove_overlays)
+            if removed > 0:
+                logger.info(f"Removed {removed} blocking overlays via JS")
+        except Exception as e:
+            logger.debug(f"JS overlay removal error: {e}")
+
+    # Round 5: Verify no blocking elements remain
+    if time.time() < end_time:
+        is_clean, reason = verify_page_ready(page)
+        if not is_clean:
+            # One more attempt
+            try:
+                dismissed += dismiss_stocktrak_overlays(page, total_ms=2000)
+            except:
+                pass
+            is_clean, reason = verify_page_ready(page)
+            if not is_clean:
+                logger.warning(f"UI not clean after ensure_clean_ui: {reason}")
+                return False
+
+    elapsed = time.time() - start_time
+    logger.debug(f"ensure_clean_ui completed in {elapsed:.2f}s, dismissed {dismissed} popups")
+    return True
+
+
 def take_debug_screenshot(page, name: str) -> str:
     """
     Take a screenshot and return the full path.
@@ -499,6 +610,10 @@ class StockTrakBot:
         # Increase timeouts - StockTrak can be slow
         self.page.set_default_timeout(90000)  # 90 seconds
         self.page.set_default_navigation_timeout(90000)
+
+        # DOMAIN GUARD: Listen for new pages/tabs and close anything not on StockTrak
+        # This prevents hijacks from clicking social links, ads, or other external content
+        self._setup_domain_guard()
 
         logger.info("Browser started successfully")
 
@@ -714,6 +829,86 @@ class StockTrakBot:
                 page.close()
             except Exception as e:
                 logger.warning(f"Could not close tab: {e}")
+
+    def _setup_domain_guard(self):
+        """
+        Set up a Domain Guard that automatically closes tabs from non-StockTrak domains.
+
+        This prevents automation failures caused by:
+        - Social media links (Facebook, Twitter, LinkedIn)
+        - Ad overlays that open new tabs
+        - External links accidentally clicked
+
+        The guard listens for new pages/tabs and immediately closes anything
+        that doesn't match stocktrak.com.
+        """
+        if not self.context:
+            logger.warning("Cannot set up domain guard: no context")
+            return
+
+        # Domains to block (close tabs from these)
+        blocked_domains = [
+            'facebook.com', 'fb.com', 'fbcdn.net',
+            'twitter.com', 'x.com',
+            'linkedin.com',
+            'instagram.com',
+            'youtube.com',
+            'google.com/ads', 'doubleclick.net', 'googlesyndication.com',
+            'adnxs.com', 'adsrvr.org', 'amazon-adsystem.com',
+            'taboola.com', 'outbrain.com',
+            'tiktok.com',
+        ]
+
+        # Allowed domains (keep tabs from these)
+        allowed_domains = [
+            'stocktrak.com',
+            'app.stocktrak.com',
+        ]
+
+        def on_page_created(new_page):
+            """Handler for new tab/page creation."""
+            try:
+                # Give page a moment to load
+                time.sleep(0.2)
+                url = new_page.url.lower()
+
+                # Check if it's an allowed domain
+                is_allowed = any(domain in url for domain in allowed_domains)
+
+                # Check if it's a blocked domain
+                is_blocked = any(domain in url for domain in blocked_domains)
+
+                # Also block any non-stocktrak domain
+                is_external = (
+                    url.startswith('http') and
+                    'stocktrak.com' not in url and
+                    url != 'about:blank'
+                )
+
+                if is_blocked or (is_external and not is_allowed):
+                    logger.warning(f"DOMAIN GUARD: Closing blocked tab: {url}")
+                    try:
+                        new_page.close()
+                    except Exception as e:
+                        logger.debug(f"Could not close tab: {e}")
+                else:
+                    logger.debug(f"DOMAIN GUARD: Allowing tab: {url}")
+
+            except Exception as e:
+                logger.debug(f"Domain guard handler error: {e}")
+                # If we can't determine, try to close it (fail-safe)
+                try:
+                    if 'stocktrak.com' not in str(new_page.url).lower():
+                        new_page.close()
+                except:
+                    pass
+
+        # Register the handler
+        try:
+            self.context.on("page", on_page_created)
+            logger.info("DOMAIN GUARD: Installed - will close external tabs automatically")
+        except Exception as e:
+            logger.warning(f"Could not install domain guard: {e}")
 
     def _ensure_on_stocktrak(self) -> bool:
         """

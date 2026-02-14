@@ -14,8 +14,9 @@ import json
 import os
 import logging
 import threading
-from datetime import datetime, date
-from typing import Dict, List, Optional
+import uuid
+from datetime import datetime, date, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import shutil
 
@@ -67,6 +68,8 @@ class StateManager:
     def __init__(self, state_file: str = STATE_FILE):
         self.state_file = state_file
         self.state = self._load_state()
+        # Migrate positions to include timestamps (one-time migration)
+        self._migrate_position_timestamps()
 
     def _load_state(self) -> Dict:
         """Load state from disk or initialize fresh state.
@@ -146,6 +149,152 @@ class StateManager:
             },
         }
 
+    def _parse_timestamp_utc(self, ts: str) -> Optional[datetime]:
+        """
+        Parse a timestamp string to UTC datetime.
+
+        Handles:
+        - ISO format with timezone
+        - ISO format with Z suffix
+        - Naive timestamps (assumed local, converted to UTC)
+
+        Args:
+            ts: Timestamp string
+
+        Returns:
+            datetime in UTC or None if unparseable
+        """
+        if not ts:
+            return None
+
+        # Handle trailing Z (e.g., 2026-01-20T14:30:00Z)
+        ts = ts.replace("Z", "+00:00")
+
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            return None
+
+        # If naive, assume local system timezone (safe for historical logs)
+        if dt.tzinfo is None:
+            local_tz = datetime.now().astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
+
+        return dt.astimezone(timezone.utc)
+
+    def _migrate_position_timestamps(self):
+        """
+        Migrate existing positions to include timestamp-based holding period fields
+        AND lot-based tracking for proper FIFO compliance.
+
+        This migration:
+        1. Migrates legacy last_buy_timestamp if missing
+        2. Migrates to lot-based structure if lots are missing
+        3. Infers lots from trade_log BUY entries when possible
+        4. Falls back to synthetic lot (fail-safe: won't violate 24h)
+
+        Called automatically in __init__.
+        """
+        changed = False
+        trade_log = self.state.get('trade_log', [])
+
+        # Build lookup of BUY transactions per ticker from trade_log
+        buys_by_ticker = {}
+        for tr in trade_log:
+            if tr.get('action') == 'BUY' and tr.get('ticker'):
+                ticker = tr['ticker']
+                if ticker not in buys_by_ticker:
+                    buys_by_ticker[ticker] = []
+                buys_by_ticker[ticker].append(tr)
+
+        positions = self.state.get('positions', {})
+        for ticker, pos in positions.items():
+            # 1. Migrate last_buy_timestamp if missing (legacy support)
+            if 'last_buy_timestamp' not in pos or not pos.get('last_buy_timestamp'):
+                # Find last BUY from trade_log
+                buys = buys_by_ticker.get(ticker, [])
+                if buys:
+                    last_buy = buys[-1]  # Most recent
+                    pos['last_buy_timestamp'] = last_buy.get('timestamp')
+                    logger.info(f"Migrated {ticker}: last_buy_timestamp from trade_log")
+                else:
+                    # Fail-safe: if we truly don't know, set to NOW so we DON'T violate 24h
+                    pos['last_buy_timestamp'] = datetime.now(timezone.utc).isoformat()
+                    pos['last_buy_timestamp_inferred'] = True
+                    logger.warning(f"Migrated {ticker}: last_buy_timestamp inferred (set to now for safety)")
+                changed = True
+
+            # 2. Migrate entry_timestamp if missing
+            if 'entry_timestamp' not in pos or not pos.get('entry_timestamp'):
+                buys = buys_by_ticker.get(ticker, [])
+                if buys:
+                    first_buy = buys[0]  # Oldest
+                    pos['entry_timestamp'] = first_buy.get('timestamp')
+                else:
+                    pos['entry_timestamp'] = pos.get('last_buy_timestamp')
+                changed = True
+
+            # 3. Migrate to lot-based structure if lots are missing
+            if 'lots' not in pos or not pos.get('lots'):
+                buys = buys_by_ticker.get(ticker, [])
+                shares = pos.get('shares', 0)
+
+                if buys and shares > 0:
+                    # Try to infer lots from trade_log
+                    lots = []
+                    for buy in buys:
+                        ts = buy.get('timestamp')
+                        qty = buy.get('shares', 0)
+                        price = buy.get('price')
+
+                        if ts and qty > 0:
+                            lot = {
+                                'lot_id': f"MIG_{len(lots)+1}",
+                                'qty': qty,
+                                'buy_ts_utc': ts,
+                            }
+                            if price:
+                                lot['buy_price'] = price
+                            lots.append(lot)
+
+                    # Verify total matches position shares
+                    lot_total = sum(lot.get('qty', 0) for lot in lots)
+
+                    if lots and abs(lot_total - shares) < shares * 0.1:  # Within 10%
+                        # Adjust last lot to match position shares exactly
+                        if lot_total != shares and lots:
+                            diff = shares - lot_total
+                            lots[-1]['qty'] += diff
+                        pos['lots'] = lots
+                        logger.info(f"Migrated {ticker}: {len(lots)} lots from trade_log")
+                    else:
+                        # Create synthetic lot (conservative: blocks sells for 24h)
+                        pos['lots'] = [{
+                            'lot_id': 'MIGRATED',
+                            'qty': shares,
+                            'buy_ts_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                            'synthetic': True
+                        }]
+                        logger.warning(
+                            f"Migrated {ticker}: synthetic lot created (conservative - blocks sells for 24h). "
+                            f"Trade log total: {lot_total}, position shares: {shares}"
+                        )
+                elif shares > 0:
+                    # No trade_log entries, create synthetic lot
+                    pos['lots'] = [{
+                        'lot_id': 'MIGRATED',
+                        'qty': shares,
+                        'buy_ts_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                        'synthetic': True
+                    }]
+                    logger.warning(f"Migrated {ticker}: synthetic lot created (no trade_log entries)")
+
+                changed = True
+
+        if changed:
+            self.save()
+            logger.info("Position timestamp and lot migration complete")
+
     def save(self):
         """Save current state to disk with backup.
 
@@ -214,35 +363,75 @@ class StateManager:
 
     def add_position(self, ticker: str, shares: int, price: float,
                      entry_date: str = None, bucket: str = None):
-        """Add or update a position"""
+        """
+        Add or update a position with timestamp tracking AND lot-based tracking.
+
+        CRITICAL: This now uses the lot-based system for proper FIFO 24h hold compliance.
+        Each call creates a new lot, allowing proper per-lot tracking.
+
+        Also maintains legacy fields (entry_timestamp, last_buy_timestamp) for
+        backwards compatibility.
+        """
+        now_utc = self._utc_now_iso()
         if entry_date is None:
             entry_date = datetime.now().date().isoformat()
 
         if ticker in self.state['positions']:
-            # Update existing position (average cost)
+            # Update existing position - use add_buy_lot for proper lot tracking
             existing = self.state['positions'][ticker]
-            old_shares = existing['shares']
-            old_cost = existing['entry_price']
+
+            # Create new lot
+            lot = {
+                'lot_id': self._generate_lot_id(),
+                'qty': shares,
+                'buy_ts_utc': now_utc,
+            }
+            if price is not None:
+                lot['buy_price'] = price
+
+            if 'lots' not in existing:
+                existing['lots'] = []
+            existing['lots'].append(lot)
+
+            # Update average cost
+            old_shares = existing.get('shares', 0)
+            old_cost = existing.get('entry_price', 0)
             new_total_shares = old_shares + shares
-            new_avg_cost = ((old_shares * old_cost) + (shares * price)) / new_total_shares
+            if old_shares > 0 and old_cost > 0:
+                new_avg_cost = ((old_shares * old_cost) + (shares * price)) / new_total_shares
+            else:
+                new_avg_cost = price
+
+            existing['shares'] = new_total_shares
+            existing['entry_price'] = new_avg_cost
+            # Keep original entry_date and entry_timestamp
+            # CRITICAL: Update last_buy_timestamp on EVERY buy for 24h enforcement
+            existing['last_buy_timestamp'] = now_utc
+            if bucket and not existing.get('bucket'):
+                existing['bucket'] = bucket
+        else:
+            # New position with first lot
+            lot = {
+                'lot_id': self._generate_lot_id(),
+                'qty': shares,
+                'buy_ts_utc': now_utc,
+            }
+            if price is not None:
+                lot['buy_price'] = price
 
             self.state['positions'][ticker] = {
-                'shares': new_total_shares,
-                'entry_price': new_avg_cost,
-                'entry_date': existing['entry_date'],  # Keep original date
-                'bucket': bucket or existing.get('bucket'),
-            }
-        else:
-            # New position
-            self.state['positions'][ticker] = {
+                'ticker': ticker,
+                'lots': [lot],
                 'shares': shares,
                 'entry_price': price,
                 'entry_date': entry_date,
+                'entry_timestamp': now_utc,  # First buy timestamp
+                'last_buy_timestamp': now_utc,  # Same as entry for new position
                 'bucket': bucket,
             }
 
         self.save()
-        logger.info(f"Position added/updated: {ticker}")
+        logger.info(f"Position added/updated: {ticker} - {shares} shares, lot created at {now_utc}")
 
     def remove_position(self, ticker: str):
         """Remove a position (after selling)"""
@@ -260,11 +449,390 @@ class StateManager:
                 self.state['positions'][ticker]['shares'] = new_shares
                 self.save()
 
+    # =========================================================================
+    # LOT-BASED POSITION TRACKING (24-HOUR HOLD COMPLIANCE)
+    # =========================================================================
+    def _generate_lot_id(self) -> str:
+        """Generate a short unique lot ID."""
+        return str(uuid.uuid4())[:8]
+
+    def _utc_now_iso(self) -> str:
+        """Get current UTC time in ISO format with Z suffix."""
+        return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+    def get_total_shares(self, ticker: str) -> int:
+        """
+        Get total shares for a ticker by summing all lots.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            Total shares held across all lots
+        """
+        pos = self.state.get('positions', {}).get(ticker)
+        if not pos:
+            return 0
+
+        lots = pos.get('lots', [])
+        if lots:
+            return sum(lot.get('qty', 0) for lot in lots)
+
+        # Fallback to legacy shares field if no lots
+        return pos.get('shares', 0)
+
+    def add_buy_lot(self, ticker: str, qty: int, ts_utc: str = None,
+                    price: float = None, bucket: str = None):
+        """
+        Add a new lot for a BUY transaction.
+
+        Each BUY creates its own timestamped lot for proper 24h hold tracking.
+
+        Args:
+            ticker: Stock ticker symbol
+            qty: Number of shares purchased
+            ts_utc: Buy timestamp in ISO UTC format (defaults to now)
+            price: Buy price per share (optional)
+            bucket: Thematic bucket (optional)
+        """
+        if ts_utc is None:
+            ts_utc = self._utc_now_iso()
+
+        lot = {
+            'lot_id': self._generate_lot_id(),
+            'qty': qty,
+            'buy_ts_utc': ts_utc,
+        }
+        if price is not None:
+            lot['buy_price'] = price
+
+        if ticker not in self.state['positions']:
+            # New position
+            self.state['positions'][ticker] = {
+                'ticker': ticker,
+                'lots': [lot],
+                'shares': qty,  # Keep legacy field in sync
+                'entry_price': price or 0,
+                'entry_date': datetime.now().date().isoformat(),
+                'entry_timestamp': ts_utc,
+                'last_buy_timestamp': ts_utc,
+                'bucket': bucket,
+            }
+        else:
+            # Add to existing position
+            pos = self.state['positions'][ticker]
+            if 'lots' not in pos:
+                pos['lots'] = []
+            pos['lots'].append(lot)
+
+            # Update derived fields
+            pos['shares'] = self.get_total_shares(ticker)
+            pos['last_buy_timestamp'] = ts_utc
+
+            # Update average cost if price provided
+            if price is not None:
+                old_shares = pos.get('shares', 0) - qty
+                old_cost = pos.get('entry_price', 0)
+                if old_shares > 0 and old_cost > 0:
+                    pos['entry_price'] = ((old_shares * old_cost) + (qty * price)) / pos['shares']
+                else:
+                    pos['entry_price'] = price
+
+            if bucket and not pos.get('bucket'):
+                pos['bucket'] = bucket
+
+        self.save()
+        logger.info(f"Added buy lot for {ticker}: {qty} shares at {ts_utc}")
+
+    def eligible_sell_qty(self, ticker: str, now_utc: datetime = None) -> int:
+        """
+        Get number of shares eligible to sell based on 24h + buffer hold.
+
+        A lot is eligible when: now_utc >= buy_ts_utc + MIN_HOLD_SECONDS + BUFFER
+
+        Args:
+            ticker: Stock ticker symbol
+            now_utc: Current UTC time (defaults to now, useful for testing)
+
+        Returns:
+            Number of shares eligible to sell
+        """
+        from config import MIN_HOLD_SECONDS, HOLD_BUFFER_SECONDS
+
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        pos = self.state.get('positions', {}).get(ticker)
+        if not pos:
+            return 0
+
+        lots = pos.get('lots', [])
+        if not lots:
+            # Legacy position without lots - use last_buy_timestamp
+            ts_str = pos.get('last_buy_timestamp') or pos.get('entry_timestamp')
+            if not ts_str:
+                return 0  # Fail-closed: no timestamp = no sell
+
+            buy_ts = self._parse_timestamp_utc(ts_str)
+            if not buy_ts:
+                return 0
+
+            required_hold = MIN_HOLD_SECONDS + HOLD_BUFFER_SECONDS
+            if (now_utc - buy_ts).total_seconds() >= required_hold:
+                return pos.get('shares', 0)
+            return 0
+
+        # Sum eligible lots
+        required_hold = MIN_HOLD_SECONDS + HOLD_BUFFER_SECONDS
+        eligible = 0
+
+        for lot in lots:
+            buy_ts = self._parse_timestamp_utc(lot.get('buy_ts_utc', ''))
+            if not buy_ts:
+                continue  # Skip lots without valid timestamps
+
+            if (now_utc - buy_ts).total_seconds() >= required_hold:
+                eligible += lot.get('qty', 0)
+
+        return eligible
+
+    def earliest_eligible_time(self, ticker: str, now_utc: datetime = None) -> Optional[str]:
+        """
+        Get the earliest time when ineligible shares become eligible.
+
+        Useful for logging: "Blocked: 0 eligible shares. Earliest eligible at 10:12:31 ET."
+
+        Args:
+            ticker: Stock ticker symbol
+            now_utc: Current UTC time (defaults to now)
+
+        Returns:
+            ISO timestamp of earliest eligible time, or None if all eligible/no position
+        """
+        from config import MIN_HOLD_SECONDS, HOLD_BUFFER_SECONDS
+
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        pos = self.state.get('positions', {}).get(ticker)
+        if not pos:
+            return None
+
+        lots = pos.get('lots', [])
+        if not lots:
+            # Legacy position without lots
+            ts_str = pos.get('last_buy_timestamp') or pos.get('entry_timestamp')
+            if not ts_str:
+                return None
+
+            buy_ts = self._parse_timestamp_utc(ts_str)
+            if not buy_ts:
+                return None
+
+            required_hold = MIN_HOLD_SECONDS + HOLD_BUFFER_SECONDS
+            eligible_time = buy_ts + timedelta(seconds=required_hold)
+
+            if eligible_time > now_utc:
+                return eligible_time.isoformat().replace('+00:00', 'Z')
+            return None
+
+        # Find earliest eligibility among ineligible lots
+        required_hold = MIN_HOLD_SECONDS + HOLD_BUFFER_SECONDS
+        earliest = None
+
+        for lot in lots:
+            buy_ts = self._parse_timestamp_utc(lot.get('buy_ts_utc', ''))
+            if not buy_ts:
+                continue
+
+            eligible_time = buy_ts + timedelta(seconds=required_hold)
+
+            # Only consider future eligibility times
+            if eligible_time > now_utc:
+                if earliest is None or eligible_time < earliest:
+                    earliest = eligible_time
+
+        if earliest:
+            return earliest.isoformat().replace('+00:00', 'Z')
+        return None
+
+    def consume_sell_fifo(self, ticker: str, sell_qty: int, now_utc: datetime = None) -> bool:
+        """
+        Consume shares from eligible lots in FIFO order for a SELL.
+
+        CRITICAL: This function will RAISE an exception if insufficient eligible
+        shares are available. This is fail-closed for compliance.
+
+        Args:
+            ticker: Stock ticker symbol
+            sell_qty: Number of shares to sell
+            now_utc: Current UTC time (defaults to now)
+
+        Returns:
+            True if successful
+
+        Raises:
+            ValueError: If insufficient eligible shares
+        """
+        from config import MIN_HOLD_SECONDS, HOLD_BUFFER_SECONDS
+
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        pos = self.state.get('positions', {}).get(ticker)
+        if not pos:
+            raise ValueError(f"No position found for {ticker}")
+
+        lots = pos.get('lots', [])
+        if not lots:
+            # Legacy position - check if can sell all
+            eligible = self.eligible_sell_qty(ticker, now_utc)
+            if eligible < sell_qty:
+                raise ValueError(
+                    f"Insufficient eligible shares for {ticker}: "
+                    f"need {sell_qty}, have {eligible} eligible"
+                )
+            # For legacy positions, just update shares
+            pos['shares'] = pos.get('shares', 0) - sell_qty
+            if pos['shares'] <= 0:
+                del self.state['positions'][ticker]
+            self.save()
+            return True
+
+        # Check total eligible
+        eligible = self.eligible_sell_qty(ticker, now_utc)
+        if eligible < sell_qty:
+            earliest = self.earliest_eligible_time(ticker, now_utc)
+            raise ValueError(
+                f"Insufficient eligible shares for {ticker}: "
+                f"need {sell_qty}, have {eligible} eligible. "
+                f"Earliest eligible: {earliest}"
+            )
+
+        # Sort lots by buy timestamp (oldest first = FIFO)
+        required_hold = MIN_HOLD_SECONDS + HOLD_BUFFER_SECONDS
+        eligible_lots = []
+
+        for i, lot in enumerate(lots):
+            buy_ts = self._parse_timestamp_utc(lot.get('buy_ts_utc', ''))
+            if buy_ts and (now_utc - buy_ts).total_seconds() >= required_hold:
+                eligible_lots.append((buy_ts, i, lot))
+
+        # Sort by timestamp (oldest first)
+        eligible_lots.sort(key=lambda x: x[0])
+
+        # Consume FIFO
+        remaining_to_sell = sell_qty
+        lots_to_remove = []
+
+        for _, idx, lot in eligible_lots:
+            if remaining_to_sell <= 0:
+                break
+
+            lot_qty = lot.get('qty', 0)
+            if lot_qty <= remaining_to_sell:
+                # Consume entire lot
+                remaining_to_sell -= lot_qty
+                lots_to_remove.append(idx)
+            else:
+                # Partial consumption
+                lot['qty'] = lot_qty - remaining_to_sell
+                remaining_to_sell = 0
+
+        # Remove fully consumed lots (in reverse order to preserve indices)
+        for idx in sorted(lots_to_remove, reverse=True):
+            lots.pop(idx)
+
+        # Update derived fields
+        pos['lots'] = lots
+        pos['shares'] = sum(lot.get('qty', 0) for lot in lots)
+
+        # Remove position if no shares remain
+        if pos['shares'] <= 0:
+            del self.state['positions'][ticker]
+
+        self.save()
+        logger.info(f"Consumed {sell_qty} shares from {ticker} (FIFO), {pos.get('shares', 0)} remaining")
+        return True
+
+    def get_lots(self, ticker: str) -> List[Dict]:
+        """
+        Get all lots for a ticker.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            List of lot dictionaries
+        """
+        pos = self.state.get('positions', {}).get(ticker)
+        if not pos:
+            return []
+        return pos.get('lots', [])
+
+    def has_any_recent_buy(self, ticker: str, now_utc: datetime = None) -> Tuple[bool, str]:
+        """
+        Check if there was ANY buy within the hold period (STRICT_TICKER mode).
+
+        In STRICT_TICKER mode, if any lot is younger than the hold threshold,
+        ALL sells are blocked for that ticker.
+
+        Args:
+            ticker: Stock ticker symbol
+            now_utc: Current UTC time (defaults to now)
+
+        Returns:
+            Tuple of (has_recent_buy, reason_string)
+        """
+        from config import MIN_HOLD_SECONDS, HOLD_BUFFER_SECONDS
+
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        pos = self.state.get('positions', {}).get(ticker)
+        if not pos:
+            return False, "No position"
+
+        lots = pos.get('lots', [])
+        required_hold = MIN_HOLD_SECONDS + HOLD_BUFFER_SECONDS
+
+        if not lots:
+            # Legacy position - use last_buy_timestamp
+            ts_str = pos.get('last_buy_timestamp') or pos.get('entry_timestamp')
+            if not ts_str:
+                return True, "No buy timestamp (fail-closed)"
+
+            buy_ts = self._parse_timestamp_utc(ts_str)
+            if not buy_ts:
+                return True, "Unparseable buy timestamp"
+
+            elapsed = (now_utc - buy_ts).total_seconds()
+            if elapsed < required_hold:
+                remaining_hours = (required_hold - elapsed) / 3600
+                return True, f"Last buy {remaining_hours:.1f}h ago (need 24h + buffer)"
+            return False, "All buys older than 24h + buffer"
+
+        # Check all lots
+        youngest_elapsed = float('inf')
+        for lot in lots:
+            buy_ts = self._parse_timestamp_utc(lot.get('buy_ts_utc', ''))
+            if not buy_ts:
+                return True, "Lot with no timestamp (fail-closed)"
+
+            elapsed = (now_utc - buy_ts).total_seconds()
+            youngest_elapsed = min(youngest_elapsed, elapsed)
+
+            if elapsed < required_hold:
+                remaining_hours = (required_hold - elapsed) / 3600
+                return True, f"Recent buy {remaining_hours:.1f}h ago (need 24h + buffer)"
+
+        return False, "All lots older than 24h + buffer"
+
     def log_trade(self, ticker: str, action: str, shares: int,
                   price: float, reason: str = ''):
-        """Log a completed trade"""
+        """Log a completed trade with UTC timestamp for compliance."""
         trade = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),  # UTC for consistency
             'ticker': ticker,
             'action': action,
             'shares': shares,

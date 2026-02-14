@@ -78,7 +78,8 @@ from scoring import (
 )
 from validators import (
     get_vix_regime, get_market_regime, validate_holding_period,
-    validate_price, can_buy, can_sell, validate_trade_count
+    validate_price, can_buy, can_sell, validate_trade_count,
+    can_sell_with_lots, validate_holding_period_lots
 )
 from utils import (
     calculate_limit_price, calculate_shares_for_allocation,
@@ -397,11 +398,18 @@ def execute_normal_mode(
         shares = position.get('shares', 0)
         pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
 
-        # Check holding period
-        can_sell_now, hold_reason = validate_holding_period(position)
-        if not can_sell_now:
+        # Check holding period using lot-based validation
+        can_sell_lots, eligible_qty, hold_reason = can_sell_with_lots(
+            ticker, shares, state, now_utc=None
+        )
+        if not can_sell_lots:
             logger.debug(f"{ticker}: {hold_reason}")
             continue
+
+        # Use eligible quantity (may be less than full position in LOT_FIFO mode)
+        if eligible_qty < shares:
+            logger.info(f"{ticker}: Only {eligible_qty}/{shares} shares eligible to sell")
+            shares = eligible_qty  # Sell only eligible shares
 
         # Check for RISK EXIT triggers (these happen daily)
         sell_reason = None
@@ -467,9 +475,12 @@ def execute_normal_mode(
             if any(t == ticker for t, _ in sells_executed):
                 continue
 
-            # Validate we can sell
+            # Validate we can sell using lot-based validation
             position = positions.get(ticker, {})
-            can_sell_result, checks = can_sell(ticker, position, positions, state.get_trades_used())
+            can_sell_result, checks = can_sell(
+                ticker, position, positions, state.get_trades_used(),
+                state_manager=state  # Enable lot-based validation
+            )
             if not can_sell_result:
                 logger.debug(f"{ticker}: Cannot sell - {checks}")
                 continue
@@ -756,10 +767,18 @@ def execute_risk_off_mode(
         shares = position.get('shares', 0)
         pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
 
-        # Check holding period
-        can_sell_now, _ = validate_holding_period(position)
-        if not can_sell_now:
+        # Check holding period using lot-based validation
+        can_sell_lots, eligible_qty, hold_reason = can_sell_with_lots(
+            ticker, shares, state, now_utc=None
+        )
+        if not can_sell_lots:
+            logger.debug(f"{ticker}: {hold_reason}")
             continue
+
+        # Use eligible quantity (may be less than full position)
+        if eligible_qty < shares:
+            logger.info(f"{ticker}: Only {eligible_qty}/{shares} shares eligible (risk-off)")
+            shares = eligible_qty
 
         # Tightened stop-loss in risk-off
         if pnl_pct <= -tightened_stop:

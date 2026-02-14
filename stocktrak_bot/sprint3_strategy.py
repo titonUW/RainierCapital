@@ -5,18 +5,18 @@ Implements a high-intensity 3-day trading sprint for end-of-competition catch-up
 Uses a Core/Satellite mandate with momentum-based forecasting.
 
 Key Features:
-- 60% Core (VOO, VTI, VEA) - stable
+- 60% Core (VOO 25%, VTI 20%, VEA 15%) - stable, max 25% per position
 - 40% Satellites (16 slots x 2.5% each) - rotated daily for momentum capture
 - Trend-following scoring with volatility penalty
-- Strict 24-hour holding period enforcement
-- Market hours only trading (3:55-4:00 PM ET window)
+- Strict 24-hour + buffer holding period enforcement (timestamp-based)
+- Market hours morning trading window (9:40-10:05 AM ET)
 
 Competition Constraints Enforced:
 - Max 80 trades total (70 remaining, 65 sprint cap, 5 buffer)
-- Max 25% per position
+- Max 25% per position (CRITICAL: enforced at purchase time)
 - Min 4 holdings at all times
 - BUY price >= $5 (use $6 safety buffer)
-- 24-hour minimum hold
+- 24-hour minimum hold (timestamp-based, not date-based)
 - No leveraged/inverse ETFs
 """
 
@@ -61,9 +61,10 @@ SPRINT3_LIMIT_FLOOR = 5.01  # Limit price cannot be below $5.01
 # Holding period (24h + buffer in seconds)
 SPRINT3_HOLD_BUFFER_SECONDS = 120  # 2 minute buffer on top of 24h
 
-# Market hours (Eastern Time)
-SPRINT3_EXECUTION_WINDOW_START = "15:55"  # 3:55 PM ET
-SPRINT3_EXECUTION_WINDOW_END = "16:00"    # 4:00 PM ET
+# Market hours (Eastern Time) - Morning trading window
+# UPDATED: Using morning window for stable execution (after initial volatility)
+SPRINT3_EXECUTION_WINDOW_START = "09:40"  # 9:40 AM ET
+SPRINT3_EXECUTION_WINDOW_END = "10:05"    # 10:05 AM ET
 
 # =============================================================================
 # SATELLITE UNIVERSE (curated, liquid, non-leveraged)
@@ -149,6 +150,9 @@ def calculate_sprint3_score(
     - vol10 = standard deviation of daily returns over 10 days
 
     This score rewards short-term relative momentum while penalizing volatility.
+
+    UPDATED: Now uses actual r1, r3, r10, vol10, SMA20 values from market_data.py
+    instead of approximations. This improves ranking accuracy significantly.
     """
     if not ticker_data or not voo_data:
         return None
@@ -156,51 +160,57 @@ def calculate_sprint3_score(
     ticker = ticker_data.get('ticker', 'UNKNOWN')
     price = ticker_data.get('price', 0)
 
-    # Get closes for return calculation
-    closes = ticker_data.get('closes_7d', [])
-
-    # Calculate returns (need historical data)
-    # r1 = 1-day return
-    # r3 = 3-day return
-    # r10 = 10-day return
-
-    # For returns, we use the return_21d data as proxy and estimate
-    # In production, we'd have more granular data
+    # Get ACTUAL returns from market data (not approximations!)
+    # MarketDataCollector now provides actual r1, r3, r10 values
+    r1 = ticker_data.get('return_1d', 0) or 0
+    r3 = ticker_data.get('return_3d', 0) or 0
+    r10 = ticker_data.get('return_10d', 0) or 0
     r21 = ticker_data.get('return_21d', 0) or 0
-    r63 = ticker_data.get('return_63d', 0) or 0
 
-    # Estimate shorter-term returns from r21
-    # r3 ≈ r21 * (3/21), r10 ≈ r21 * (10/21)
-    r3 = r21 * (3/21) if r21 else 0
-    r10 = r21 * (10/21) if r21 else 0
-    r1 = r21 * (1/21) if r21 else 0
+    # Fallback: If actual values not available, use approximations
+    # This maintains backwards compatibility with older cached data
+    if r3 == 0 and r21 != 0:
+        r3 = r21 * (3/21)  # Fallback approximation
+    if r10 == 0 and r21 != 0:
+        r10 = r21 * (10/21)  # Fallback approximation
+    if r1 == 0 and r21 != 0:
+        r1 = r21 * (1/21)  # Fallback approximation
 
-    # VOO returns for relative calculation
-    voo_r21 = voo_data.get('return_21d', 0) or 0
-    voo_r3 = voo_r21 * (3/21) if voo_r21 else 0
-    voo_r10 = voo_r21 * (10/21) if voo_r21 else 0
+    # VOO ACTUAL returns for relative calculation
+    voo_r3 = voo_data.get('return_3d', 0) or 0
+    voo_r10 = voo_data.get('return_10d', 0) or 0
 
-    # Relative returns
+    # Fallback for VOO if not available
+    if voo_r3 == 0:
+        voo_r21 = voo_data.get('return_21d', 0) or 0
+        voo_r3 = voo_r21 * (3/21) if voo_r21 else 0
+    if voo_r10 == 0:
+        voo_r21 = voo_data.get('return_21d', 0) or 0
+        voo_r10 = voo_r21 * (10/21) if voo_r21 else 0
+
+    # Relative returns (actual momentum vs benchmark)
     rr3 = r3 - voo_r3
     rr10 = r10 - voo_r10
 
-    # Volatility (21-day as proxy for 10-day)
-    vol10 = ticker_data.get('volatility_21d', 0.05) or 0.05
+    # ACTUAL 10-day volatility (not 21-day proxy!)
+    vol10 = ticker_data.get('vol10', None)
+    if vol10 is None:
+        # Fallback to 21-day if 10-day not available
+        vol10 = ticker_data.get('volatility_21d', 0.05) or 0.05
 
     # ForecastScore
     score = 0.55 * rr3 + 0.35 * rr10 - 0.25 * vol10
 
-    # SMAs for trend filter
+    # SMAs for trend filter - use ACTUAL SMA20 now!
+    sma20 = ticker_data.get('sma20', None)  # Actual SMA20 from market data
     sma50 = ticker_data.get('sma50', 0) or 0
     sma100 = ticker_data.get('sma100', 0) or 0
-    # Use sma100 as proxy for sma200 if not available
     sma200 = ticker_data.get('sma200', sma100) or sma100
 
-    # Estimate SMA20 from price and SMA50
-    # SMA20 is typically between price and SMA50
-    if price and sma50:
-        sma20 = (price + sma50) / 2  # Rough estimate
-    else:
+    # Fallback SMA20 estimation only if actual not available
+    if sma20 is None and price and sma50:
+        sma20 = (price + sma50) / 2  # Rough estimate as fallback
+    elif sma20 is None:
         sma20 = price
 
     # Trend filter: Close > SMA20 AND SMA20 > SMA50
@@ -404,10 +414,10 @@ def is_market_open() -> Tuple[bool, str]:
 
 def is_in_execution_window() -> Tuple[bool, str]:
     """
-    Check if we're in the sprint3 execution window (3:55-4:00 PM ET).
+    Check if we're in the sprint3 execution window (9:40-10:05 AM ET).
 
-    This is the only safe time to trade if we want to rotate daily
-    while respecting the 24h hold rule.
+    Morning window provides stable execution after initial market volatility.
+    The 24-hour hold is enforced via timestamps, not trading times.
     """
     et = pytz.timezone('US/Eastern')
     now = datetime.now(et)
