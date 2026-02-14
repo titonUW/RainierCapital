@@ -70,6 +70,8 @@ class StateManager:
         self.state = self._load_state()
         # Migrate positions to include timestamps (one-time migration)
         self._migrate_position_timestamps()
+        # Validate HOLD_MODE consistency (FIX: prevent mode/lot mismatch)
+        self._validate_hold_mode_consistency()
 
     def _load_state(self) -> Dict:
         """Load state from disk or initialize fresh state.
@@ -268,23 +270,61 @@ class StateManager:
                         pos['lots'] = lots
                         logger.info(f"Migrated {ticker}: {len(lots)} lots from trade_log")
                     else:
-                        # Create synthetic lot (conservative: blocks sells for 24h)
+                        # Create synthetic lot using entry_date if available
+                        # FIX: Use entry_date + 25h to ensure old positions remain sellable
+                        # instead of NOW which blocks sells for 24h on known-old positions
+                        entry_date_str = pos.get('entry_date')
+                        if entry_date_str:
+                            # Use entry_date + 25 hours (guarantees it's past 24h hold)
+                            try:
+                                entry_dt = datetime.fromisoformat(entry_date_str)
+                                if entry_dt.tzinfo is None:
+                                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                                synthetic_ts = (entry_dt + timedelta(hours=25)).isoformat().replace('+00:00', 'Z')
+                                logger.info(
+                                    f"Migrated {ticker}: synthetic lot using entry_date + 25h = {synthetic_ts}"
+                                )
+                            except Exception as e:
+                                # Fallback to NOW if entry_date unparseable
+                                synthetic_ts = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+                                logger.warning(f"Could not parse entry_date for {ticker}: {e}, using NOW")
+                        else:
+                            # No entry_date - conservative fallback to NOW (blocks sells for 24h)
+                            synthetic_ts = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+                            logger.warning(f"Migrated {ticker}: no entry_date, using NOW (conservative)")
+
                         pos['lots'] = [{
                             'lot_id': 'MIGRATED',
                             'qty': shares,
-                            'buy_ts_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                            'buy_ts_utc': synthetic_ts,
                             'synthetic': True
                         }]
                         logger.warning(
-                            f"Migrated {ticker}: synthetic lot created (conservative - blocks sells for 24h). "
+                            f"Migrated {ticker}: synthetic lot created. "
                             f"Trade log total: {lot_total}, position shares: {shares}"
                         )
                 elif shares > 0:
                     # No trade_log entries, create synthetic lot
+                    # FIX: Use entry_date if available to avoid blocking old positions
+                    entry_date_str = pos.get('entry_date')
+                    if entry_date_str:
+                        try:
+                            entry_dt = datetime.fromisoformat(entry_date_str)
+                            if entry_dt.tzinfo is None:
+                                entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                            synthetic_ts = (entry_dt + timedelta(hours=25)).isoformat().replace('+00:00', 'Z')
+                            logger.info(f"Migrated {ticker}: using entry_date + 25h = {synthetic_ts}")
+                        except Exception as e:
+                            synthetic_ts = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+                            logger.warning(f"Could not parse entry_date for {ticker}: {e}, using NOW")
+                    else:
+                        synthetic_ts = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+                        logger.warning(f"No entry_date for {ticker}, using NOW (conservative)")
+
                     pos['lots'] = [{
                         'lot_id': 'MIGRATED',
                         'qty': shares,
-                        'buy_ts_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                        'buy_ts_utc': synthetic_ts,
                         'synthetic': True
                     }]
                     logger.warning(f"Migrated {ticker}: synthetic lot created (no trade_log entries)")
@@ -294,6 +334,54 @@ class StateManager:
         if changed:
             self.save()
             logger.info("Position timestamp and lot migration complete")
+
+    def _validate_hold_mode_consistency(self):
+        """
+        Validate HOLD_MODE configuration is consistent with actual lot data.
+
+        FIX: Detect and warn if HOLD_MODE setting conflicts with lot structure.
+
+        - STRICT_TICKER mode expects all positions to behave as single-lot
+        - LOT_FIFO mode supports multiple lots per position
+
+        If there's a mismatch (e.g., STRICT_TICKER with multi-lot positions),
+        log a warning but don't block (let the bot continue with warnings).
+        """
+        from config import HOLD_MODE
+
+        positions = self.state.get('positions', {})
+        if not positions:
+            return  # Nothing to validate
+
+        multi_lot_tickers = []
+        no_lot_tickers = []
+
+        for ticker, pos in positions.items():
+            lots = pos.get('lots', [])
+            if len(lots) > 1:
+                multi_lot_tickers.append((ticker, len(lots)))
+            elif len(lots) == 0 and pos.get('shares', 0) > 0:
+                no_lot_tickers.append(ticker)
+
+        # Log validation results
+        if HOLD_MODE == "STRICT_TICKER" and multi_lot_tickers:
+            logger.warning("=" * 60)
+            logger.warning("HOLD_MODE CONSISTENCY WARNING")
+            logger.warning("=" * 60)
+            logger.warning(f"HOLD_MODE is set to STRICT_TICKER but {len(multi_lot_tickers)} "
+                          f"positions have multiple lots:")
+            for ticker, lot_count in multi_lot_tickers:
+                logger.warning(f"  {ticker}: {lot_count} lots")
+            logger.warning("In STRICT_TICKER mode, ANY recent buy blocks ALL sells for that ticker.")
+            logger.warning("Consider switching to LOT_FIFO mode for proper per-lot tracking.")
+            logger.warning("=" * 60)
+
+        if no_lot_tickers:
+            logger.info(f"Positions without lot data (legacy): {no_lot_tickers}")
+            logger.info("These will use last_buy_timestamp for hold validation.")
+
+        if not multi_lot_tickers and not no_lot_tickers:
+            logger.debug(f"HOLD_MODE consistency check passed: {HOLD_MODE}")
 
     def save(self):
         """Save current state to disk with backup.
@@ -868,6 +956,32 @@ class StateManager:
         """Check if we already executed today"""
         today = datetime.now().date().isoformat()
         return self.state.get('last_execution_date') == today
+
+    def check_and_mark_execution(self) -> bool:
+        """
+        Atomically check if already executed today and mark as executed.
+
+        FIX: Prevents race condition when bot runs twice simultaneously.
+        Uses file lock to ensure check-and-mark is atomic.
+
+        Returns:
+            True if this is the first execution today (and it's now marked).
+            False if already executed today (another instance got there first).
+        """
+        with _state_file_lock:
+            today = datetime.now().date().isoformat()
+            if self.state.get('last_execution_date') == today:
+                logger.info("Already executed today (atomic check)")
+                return False
+
+            # First execution today - mark it immediately
+            now = datetime.now()
+            self.state['last_execution_date'] = now.date().isoformat()
+            self.state['last_execution_time'] = now.time().isoformat()
+            self.state['execution_count'] = self.state.get('execution_count', 0) + 1
+            self.save()  # Save while holding lock
+            logger.info("Marked as executed (atomic check-and-mark)")
+            return True
 
     def already_submitted_today(self, ticker: str, action: str, shares: int, price: float) -> bool:
         """

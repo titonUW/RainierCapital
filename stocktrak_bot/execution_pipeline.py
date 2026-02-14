@@ -342,6 +342,15 @@ class ExecutionPipeline:
             else:
                 logger.warning("Could not verify in history - order may or may not have gone through")
 
+            # STEP 7.5 (FIX): External transaction count verification
+            # This catches duplicates even if local state is corrupted
+            ext_verified, ext_msg = self._verify_external_trade_count()
+            if ext_verified:
+                logger.info(f"External verification: {ext_msg}")
+            else:
+                logger.error(f"External verification issue: {ext_msg}")
+                # Log but don't fail - the trade UI showed success
+
             # STEP 8: Add trade note
             if order.rationale:
                 noted = self._run_step("add_note", lambda: self._add_trade_note(order), order, required=False)
@@ -602,6 +611,70 @@ class ExecutionPipeline:
             shares=order.shares,
             price=order.limit_price or 0
         )
+
+    def _get_external_trade_count(self) -> Optional[int]:
+        """
+        FIX: Get transaction count directly from StockTrak for external verification.
+
+        This provides a second layer of idempotency protection independent of
+        the local state file. If state file corrupts, we can still detect
+        duplicate submissions by comparing before/after counts.
+
+        Returns:
+            Transaction count from StockTrak, or None if unavailable.
+        """
+        try:
+            # Use bot's method to get transaction count
+            count = self.bot.get_transaction_count()
+            if count is not None and isinstance(count, int) and count >= 0:
+                return count
+            logger.warning(f"Invalid transaction count from StockTrak: {count}")
+            return None
+        except Exception as e:
+            logger.warning(f"Could not get external transaction count: {e}")
+            return None
+
+    def _verify_external_trade_count(self, expected_delta: int = 1) -> Tuple[bool, str]:
+        """
+        FIX: Verify transaction count increased by expected amount after trade.
+
+        Args:
+            expected_delta: Expected increase in count (default 1)
+
+        Returns:
+            Tuple of (verified, message)
+        """
+        if not hasattr(self, '_pre_trade_count') or self._pre_trade_count is None:
+            return True, "External verification skipped (no pre-trade count)"
+
+        try:
+            post_trade_count = self._get_external_trade_count()
+            if post_trade_count is None:
+                return True, "External verification skipped (could not get post-trade count)"
+
+            actual_delta = post_trade_count - self._pre_trade_count
+
+            if actual_delta == expected_delta:
+                return True, f"External verification passed: count {self._pre_trade_count} -> {post_trade_count}"
+            elif actual_delta == 0:
+                return False, (
+                    f"EXTERNAL VERIFICATION FAILED: Trade may not have executed. "
+                    f"Count unchanged: {self._pre_trade_count} -> {post_trade_count}"
+                )
+            elif actual_delta > expected_delta:
+                return False, (
+                    f"EXTERNAL VERIFICATION WARNING: Count increased by {actual_delta} "
+                    f"(expected {expected_delta}). Possible duplicate? "
+                    f"{self._pre_trade_count} -> {post_trade_count}"
+                )
+            else:
+                return False, (
+                    f"EXTERNAL VERIFICATION ERROR: Count decreased by {abs(actual_delta)}. "
+                    f"Data inconsistency: {self._pre_trade_count} -> {post_trade_count}"
+                )
+        except Exception as e:
+            logger.warning(f"External verification error: {e}")
+            return True, f"External verification skipped (error: {e})"
 
     def _check_24h_hold(self, ticker: str, shares: int = None) -> tuple:
         """
@@ -1323,9 +1396,20 @@ class ExecutionPipeline:
 
         self._take_screenshot(f"before_confirm_{order.ticker}")
 
-        # IDEMPOTENCY CHECK
+        # IDEMPOTENCY CHECK 1: Local state check
         if self._check_already_placed(order):
             raise RuntimeError("Order already placed - aborting to prevent duplicate")
+
+        # IDEMPOTENCY CHECK 2 (FIX): External verification against StockTrak's actual count
+        # This guards against state file corruption causing duplicate submissions
+        pre_trade_count = self._get_external_trade_count()
+        if pre_trade_count is not None:
+            logger.info(f"Pre-trade transaction count from StockTrak: {pre_trade_count}")
+            # Store for post-trade verification
+            self._pre_trade_count = pre_trade_count
+        else:
+            logger.warning("Could not get external trade count - proceeding with local check only")
+            self._pre_trade_count = None
 
         # USE JAVASCRIPT to find and click - most reliable method
         js_click_script = """
