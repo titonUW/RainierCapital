@@ -348,6 +348,17 @@ def is_friday() -> bool:
     return datetime.now().weekday() == 4  # Monday=0, Friday=4
 
 
+def is_sprint_rotation_day() -> bool:
+    """
+    In SPRINT mode, allow rotations any day (not just Fridays).
+    This is critical for final week catch-up.
+    """
+    from config import SPRINT_MODE_ENABLED
+    if SPRINT_MODE_ENABLED:
+        return True  # Every day is rotation day in sprint mode
+    return is_friday()
+
+
 def execute_normal_mode(
     bot: StockTrakBot,
     state: StateManager,
@@ -371,10 +382,17 @@ def execute_normal_mode(
     positions = state.get_positions()
     vix_regime = get_vix_regime(vix_level)
     regime_params = REGIME_PARAMS[vix_regime]
-    friday = is_friday()
 
-    if friday:
-        logger.info("FRIDAY - Discretionary rotations ENABLED")
+    # SPRINT MODE: Allow rotations any day, not just Fridays
+    rotation_day = is_sprint_rotation_day()
+    friday = is_friday()  # Keep for logging
+
+    if rotation_day:
+        from config import SPRINT_MODE_ENABLED
+        if SPRINT_MODE_ENABLED and not friday:
+            logger.info("SPRINT MODE - Daily discretionary rotations ENABLED")
+        else:
+            logger.info("FRIDAY - Discretionary rotations ENABLED")
     else:
         logger.info("NON-FRIDAY - Risk exits only (no discretionary rotations)")
 
@@ -433,8 +451,8 @@ def execute_normal_mode(
             sell_reason = "TREND_BREAK"
             is_risk_exit = True
 
-        # 4. Stale money (held 15+ days with <2% gain) - FRIDAY ONLY
-        if friday and not sell_reason:
+        # 4. Stale money (held 15+ days with <2% gain) - ROTATION DAY ONLY
+        if rotation_day and not sell_reason:
             entry_date_str = position.get('entry_date')
             if entry_date_str:
                 from utils import get_trading_days_between
@@ -444,8 +462,8 @@ def execute_normal_mode(
                     sell_reason = "STALE_MONEY"
                     is_risk_exit = False  # Discretionary, not risk
 
-        # Execute sell if triggered (risk exits daily, stale money Friday only)
-        if sell_reason and (is_risk_exit or friday):
+        # Execute sell if triggered (risk exits daily, stale money on rotation days)
+        if sell_reason and (is_risk_exit or rotation_day):
             # Validate trade count
             trade_valid, _ = validate_trade_count(state.get_trades_used(), is_new_buy=False)
             if not trade_valid:
@@ -467,9 +485,9 @@ def execute_normal_mode(
                 # Increased delay between trades to prevent StockTrak rate limiting
                 time.sleep(5)
 
-    # ===== STEP 2: Check for profit-taking (FRIDAY ONLY) =====
-    if friday:
-        logger.info("Checking for profit-taking opportunities (Friday discretionary)...")
+    # ===== STEP 2: Check for profit-taking (ROTATION DAYS) =====
+    if rotation_day:
+        logger.info("Checking for profit-taking opportunities (discretionary)...")
 
         double7_highs = get_double7_sell_candidates(market_data, positions)
         for ticker, reason in double7_highs:
@@ -509,10 +527,11 @@ def execute_normal_mode(
                 # Increased delay between trades to prevent StockTrak rate limiting
                 time.sleep(5)
     else:
-        logger.info("Skipping profit-taking (non-Friday)")
+        logger.info("Skipping profit-taking (not a rotation day)")
 
-    # ===== STEP 3: Look for new entry opportunities (FRIDAY ONLY for discretionary) =====
-    # Exceptions that allow non-Friday entries:
+    # ===== STEP 3: Look for new entry opportunities (ROTATION DAYS for discretionary) =====
+    # In SPRINT MODE: entries allowed any day
+    # Exceptions that allow non-rotation-day entries:
     #   1. Emergency replacement if risk exit created empty bucket
     #   2. DAY-1 CONTINUATION: If we're missing satellite buckets from incomplete Day-1 build
 
@@ -559,15 +578,15 @@ def execute_normal_mode(
             logger.info(f"DAY-1 CONTINUATION MODE: {len(missing_buckets)} satellite buckets missing")
             logger.info(f"Missing buckets: {sorted(missing_buckets)}")
 
-    if friday:
-        logger.info("Looking for new entry opportunities (Friday discretionary)...")
+    if rotation_day:
+        logger.info("Looking for new entry opportunities (discretionary rotation)...")
     elif need_emergency_replacement:
         logger.info("Looking for emergency replacement (maintain min holdings)...")
     elif need_day1_continuation:
         logger.info("Looking to complete Day-1 portfolio build (fill missing buckets)...")
     else:
-        logger.info("Skipping new entries (non-Friday, no emergency, Day-1 complete)")
-        logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys (non-Friday)")
+        logger.info("Skipping new entries (not rotation day, no emergency, Day-1 complete)")
+        logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys")
         return
 
     # Check if we should buy (have room and budget)
@@ -580,7 +599,7 @@ def execute_normal_mode(
         logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys")
         return
 
-    if friday and week_replacements >= weekly_cap:
+    if rotation_day and week_replacements >= weekly_cap:
         logger.info(f"At weekly cap ({week_replacements}/{weekly_cap})")
         logger.info(f"Session summary: {len(sells_executed)} sells, 0 buys")
         return
@@ -591,7 +610,7 @@ def execute_normal_mode(
         return
 
     # Get candidates - prioritize replacing sold buckets to maintain 1/N structure
-    if friday:
+    if rotation_day:
         buy_candidates = get_double7_buy_candidates(market_data, positions, vix_level)
     elif need_day1_continuation:
         # DAY-1 CONTINUATION: Fill missing satellite buckets to complete initial build
@@ -685,9 +704,9 @@ def execute_normal_mode(
             continue
 
         # Execute buy using stall-proof pipeline
-        if friday:
+        if rotation_day:
             entry_type = "DISCRETIONARY"
-            rationale = 'DOUBLE7_ENTRY'
+            rationale = 'MOMENTUM_ENTRY'
         elif need_day1_continuation:
             entry_type = "DAY1_CONTINUATION"
             rationale = f'FILL_BUCKET_{candidate.bucket}'
@@ -735,12 +754,12 @@ def execute_normal_mode(
                 break
             if state.get_trades_used() >= HARD_STOP_TRADES:
                 break
-            if friday and week_replacements >= weekly_cap:
+            if rotation_day and week_replacements >= weekly_cap:
                 break
             if need_day1_continuation and len(missing_buckets) == 0:
                 logger.info("Day-1 portfolio build COMPLETE - all buckets filled!")
                 break
-            if not friday and not need_day1_continuation and len(positions) >= 4:
+            if not rotation_day and not need_day1_continuation and len(positions) >= 4:
                 # Emergency replacement complete (old behavior)
                 break
 
