@@ -86,6 +86,7 @@ from utils import (
     format_currency, is_trading_day, get_current_time_et
 )
 from execution_pipeline import ExecutionPipeline, TradeOrder, TradeResult
+from queue_manager import QueueManager, organize_order_queue
 
 logger = logging.getLogger('stocktrak_bot.daily_routine')
 
@@ -257,6 +258,31 @@ def _execute_daily_routine_inner(state: StateManager) -> 'StockTrakBot':
 
     # Sync state with StockTrak
     sync_state_with_stocktrak(state, stocktrak_holdings, trade_count)
+
+    # ==========================================================================
+    # QUEUE MANAGEMENT: Automatically organize and clean up pending orders
+    # ==========================================================================
+    logger.info("Checking and organizing order queue...")
+    try:
+        queue_manager = QueueManager(bot, state)
+        queue_healthy, audit_result = queue_manager.organize_queue(
+            auto_cancel_duplicates=True,  # Remove duplicate orders automatically
+            auto_cancel_invalid=False     # Don't auto-cancel invalid (log only)
+        )
+
+        if not queue_healthy:
+            logger.warning(f"Queue issues detected: {len(audit_result.warnings)} warnings")
+            for warning in audit_result.warnings[:5]:  # Log first 5 warnings
+                logger.warning(f"  - {warning}")
+
+        if audit_result.duplicate_orders:
+            logger.info(f"Cleaned up {len(audit_result.duplicate_orders)} duplicate orders")
+
+        logger.info(f"Queue state: {audit_result.total_orders} pending orders "
+                   f"(BUY: {audit_result.buy_orders}, SELL: {audit_result.sell_orders})")
+    except Exception as e:
+        logger.warning(f"Queue management check failed (non-critical): {e}")
+        # Continue execution - queue management is non-critical
 
     # Get market data with circuit breaker
     logger.info("Fetching market data...")
