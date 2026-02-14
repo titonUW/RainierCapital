@@ -59,6 +59,7 @@ class CircuitBreaker:
         self.last_failure_time = None
         self.total_failures = 0
         self.total_successes = 0
+        self.last_failure_date = None  # Track date for session-based reset
 
     def record_success(self):
         """Record a successful trade execution."""
@@ -71,7 +72,9 @@ class CircuitBreaker:
         """Record a failed trade execution."""
         self.consecutive_failures += 1
         self.total_failures += 1
-        self.last_failure_time = datetime.now()
+        now = datetime.now()
+        self.last_failure_time = now
+        self.last_failure_date = now.date()  # Track date for session reset
 
         logger.warning(
             f"Circuit breaker: failure #{self.consecutive_failures} "
@@ -89,6 +92,17 @@ class CircuitBreaker:
         """Check if trade execution is allowed."""
         if not self.is_open:
             return True, "Circuit closed"
+
+        # FIX: Auto-reset on new trading session (new day)
+        # This prevents failures from yesterday blocking today's trades
+        today = datetime.now().date()
+        if self.last_failure_date and self.last_failure_date < today:
+            logger.info(
+                f"Circuit breaker auto-reset for new trading session "
+                f"(last failure: {self.last_failure_date}, today: {today})"
+            )
+            self.reset()
+            return True, "Circuit auto-reset for new trading session"
 
         # Check if timeout has expired
         if self.last_failure_time:
@@ -116,7 +130,8 @@ class CircuitBreaker:
             'consecutive_failures': self.consecutive_failures,
             'total_failures': self.total_failures,
             'total_successes': self.total_successes,
-            'last_failure_time': self.last_failure_time.isoformat() if self.last_failure_time else None
+            'last_failure_time': self.last_failure_time.isoformat() if self.last_failure_time else None,
+            'last_failure_date': self.last_failure_date.isoformat() if self.last_failure_date else None
         }
 
 
@@ -291,6 +306,22 @@ class ExecutionPipeline:
                     order=order,
                     screenshots=self.screenshots
                 )
+
+            # STEP 2.25: BUYING POWER PRE-CHECK for BUY orders
+            # FIX: Check buying power BEFORE attempting trade to avoid wasting circuit breaker attempts
+            if order.side == "BUY":
+                bp_ok, bp_msg = self._check_buying_power(order)
+                if not bp_ok:
+                    logger.error(f"INSUFFICIENT BUYING POWER: {bp_msg}")
+                    self.current_state = TradeState.ABORTED
+                    return TradeResult(
+                        success=False,
+                        state=self.current_state,
+                        message=f"Insufficient buying power: {bp_msg}",
+                        order=order,
+                        screenshots=self.screenshots
+                    )
+                logger.info(f"Buying power check passed: {bp_msg}")
 
             # STEP 2.5: HARD GUARD - 24-hour minimum hold enforcement for SELLs
             # CRITICAL: This is a last-line-of-defense block to prevent violations
@@ -808,6 +839,65 @@ class ExecutionPipeline:
 
         return can_sell, allowed_qty, reason
 
+    def _check_buying_power(self, order: TradeOrder) -> Tuple[bool, str]:
+        """
+        FIX: Pre-check buying power before attempting trade.
+
+        This prevents wasting circuit breaker attempts on orders that will
+        fail due to insufficient buying power.
+
+        Args:
+            order: TradeOrder to check
+
+        Returns:
+            Tuple of (sufficient, message)
+        """
+        try:
+            # Get current buying power from bot
+            _, _, buying_power = self.bot.get_capital_from_trade_kpis("VOO")
+
+            if buying_power is None or buying_power <= 0:
+                logger.warning("Could not determine buying power - proceeding with trade")
+                return True, "Buying power check skipped (could not read)"
+
+            # Estimate order cost
+            # Use limit_price if available, otherwise try to get current price
+            if order.limit_price and order.limit_price > 0:
+                estimated_price = order.limit_price
+            else:
+                # Try to get price from market data
+                try:
+                    from market_data import MarketData
+                    md = MarketData()
+                    ticker_data = md.get_ticker_data(order.ticker)
+                    if ticker_data and 'price' in ticker_data:
+                        estimated_price = ticker_data['price']
+                    else:
+                        # Fallback: assume worst case ~$500/share for safety check
+                        estimated_price = 500
+                        logger.warning(f"Could not get price for {order.ticker}, using ${estimated_price} estimate")
+                except Exception as e:
+                    estimated_price = 500
+                    logger.warning(f"Price lookup failed: {e}, using ${estimated_price} estimate")
+
+            estimated_cost = order.shares * estimated_price
+            buffer = 1.05  # 5% buffer for price movement
+
+            if estimated_cost * buffer > buying_power:
+                return False, (
+                    f"Order cost ~${estimated_cost:,.2f} ({order.shares} × ${estimated_price:.2f}) "
+                    f"exceeds buying power ${buying_power:,.2f}"
+                )
+
+            return True, (
+                f"Buying power ${buying_power:,.2f} sufficient for "
+                f"~${estimated_cost:,.2f} order"
+            )
+
+        except Exception as e:
+            logger.warning(f"Buying power check failed: {e} - proceeding with trade")
+            return True, f"Buying power check skipped (error: {e})"
+
     def _navigate_to_trade(self, order: TradeOrder) -> bool:
         """Navigate to the equity trade ticket."""
         logger.info(f"Navigating to trade page for {order.ticker}...")
@@ -1213,35 +1303,82 @@ class ExecutionPipeline:
         time.sleep(2)
 
         # First, check for any error messages that might indicate why confirm isn't showing
+        # FIX: Enhanced error detection - extract actual error text for better debugging
         error_check_js = """
         (function() {
-            const errorSelectors = ['.error', '.alert-danger', '.alert-error', '.error-message',
-                                   '[class*="error"]', '[class*="alert"]', '.toast-error'];
+            // Priority 1: Look for specific error elements with visible text
+            const errorSelectors = [
+                '.error', '.alert-danger', '.alert-error', '.error-message',
+                '[class*="error"]', '[class*="alert"]', '.toast-error',
+                '.validation-error', '.form-error', '[role="alert"]',
+                '.notification-error', '.message-error'
+            ];
+
+            let errorMessages = [];
             for (const sel of errorSelectors) {
-                const el = document.querySelector(sel);
-                if (el && el.offsetParent !== null) {
-                    const text = el.textContent.trim();
-                    if (text.length > 5 && text.length < 500) {
-                        return {hasError: true, message: text};
+                const elements = document.querySelectorAll(sel);
+                for (const el of elements) {
+                    if (el && el.offsetParent !== null) {
+                        const text = el.textContent.trim();
+                        if (text.length > 5 && text.length < 500) {
+                            errorMessages.push(text);
+                        }
                     }
                 }
             }
-            // Also check for "insufficient" or similar text anywhere visible
-            const body = document.body.innerText.toLowerCase();
-            if (body.includes('insufficient') || body.includes('not enough') ||
-                body.includes('exceeds') || body.includes('limit reached') ||
-                body.includes('buying power')) {
-                return {hasError: true, message: 'Possible buying power or limit issue detected'};
+
+            // Priority 2: Look for specific error keywords in visible text
+            const body = document.body.innerText;
+            const bodyLower = body.toLowerCase();
+
+            // Extract sentences containing error keywords
+            const errorKeywords = [
+                'insufficient', 'not enough', 'exceeds', 'limit reached',
+                'buying power', 'cannot', 'unable', 'failed', 'rejected',
+                'invalid', 'error', 'not available', 'restricted'
+            ];
+
+            let keywordContext = null;
+            for (const keyword of errorKeywords) {
+                const idx = bodyLower.indexOf(keyword);
+                if (idx !== -1) {
+                    // Extract ~100 chars around the keyword for context
+                    const start = Math.max(0, idx - 30);
+                    const end = Math.min(body.length, idx + 70);
+                    keywordContext = body.substring(start, end).replace(/\\s+/g, ' ').trim();
+                    break;
+                }
             }
+
+            if (errorMessages.length > 0) {
+                return {
+                    hasError: true,
+                    message: errorMessages[0],
+                    allErrors: errorMessages,
+                    source: 'element'
+                };
+            } else if (keywordContext) {
+                return {
+                    hasError: true,
+                    message: keywordContext,
+                    source: 'keyword'
+                };
+            }
+
             return {hasError: false};
         })();
         """
         error_result = self.page.evaluate(error_check_js)
+        detected_error = None
         if error_result.get('hasError'):
-            logger.warning(f"Possible error on page: {error_result.get('message')}")
-            # If there's an error, try dismissing overlays and take screenshot
-            self._dismiss_overlays()
+            detected_error = error_result.get('message', 'Unknown error')
+            error_source = error_result.get('source', 'unknown')
+            logger.error(f"ERROR DETECTED on page ({error_source}): {detected_error}")
+            if error_result.get('allErrors'):
+                logger.error(f"All error messages: {error_result.get('allErrors')}")
+            # Take screenshot immediately when error detected
             self._take_screenshot(f"error_detected_{order.ticker}")
+            self._dismiss_overlays()
 
         # Log current URL to detect unexpected navigation
         current_url = self.page.url
@@ -1349,7 +1486,15 @@ class ExecutionPipeline:
             logger.error(f"Page URL: {self.page.url}")
             if result.get('possibleError'):
                 logger.error("Error indicators found on page - order may have been rejected")
-            raise RuntimeError("Confirmation UI did not appear - Confirm Order button not found")
+
+            # FIX: Include detected error in exception for better debugging
+            if detected_error:
+                raise RuntimeError(
+                    f"Order rejected by StockTrak: {detected_error}. "
+                    f"Confirm Order button did not appear."
+                )
+            else:
+                raise RuntimeError("Confirmation UI did not appear - Confirm Order button not found")
 
         return True
 
