@@ -15,6 +15,8 @@ Usage:
     python main.py --status     # Show current bot status
     python main.py --scores     # Show satellite scoring report
     python main.py --preflight  # Test trade flow UI without executing
+    python main.py --queue      # Manage pending order queue (dedupe, validate)
+    python main.py --queue-auto # Auto-clean duplicate orders
 
 Competition Rules Summary:
     - Max 80 trades total
@@ -545,6 +547,125 @@ def sprint3_reset_mode():
     print("Sprint3 state reset successfully.")
 
 
+def queue_mode(audit_only: bool = False, cancel_duplicates: bool = False):
+    """
+    Queue management mode - audit and organize pending orders.
+
+    This automates queue management:
+    - Scrapes pending orders from StockTrak Order History
+    - Detects duplicate orders
+    - Detects invalid orders
+    - Optionally cancels duplicates
+
+    Args:
+        audit_only: If True, only audit (don't cancel anything)
+        cancel_duplicates: If True, automatically cancel duplicate orders
+    """
+    from stocktrak_bot import StockTrakBot
+    from state_manager import StateManager
+    from queue_manager import QueueManager
+
+    logger = logging.getLogger('stocktrak_bot')
+    logger.info("QUEUE MODE - Managing pending orders")
+
+    print("\n" + "=" * 60)
+    print("QUEUE MANAGEMENT")
+    print("=" * 60)
+
+    if audit_only:
+        print("Mode: AUDIT ONLY (no changes will be made)")
+    else:
+        print("Mode: ORGANIZE (will clean up duplicates)")
+    print("=" * 60)
+
+    state = StateManager()
+    bot = None
+
+    try:
+        # Start browser and login
+        print("\n[1/3] Starting browser and logging in...")
+        bot = StockTrakBot()
+        bot.start_browser(headless=False)  # Show browser for queue management
+
+        if not bot.login():
+            print("ERROR: Login failed")
+            return
+
+        print("Login successful")
+
+        # Create queue manager
+        print("\n[2/3] Fetching pending orders...")
+        queue_manager = QueueManager(bot, state)
+
+        if audit_only:
+            # Just audit
+            audit_result = queue_manager.audit_queue()
+            queue_manager.print_queue_summary()
+
+            print("\n" + "=" * 60)
+            print("AUDIT COMPLETE")
+            print("=" * 60)
+            print(f"Total orders: {audit_result.total_orders}")
+            print(f"BUY orders: {audit_result.buy_orders}")
+            print(f"SELL orders: {audit_result.sell_orders}")
+            print(f"Duplicates: {len(audit_result.duplicate_orders)}")
+            print(f"Invalid: {len(audit_result.invalid_orders)}")
+            print(f"Queue healthy: {audit_result.is_healthy}")
+
+            if audit_result.warnings:
+                print("\nWarnings:")
+                for warning in audit_result.warnings:
+                    print(f"  - {warning}")
+        else:
+            # Organize (audit + cleanup)
+            print("\n[3/3] Organizing queue...")
+
+            if not cancel_duplicates:
+                # Ask for confirmation
+                orders = queue_manager.get_pending_orders()
+                queue_manager.print_queue_summary(orders)
+
+                duplicates = queue_manager.find_duplicates(orders)
+                if duplicates:
+                    print(f"\nFound {len(duplicates)} duplicate groups to clean up.")
+                    confirm = input("Cancel duplicates? (yes/no): ")
+                    if confirm.lower() != 'yes':
+                        print("Cancelled. No changes made.")
+                        return
+                    cancel_duplicates = True
+                else:
+                    print("\nNo duplicates found. Queue is clean.")
+                    return
+
+            # Execute cleanup
+            success, audit_result = queue_manager.organize_queue(
+                auto_cancel_duplicates=cancel_duplicates,
+                auto_cancel_invalid=False  # Never auto-cancel invalid (too dangerous)
+            )
+
+            queue_manager.print_queue_summary()
+
+            print("\n" + "=" * 60)
+            print("ORGANIZATION COMPLETE")
+            print("=" * 60)
+            print(f"Final state: {audit_result.total_orders} pending orders")
+            print(f"Queue healthy: {audit_result.is_healthy}")
+
+            if audit_result.duplicate_orders:
+                print(f"Duplicates cancelled: {len(audit_result.duplicate_orders)}")
+
+    except Exception as e:
+        logger.error(f"Queue management error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        if bot:
+            input("\nPress Enter to close browser...")
+            bot.close()
+        print("Done.")
+
+
 def hold_test_mode():
     """
     Test lot-based 24-hour holding compliance (offline, no Playwright).
@@ -825,6 +946,9 @@ Examples:
     python main.py --status         Show current bot status
     python main.py --scores         Show satellite scoring report
     python main.py --preflight      Test trade flow UI without executing
+    python main.py --queue          Audit and clean up pending order queue
+    python main.py --queue-audit    Audit pending orders (no changes)
+    python main.py --queue-auto     Auto-cancel duplicate orders (no confirmation)
     python main.py --sprint3        Execute SPRINT3 mode (3-day high-intensity trading)
     python main.py --sprint3-status Show SPRINT3 status
     python main.py --sprint3-dry-run Plan SPRINT3 trades without executing
@@ -858,6 +982,14 @@ Examples:
                         help='Reset SPRINT3 state')
     parser.add_argument('--sprint3-day', type=int, choices=[1, 2, 3],
                         help='Force specific sprint day (1, 2, or 3)')
+
+    # Queue management options
+    parser.add_argument('--queue', action='store_true',
+                        help='Queue management - audit and clean up pending orders')
+    parser.add_argument('--queue-audit', action='store_true',
+                        help='Audit pending orders without making changes')
+    parser.add_argument('--queue-auto', action='store_true',
+                        help='Automatically clean up duplicate orders (no confirmation)')
 
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -902,6 +1034,12 @@ Examples:
             sprint3_mode(dry_run=True, force_day=args.sprint3_day)
         elif args.sprint3_reset:
             sprint3_reset_mode()
+        elif args.queue:
+            queue_mode(audit_only=False, cancel_duplicates=False)
+        elif args.queue_audit:
+            queue_mode(audit_only=True, cancel_duplicates=False)
+        elif args.queue_auto:
+            queue_mode(audit_only=False, cancel_duplicates=True)
         else:
             scheduler_mode()
 
@@ -940,6 +1078,12 @@ def get_mode_name(args):
         return "SPRINT3-DRY-RUN"
     elif args.sprint3_reset:
         return "SPRINT3-RESET"
+    elif args.queue:
+        return "QUEUE"
+    elif args.queue_audit:
+        return "QUEUE-AUDIT"
+    elif args.queue_auto:
+        return "QUEUE-AUTO"
     else:
         return "SCHEDULER"
 
