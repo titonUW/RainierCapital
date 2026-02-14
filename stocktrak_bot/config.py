@@ -14,6 +14,12 @@ import os
 from datetime import datetime
 
 # =============================================================================
+# SPRINT MODE FLAG - Enable for final week aggressive trading
+# MUST BE DEFINED EARLY - used by other config values below
+# =============================================================================
+SPRINT_MODE_ENABLED = True  # ACTIVATED: Final week catch-up mode
+
+# =============================================================================
 # STOCKTRAK CREDENTIALS (from environment variables)
 # =============================================================================
 STOCKTRAK_URL = "https://app.stocktrak.com"
@@ -196,11 +202,6 @@ VOLATILITY_KILL_SWITCH_THRESHOLD = 0.06
 # =============================================================================
 # VIX REGIME PARAMETERS
 # =============================================================================
-# =============================================================================
-# SPRINT MODE FLAG - Enable for final week aggressive trading
-# =============================================================================
-SPRINT_MODE_ENABLED = True  # ACTIVATED: Final week catch-up mode
-
 REGIME_PARAMS = {
     'NORMAL': {       # VIX < 20
         'max_satellites': 12 if SPRINT_MODE_ENABLED else 8,  # More satellites in sprint
