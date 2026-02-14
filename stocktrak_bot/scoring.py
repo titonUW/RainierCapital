@@ -1,10 +1,13 @@
 """
 Satellite Selection Scoring System for StockTrak Bot
 
-Implements parameter-free lexicographic ranking (DeMiguel et al. 1/N approach).
-No tunable weights - reduces estimation error and model risk.
+SPRINT MODE: Uses short-term momentum scoring for final week catch-up.
+When SPRINT_MODE_ENABLED:
+  - Primary rank: RelR3 (relative 3-day return vs VOO) - captures recent momentum
+  - Tie-break #1: RelR10 (relative 10-day return vs VOO) - medium-term confirmation
+  - Tie-break #2: VOL10 (10-day volatility) - ascending (lower is better)
 
-Ranking method (parameter-free):
+Normal mode (DeMiguel et al. 1/N approach):
   1. Primary rank: RelR21 (relative 21-day return vs VOO) - descending
   2. Tie-break #1: RelR63 (relative 63-day return vs VOO) - descending
   3. Tie-break #2: VOL21 (21-day volatility) - ascending (lower is better)
@@ -32,27 +35,38 @@ class ScoredCandidate:
     """
     Scored satellite candidate using parameter-free ranking.
 
-    No 'score' field with tunable weights - instead use rel_r21, rel_r63, vol_21
-    for lexicographic sorting (DeMiguel-consistent approach).
+    SPRINT MODE: Uses short-term momentum (3-day, 10-day) for final week catch-up.
+    NORMAL MODE: Uses longer-term momentum (21-day, 63-day) per DeMiguel approach.
     """
     ticker: str
     bucket: str
-    rel_r21: float       # Relative 21-day return vs VOO (primary rank)
-    rel_r63: float       # Relative 63-day return vs VOO (tie-break #1)
-    vol_21: float        # 21-day volatility (tie-break #2, lower is better)
+    rel_r21: float       # Relative 21-day return vs VOO (normal mode primary)
+    rel_r63: float       # Relative 63-day return vs VOO (normal mode tie-break)
+    vol_21: float        # 21-day volatility (tie-break, lower is better)
     price: float
     is_qualified: bool
     is_etf: bool = False  # True if ticker is an ETF (for volatility kill-switch)
     disqualification_reason: Optional[str] = None
+    # SPRINT MODE fields
+    rel_r3: float = 0.0   # Relative 3-day return vs VOO (sprint primary)
+    rel_r10: float = 0.0  # Relative 10-day return vs VOO (sprint tie-break)
+    vol_10: float = 0.0   # 10-day volatility (sprint tie-break)
+    momentum_score: float = 0.0  # Weighted score for sprint mode
 
     @property
     def rank_key(self) -> Tuple[float, float, float]:
         """
         Lexicographic sort key for parameter-free ranking.
-        Returns tuple for sorting: (-rel_r21, -rel_r63, vol_21)
-        Negative values for descending sort on first two, ascending on volatility.
+        SPRINT MODE: Uses short-term momentum (-rel_r3, -rel_r10, vol_10)
+        NORMAL MODE: Uses longer-term momentum (-rel_r21, -rel_r63, vol_21)
         """
-        return (-self.rel_r21, -self.rel_r63, self.vol_21)
+        from config import SPRINT_MODE_ENABLED
+        if SPRINT_MODE_ENABLED:
+            # Sprint mode: prioritize short-term momentum
+            return (-self.momentum_score, -self.rel_r3, self.vol_10)
+        else:
+            # Normal mode: DeMiguel-consistent ranking
+            return (-self.rel_r21, -self.rel_r63, self.vol_21)
 
 
 def is_bucket_etf(ticker: str, bucket: str) -> bool:
@@ -65,13 +79,10 @@ def is_bucket_etf(ticker: str, bucket: str) -> bool:
 
 def calculate_candidate_metrics(ticker: str, market_data: Dict) -> Optional[ScoredCandidate]:
     """
-    Calculate parameter-free ranking metrics for a satellite candidate.
+    Calculate ranking metrics for a satellite candidate.
 
-    NO TUNABLE WEIGHTS - follows DeMiguel et al. 1/N methodology.
-    Uses lexicographic ranking:
-      1. RelR21 (relative 21-day return vs VOO) - descending
-      2. RelR63 (relative 63-day return vs VOO) - descending
-      3. VOL21 (21-day volatility) - ascending
+    SPRINT MODE: Uses short-term momentum (3-day, 10-day returns) with weighted scoring.
+    NORMAL MODE: Uses DeMiguel et al. 1/N methodology with lexicographic ranking.
 
     Args:
         ticker: Stock ticker symbol
@@ -80,6 +91,8 @@ def calculate_candidate_metrics(ticker: str, market_data: Dict) -> Optional[Scor
     Returns:
         ScoredCandidate object or None if data missing
     """
+    from config import SPRINT_MODE_ENABLED
+
     ticker_data = market_data.get(ticker)
     voo_data = market_data.get('VOO')
 
@@ -87,7 +100,7 @@ def calculate_candidate_metrics(ticker: str, market_data: Dict) -> Optional[Scor
         logger.warning(f"Missing data for {ticker} or VOO")
         return None
 
-    # Get returns and volatility
+    # Get returns and volatility (long-term)
     ticker_ret_21d = ticker_data.get('return_21d')
     ticker_ret_63d = ticker_data.get('return_63d')
     ticker_vol_21d = ticker_data.get('volatility_21d')
@@ -95,15 +108,42 @@ def calculate_candidate_metrics(ticker: str, market_data: Dict) -> Optional[Scor
     voo_ret_21d = voo_data.get('return_21d')
     voo_ret_63d = voo_data.get('return_63d')
 
-    # Check for missing data
+    # Get short-term returns for SPRINT mode
+    ticker_ret_3d = ticker_data.get('return_3d', 0) or 0
+    ticker_ret_10d = ticker_data.get('return_10d', 0) or 0
+    ticker_vol_10d = ticker_data.get('vol10', 0) or ticker_data.get('volatility_21d', 0.03) or 0.03
+
+    voo_ret_3d = voo_data.get('return_3d', 0) or 0
+    voo_ret_10d = voo_data.get('return_10d', 0) or 0
+
+    # Fallback: estimate short-term from 21-day if not available
+    if ticker_ret_3d == 0 and ticker_ret_21d:
+        ticker_ret_3d = ticker_ret_21d * (3/21)
+    if ticker_ret_10d == 0 and ticker_ret_21d:
+        ticker_ret_10d = ticker_ret_21d * (10/21)
+    if voo_ret_3d == 0 and voo_ret_21d:
+        voo_ret_3d = voo_ret_21d * (3/21)
+    if voo_ret_10d == 0 and voo_ret_21d:
+        voo_ret_10d = voo_ret_21d * (10/21)
+
+    # Check for missing data (need at least 21d for qualification)
     if None in [ticker_ret_21d, voo_ret_21d, ticker_vol_21d]:
         logger.warning(f"Missing return/volatility data for {ticker}")
         return None
 
-    # Calculate relative metrics (no weights applied - parameter-free)
+    # Calculate relative metrics (long-term)
     rel_r21 = ticker_ret_21d - voo_ret_21d
     rel_r63 = (ticker_ret_63d - voo_ret_63d) if ticker_ret_63d and voo_ret_63d else 0.0
-    vol_21 = ticker_vol_21d  # Raw volatility (not relative)
+    vol_21 = ticker_vol_21d
+
+    # Calculate relative metrics (short-term for SPRINT mode)
+    rel_r3 = ticker_ret_3d - voo_ret_3d
+    rel_r10 = ticker_ret_10d - voo_ret_10d
+    vol_10 = ticker_vol_10d
+
+    # SPRINT MODE: Calculate momentum score
+    # Score = 0.55*rr3 + 0.35*rr10 - 0.25*vol10 (same as sprint3_strategy.py)
+    momentum_score = 0.55 * rel_r3 + 0.35 * rel_r10 - 0.25 * vol_10
 
     # Check qualification criteria
     is_qualified = True
@@ -121,11 +161,18 @@ def calculate_candidate_metrics(ticker: str, market_data: Dict) -> Optional[Scor
         is_qualified = False
         disqualification_reason = price_reason
 
-    # Check uptrend
-    uptrend_valid, uptrend_reason = validate_uptrend(ticker_data)
-    if not uptrend_valid:
-        is_qualified = False
-        disqualification_reason = uptrend_reason
+    # Check uptrend - SPRINT MODE uses relaxed trend check
+    if SPRINT_MODE_ENABLED:
+        # Relaxed: just check price > SMA50 (allow more entries)
+        sma50 = ticker_data.get('sma50', 0)
+        if sma50 and price < sma50:
+            is_qualified = False
+            disqualification_reason = "Below SMA50"
+    else:
+        uptrend_valid, uptrend_reason = validate_uptrend(ticker_data)
+        if not uptrend_valid:
+            is_qualified = False
+            disqualification_reason = uptrend_reason
 
     bucket = get_bucket_for_ticker(ticker)
     is_etf = is_bucket_etf(ticker, bucket)
@@ -139,7 +186,11 @@ def calculate_candidate_metrics(ticker: str, market_data: Dict) -> Optional[Scor
         price=price,
         is_qualified=is_qualified,
         is_etf=is_etf,
-        disqualification_reason=disqualification_reason
+        disqualification_reason=disqualification_reason,
+        rel_r3=rel_r3,
+        rel_r10=rel_r10,
+        vol_10=vol_10,
+        momentum_score=momentum_score
     )
 
 
@@ -311,17 +362,18 @@ def get_double7_buy_candidates(
     vix_level: float
 ) -> List[ScoredCandidate]:
     """
-    Get candidates that meet all buy criteria including Double-7 Low.
+    Get candidates that meet all buy criteria.
 
-    UPDATED for structural 1/N: Uses bucket-based selection instead of global top 12.
+    SPRINT MODE: Skips Double-7 Low requirement - uses pure momentum ranking.
+    NORMAL MODE: Requires Double-7 Low for entry confirmation.
 
-    Entry conditions (ALL must be TRUE):
+    Entry conditions:
     - Price >= $6
     - Not prohibited
-    - Uptrend (Close > SMA50 > SMA200)
-    - Double-7 Low (today's close is 7-day low)
+    - Uptrend check (relaxed in SPRINT mode)
+    - Double-7 Low (NORMAL mode only)
     - Is best candidate in its bucket (1/N structural)
-    - Bucket is empty (exactly 1 per bucket rule)
+    - Bucket has room (MAX_PER_BUCKET varies by mode)
 
     Args:
         market_data: Market data dict
@@ -331,6 +383,8 @@ def get_double7_buy_candidates(
     Returns:
         List of candidates meeting all criteria
     """
+    from config import SPRINT_MODE_ENABLED, MAX_PER_BUCKET
+
     # Get best candidate per bucket (structural 1/N)
     best_per_bucket = get_best_per_bucket(market_data, require_qualified=True)
 
@@ -340,15 +394,17 @@ def get_double7_buy_candidates(
         ticker = candidate.ticker
         ticker_data = market_data.get(ticker, {})
 
-        # Check Double-7 Low
-        double7_valid, double7_reason = validate_double7_low(ticker_data)
-        if not double7_valid:
-            continue
+        # SPRINT MODE: Skip Double-7 Low - use pure momentum
+        if not SPRINT_MODE_ENABLED:
+            # Normal mode: Check Double-7 Low
+            double7_valid, double7_reason = validate_double7_low(ticker_data)
+            if not double7_valid:
+                continue
 
-        # Check bucket is empty (exactly 1 per bucket rule)
+        # Check bucket capacity (MAX_PER_BUCKET is 2 in sprint mode)
         bucket_count = count_bucket_positions(bucket, current_positions)
         if bucket_count >= MAX_PER_BUCKET:
-            logger.debug(f"{ticker}: Bucket {bucket} already filled ({bucket_count}/{MAX_PER_BUCKET})")
+            logger.debug(f"{ticker}: Bucket {bucket} at capacity ({bucket_count}/{MAX_PER_BUCKET})")
             continue
 
         # Check we don't already hold this ticker
@@ -358,7 +414,8 @@ def get_double7_buy_candidates(
 
         buy_candidates.append(candidate)
 
-    logger.info(f"Found {len(buy_candidates)} Double-7 buy candidates (1/N bucket selection)")
+    mode_str = "SPRINT momentum" if SPRINT_MODE_ENABLED else "Double-7"
+    logger.info(f"Found {len(buy_candidates)} {mode_str} buy candidates (1/N bucket selection)")
     return buy_candidates
 
 

@@ -152,12 +152,12 @@ CORE_POSITIONS = {
 SATELLITE_BUCKETS = {
     'A_SPACE': ['ROKT', 'UFO', 'RKLB', 'PL', 'ASTS', 'LUNR', 'ONDS', 'RDW'],
     'B_DEFENSE': ['PPA', 'ITA', 'XAR', 'JEDI', 'LMT', 'NOC', 'RTX', 'GD', 'KTOS', 'AVAV'],
-    'C_SEMIS': ['SMH', 'SOXX', 'ASML', 'AMAT', 'LRCX', 'KLAC', 'TER', 'ENTG'],
-    'D_BIOTECH': ['XBI', 'IDNA', 'CRSP', 'NTLA', 'BEAM'],
+    'C_SEMIS': ['SMH', 'SOXX', 'ASML', 'AMAT', 'LRCX', 'KLAC', 'TER', 'ENTG', 'NVDA', 'AMD'],
+    'D_BIOTECH': ['XBI', 'IDNA', 'CRSP', 'NTLA', 'BEAM', 'VRTX'],
     'E_NUCLEAR': ['URNM', 'URA', 'NLR', 'CCJ'],
     'F_ENERGY': ['XLE', 'XOP', 'XOM', 'CVX'],
     'G_METALS': ['COPX', 'XME', 'PICK', 'FCX', 'SCCO'],
-    'H_MATERIALS': ['DMAT'],
+    'H_MATERIALS': ['XLB', 'VAW', 'DMAT', 'LIN', 'APD', 'ECL'],  # EXPANDED: Added XLB, VAW, LIN, APD, ECL
 }
 
 # ETFs per bucket (for volatility kill-switch fallback)
@@ -169,7 +169,7 @@ BUCKET_ETFS = {
     'E_NUCLEAR': ['URNM', 'URA', 'NLR'],
     'F_ENERGY': ['XLE', 'XOP'],
     'G_METALS': ['COPX', 'XME', 'PICK'],
-    'H_MATERIALS': ['DMAT'],
+    'H_MATERIALS': ['XLB', 'VAW', 'DMAT'],  # EXPANDED: XLB and VAW are liquid ETFs
 }
 
 # Day-1 satellite lineup (1 per bucket - structural diversification)
@@ -184,8 +184,9 @@ DAY1_SATELLITES = [
     ('DMAT', 'H_MATERIALS'),  # Materials ETF
 ]
 
-SATELLITE_POSITION_SIZE = 0.05  # 5% per satellite (8 × 5% = 40%)
-MAX_PER_BUCKET = 1              # Exactly 1 satellite per bucket (structural 1/N)
+# SPRINT MODE: Increase satellite allocation to deploy cash faster
+SATELLITE_POSITION_SIZE = 0.05 if not SPRINT_MODE_ENABLED else 0.04  # 4% in sprint (allows more positions)
+MAX_PER_BUCKET = 1 if not SPRINT_MODE_ENABLED else 2  # Allow 2 per bucket in sprint mode
 MIN_BUCKETS = 8                 # Must have all 8 buckets represented
 
 # Volatility kill-switch threshold (DeMiguel-consistent risk control)
@@ -195,24 +196,29 @@ VOLATILITY_KILL_SWITCH_THRESHOLD = 0.06
 # =============================================================================
 # VIX REGIME PARAMETERS
 # =============================================================================
+# =============================================================================
+# SPRINT MODE FLAG - Enable for final week aggressive trading
+# =============================================================================
+SPRINT_MODE_ENABLED = True  # ACTIVATED: Final week catch-up mode
+
 REGIME_PARAMS = {
     'NORMAL': {       # VIX < 20
-        'max_satellites': 8,
-        'weekly_replacement_cap': 2,
-        'stop_loss_pct': 0.15,
-        'max_satellite_pct': 0.40,
+        'max_satellites': 12 if SPRINT_MODE_ENABLED else 8,  # More satellites in sprint
+        'weekly_replacement_cap': 99 if SPRINT_MODE_ENABLED else 2,  # Unlimited in sprint
+        'stop_loss_pct': 0.10,  # TIGHTENED: 10% stop-loss (was 15%)
+        'max_satellite_pct': 0.50 if SPRINT_MODE_ENABLED else 0.40,  # Higher allocation
     },
     'CAUTION': {      # 20 <= VIX <= 30
-        'max_satellites': 6,
-        'weekly_replacement_cap': 1,
-        'stop_loss_pct': 0.12,
-        'max_satellite_pct': 0.30,
+        'max_satellites': 8 if SPRINT_MODE_ENABLED else 6,
+        'weekly_replacement_cap': 99 if SPRINT_MODE_ENABLED else 1,
+        'stop_loss_pct': 0.10,  # TIGHTENED: 10% (was 12%)
+        'max_satellite_pct': 0.40 if SPRINT_MODE_ENABLED else 0.30,
     },
     'SHOCK': {        # VIX > 30
-        'max_satellites': 4,
-        'weekly_replacement_cap': 0,  # No new buys
-        'stop_loss_pct': 0.10,
-        'max_satellite_pct': 0.20,
+        'max_satellites': 6 if SPRINT_MODE_ENABLED else 4,
+        'weekly_replacement_cap': 2 if SPRINT_MODE_ENABLED else 0,  # Allow some buys
+        'stop_loss_pct': 0.08,  # TIGHTENED: 8% (was 10%)
+        'max_satellite_pct': 0.30 if SPRINT_MODE_ENABLED else 0.20,
     },
 }
 
