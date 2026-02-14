@@ -35,6 +35,7 @@ from config import (
     STOCKTRAK_TRADING_EQUITIES_URL, STOCKTRAK_TRANSACTION_HISTORY_URL,
     STOCKTRAK_ORDER_HISTORY_URL, DEFAULT_TIMEOUT, PAGE_LOAD_TIMEOUT
 )
+from utils import is_market_hours
 
 logger = logging.getLogger('stocktrak_bot.execution_pipeline')
 
@@ -249,6 +250,14 @@ class ExecutionPipeline:
         logger.info(f"Run ID: {order.run_id}")
         logger.info(f"=" * 60)
 
+        # FIX: Warn if market is closed - orders will be queued
+        if not is_market_hours():
+            logger.warning(
+                "MARKET CLOSED: Order will be QUEUED for execution at market open. "
+                "Trade count verification will be skipped since queued orders don't "
+                "increment the count until they execute."
+            )
+
         self.screenshots = []
         self.current_state = TradeState.INIT
 
@@ -326,7 +335,10 @@ class ExecutionPipeline:
             self.current_state = TradeState.FORM_FILLED
 
             # STEP 5: Preview order
-            self._run_step("preview", lambda: self._preview_order(order), order)
+            # FIX: Use _run_step_with_preview_retry to re-navigate on failure
+            # The previous bug: _run_step resets to dashboard but retries _preview_order
+            # without re-navigating to trade page, causing it to click wrong buttons
+            self._run_step_with_preview_retry("preview", order)
             self.current_state = TradeState.PREVIEWED
 
             # DRY RUN: Stop here
@@ -556,6 +568,69 @@ class ExecutionPipeline:
         # All attempts failed
         raise last_error
 
+    def _run_step_with_preview_retry(self, name: str, order: TradeOrder, max_attempts: int = 3):
+        """
+        Execute preview step with FULL trade flow retry on failure.
+
+        FIX: When preview fails and we reset to dashboard, we MUST re-navigate
+        to the trade page and re-fill the form before retrying preview.
+        Otherwise we're on the dashboard trying to click "Review Order" and
+        end up clicking dashboard "Next" buttons instead.
+        """
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"[{name}] Attempt {attempt}/{max_attempts}")
+                self._update_dashboard("RUNNING", name.upper(), order)
+                self._dismiss_overlays()
+
+                # URL validation: ensure we're on the trade page before trying preview
+                current_url = self.page.url.lower()
+                if "trading" not in current_url or "dashboard" in current_url:
+                    logger.warning(f"[{name}] Not on trade page (URL: {current_url}), re-navigating...")
+                    self._navigate_to_trade(order)
+                    self._fill_order_form(order)
+
+                result = self._preview_order(order)
+
+                logger.info(f"[{name}] SUCCESS")
+                return result
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[{name}] FAILED attempt {attempt}: {e}")
+                self._take_screenshot(f"{name}_fail_{attempt}_{order.ticker}")
+
+                if attempt < max_attempts:
+                    # FULL RETRY: Re-run entire navigate → fill flow before retrying preview
+                    logger.info(f"[{name}] Re-running full trade flow for retry...")
+                    try:
+                        # Reset to dashboard
+                        self.page.goto(
+                            STOCKTRAK_DASHBOARD_URL,
+                            wait_until="domcontentloaded",
+                            timeout=PAGE_LOAD_TIMEOUT
+                        )
+                        self._dismiss_overlays()
+                        time.sleep(1)
+
+                        # Re-run: navigate → fill (preview will be retried in next loop iteration)
+                        logger.info(f"[{name}] Re-navigating to trade page...")
+                        self._navigate_to_trade(order)
+
+                        logger.info(f"[{name}] Re-filling order form...")
+                        self._fill_order_form(order)
+
+                        logger.info(f"[{name}] Ready for retry attempt {attempt + 1}")
+
+                    except Exception as setup_err:
+                        logger.warning(f"[{name}] Full retry setup failed: {setup_err}")
+                        # Continue to next attempt anyway
+
+        # All attempts failed
+        raise last_error
+
     # =========================================================================
     # PIPELINE STEPS
     # =========================================================================
@@ -657,6 +732,12 @@ class ExecutionPipeline:
         """
         if not hasattr(self, '_pre_trade_count') or self._pre_trade_count is None:
             return True, "External verification skipped (no pre-trade count)"
+
+        # FIX: Skip verification when market is closed - orders are queued, not executed
+        # Trade count only increments when orders actually execute at market open
+        if not is_market_hours():
+            logger.info("Market is closed - order queued for market open, skipping trade count verification")
+            return True, "External verification skipped (market closed - order queued)"
 
         try:
             post_trade_count = self._get_external_trade_count()
@@ -1060,6 +1141,20 @@ class ExecutionPipeline:
         """
         logger.info("=== CLICKING REVIEW ORDER ===")
 
+        # FIX: URL validation - ensure we're on trade page, not dashboard
+        # This prevents clicking wrong buttons if previous navigation failed
+        current_url = self.page.url.lower()
+        if "trading" not in current_url:
+            raise RuntimeError(
+                f"Not on trade page before preview. URL: {self.page.url}. "
+                f"Expected URL containing 'trading'. This indicates a navigation failure."
+            )
+        if "dashboard" in current_url:
+            raise RuntimeError(
+                f"On dashboard instead of trade page. URL: {self.page.url}. "
+                f"The retry logic should have re-navigated to trade page."
+            )
+
         self._dismiss_overlays()
 
         # Scroll to bottom to reveal Review Order button
@@ -1071,8 +1166,10 @@ class ExecutionPipeline:
         js_click_script = """
         (function() {
             const clickables = document.querySelectorAll('button, a, [role="button"]');
-            const reviewKeywords = ['review order', 'preview order', 'review', 'preview', 'continue', 'next'];
-            const excludeKeywords = ['cancel', 'close', 'back'];
+            // FIX: Removed 'next' - too generic, matches dashboard pagination buttons
+            // Also removed 'continue' to be safer - focus on order-specific keywords
+            const reviewKeywords = ['review order', 'preview order', 'review', 'preview'];
+            const excludeKeywords = ['cancel', 'close', 'back', 'next', 'previous'];
 
             for (const element of clickables) {
                 const text = (element.textContent || '').toLowerCase().trim();
