@@ -15,10 +15,8 @@ The numbers tell the story:
 ```
 BOT STATUS (Feb 14, 2026)
 =========================
-Trades Used: ~35/80
-Positions: 11
+Trades Used: 10/80
 Days Remaining: 6 trading days
-Execution Count: 12 successful daily runs
 Error Count: 0 unrecovered failures
 ```
 
@@ -218,7 +216,7 @@ Our trade execution module has grown from 400 to nearly 2,000 lines. Every line 
 | 1400-1600 | Trade history verification |
 | 1600-1922 | Utility functions, overlays, recovery |
 
-Is it over-engineered? Maybe. But it hasn't failed in 12 consecutive executions.
+Is it over-engineered? Maybe. But it hasn't failed yet.
 
 ---
 
@@ -258,7 +256,7 @@ Portfolio Summary
 Core Holdings: ~$600,000 (VOO, VTI, VEA)
 Satellites: ~$250,000 (8 positions across thematic buckets)
 Cash: ~$150,000 (reserve for final adjustments)
-Trade Budget: 45 trades remaining
+Trade Budget: 70 trades remaining
 ```
 
 ### Our Final Week Strategy
@@ -300,7 +298,6 @@ SYSTEM STATUS
 Execution Pipeline: OPERATIONAL
 Circuit Breaker: CLOSED (0 consecutive failures)
 HOLD_MODE: LOT_FIFO
-Last Execution: 2026-02-14 09:45:32 ET
 Next Execution: 2026-02-18 09:30:00 ET (Monday - markets closed for holiday)
 ```
 
