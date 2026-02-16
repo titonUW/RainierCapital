@@ -386,6 +386,129 @@ def can_sell_sprint3(position: Dict, current_time: datetime = None) -> Tuple[boo
         return True, "Parse error - assuming eligible"
 
 
+def get_us_market_holidays(year: int) -> List[Tuple[int, int, str]]:
+    """
+    Return US stock market holidays for the given year as (month, day, name) tuples.
+
+    Covers NYSE/NASDAQ observed holidays. For holidays that fall on weekends,
+    the observed date (Friday or Monday) is used.
+    """
+    from datetime import date as date_cls
+    holidays = []
+
+    # New Year's Day - Jan 1 (observed Fri if Sat, Mon if Sun)
+    d = date_cls(year, 1, 1)
+    if d.weekday() == 5:  # Saturday
+        holidays.append((12, 31, "New Year's Day (observed)"))  # Previous year Dec 31
+    elif d.weekday() == 6:  # Sunday
+        holidays.append((1, 2, "New Year's Day (observed)"))
+    else:
+        holidays.append((1, 1, "New Year's Day"))
+
+    # MLK Day - 3rd Monday of January
+    jan1 = date_cls(year, 1, 1)
+    first_monday = (7 - jan1.weekday()) % 7 + 1  # Day of first Monday
+    mlk_day = first_monday + 14  # 3rd Monday
+    holidays.append((1, mlk_day, "MLK Day"))
+
+    # Presidents' Day - 3rd Monday of February
+    feb1 = date_cls(year, 2, 1)
+    first_monday = (7 - feb1.weekday()) % 7 + 1
+    pres_day = first_monday + 14
+    holidays.append((2, pres_day, "Presidents' Day"))
+
+    # Good Friday - varies (approximate: 2 days before Easter)
+    # Easter algorithm (Anonymous Gregorian)
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d_val = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d_val - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    # Easter is month/day, Good Friday is 2 days before
+    easter = date_cls(year, month, day)
+    good_friday = easter - timedelta(days=2)
+    holidays.append((good_friday.month, good_friday.day, "Good Friday"))
+
+    # Memorial Day - last Monday of May
+    may31 = date_cls(year, 5, 31)
+    mem_day = 31 - ((may31.weekday()) % 7)  # Last Monday
+    holidays.append((5, mem_day, "Memorial Day"))
+
+    # Juneteenth - Jun 19 (observed)
+    d = date_cls(year, 6, 19)
+    if d.weekday() == 5:
+        holidays.append((6, 18, "Juneteenth (observed)"))
+    elif d.weekday() == 6:
+        holidays.append((6, 20, "Juneteenth (observed)"))
+    else:
+        holidays.append((6, 19, "Juneteenth"))
+
+    # Independence Day - Jul 4 (observed)
+    d = date_cls(year, 7, 4)
+    if d.weekday() == 5:
+        holidays.append((7, 3, "Independence Day (observed)"))
+    elif d.weekday() == 6:
+        holidays.append((7, 5, "Independence Day (observed)"))
+    else:
+        holidays.append((7, 4, "Independence Day"))
+
+    # Labor Day - 1st Monday of September
+    sep1 = date_cls(year, 9, 1)
+    labor_day = (7 - sep1.weekday()) % 7 + 1
+    holidays.append((9, labor_day, "Labor Day"))
+
+    # Thanksgiving - 4th Thursday of November
+    nov1 = date_cls(year, 11, 1)
+    first_thurs = (3 - nov1.weekday()) % 7 + 1
+    thanksgiving = first_thurs + 21
+    holidays.append((11, thanksgiving, "Thanksgiving"))
+
+    # Christmas - Dec 25 (observed)
+    d = date_cls(year, 12, 25)
+    if d.weekday() == 5:
+        holidays.append((12, 24, "Christmas (observed)"))
+    elif d.weekday() == 6:
+        holidays.append((12, 26, "Christmas (observed)"))
+    else:
+        holidays.append((12, 25, "Christmas"))
+
+    return holidays
+
+
+def is_market_holiday(dt: datetime = None) -> Tuple[bool, Optional[str]]:
+    """
+    Check if the given date is a US stock market holiday.
+
+    Args:
+        dt: datetime to check (defaults to now in ET)
+
+    Returns:
+        Tuple of (is_holiday, holiday_name or None)
+    """
+    if dt is None:
+        et = pytz.timezone('US/Eastern')
+        dt = datetime.now(et)
+
+    year = dt.year
+    month = dt.month
+    day = dt.day
+
+    for h_month, h_day, h_name in get_us_market_holidays(year):
+        if month == h_month and day == h_day:
+            return True, h_name
+
+    return False, None
+
+
 def is_market_open() -> Tuple[bool, str]:
     """
     Check if market is currently open.
@@ -399,6 +522,11 @@ def is_market_open() -> Tuple[bool, str]:
     # Check day of week (Monday=0, Friday=4)
     if now.weekday() > 4:
         return False, f"Weekend (day {now.weekday()})"
+
+    # Check US market holidays
+    is_holiday, holiday_name = is_market_holiday(now)
+    if is_holiday:
+        return False, f"Market holiday: {holiday_name}"
 
     # Check time
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -617,13 +745,23 @@ class Sprint3Executor:
         else:
             result = self._execute_day4()
 
-        # Update sprint state
-        if result['success']:
+        # Update sprint state - only advance day if trades actually executed
+        # FIX: Previously marked day complete even with 0 trades, blocking retries
+        trades_done = result.get('trades_executed', 0)
+        if result['success'] and trades_done > 0:
             self.update_sprint_state(
                 sprint_day=next_day,
-                trades_used_sprint=self.get_sprint_state()['trades_used_sprint'] + result['trades_executed'],
+                trades_used_sprint=self.get_sprint_state()['trades_used_sprint'] + trades_done,
                 last_run_time=datetime.now().isoformat(),
                 last_run_day=datetime.now().date().isoformat()
+            )
+            logger.info(f"Sprint day {next_day} marked complete: {trades_done} trades executed")
+        elif result['success'] and trades_done == 0:
+            logger.warning(f"Sprint day {next_day} had 0 successful trades - NOT marking as complete (will retry)")
+            # Update last_run_time but NOT last_run_day, so the bot can retry today
+            self.update_sprint_state(
+                last_run_time=datetime.now().isoformat(),
+                last_error=f"Day {next_day} completed with 0 trades"
             )
 
         return result

@@ -867,9 +867,9 @@ class ExecutionPipeline:
             else:
                 # Try to get price from market data
                 try:
-                    from market_data import MarketData
-                    md = MarketData()
-                    ticker_data = md.get_ticker_data(order.ticker)
+                    from market_data import MarketDataCollector
+                    md = MarketDataCollector()
+                    ticker_data = md.get_single_ticker(order.ticker)
                     if ticker_data and 'price' in ticker_data:
                         estimated_price = ticker_data['price']
                     else:

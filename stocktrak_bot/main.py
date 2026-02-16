@@ -548,107 +548,6 @@ def sprint3_reset_mode():
     print("Sprint3 state reset successfully.")
 
 
-def sprint3_auto_mode(poll_seconds: int = 30):
-    """
-    Run SPRINT3 automatically across all days with restart-safe state tracking.
-
-    Behavior:
-    - Initializes sprint state if not active
-    - Polls continuously during runtime
-    - Executes at most one sprint day per calendar day (ET)
-    - Resumes from persisted state after restart
-    - Stops automatically when sprint is complete
-
-    Args:
-        poll_seconds: Loop interval in seconds
-    """
-    import time
-    from sprint3_strategy import Sprint3Executor, is_market_open, is_in_execution_window, SPRINT3_TOTAL_DAYS
-    from stocktrak_bot import StockTrakBot
-    from state_manager import StateManager
-
-    logger = logging.getLogger('stocktrak_bot')
-
-    print("\n" + "!" * 70)
-    print("SPRINT3 AUTO MODE - Hands-Free Multi-Day Execution")
-    print("!" * 70)
-    print(f"Polling every {poll_seconds}s. Press Ctrl+C to stop.\n")
-
-    state = StateManager()
-    if not state.is_sprint3_active():
-        print("Initializing SPRINT3 state...")
-        state.start_sprint3()
-
-    while True:
-        try:
-            # Reload state each loop so restarts/manual edits are respected
-            state = StateManager()
-            sprint_state = state.get_sprint3_state()
-            sprint_day = sprint_state.get('sprint_day', 0)
-            last_run_day = sprint_state.get('last_run_day')
-
-            if sprint_day >= SPRINT3_TOTAL_DAYS:
-                print(f"SPRINT3 already complete ({sprint_day}/{SPRINT3_TOTAL_DAYS}). Exiting auto mode.")
-                return
-
-            market_open, market_reason = is_market_open()
-            in_window, window_reason = is_in_execution_window()
-
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"[{now}] Day {sprint_day}/{SPRINT3_TOTAL_DAYS} | Market: {market_reason} | Window: {window_reason}")
-
-            if not market_open or not in_window:
-                time.sleep(poll_seconds)
-                continue
-
-            today_et = datetime.now().date().isoformat()
-            if last_run_day == today_et:
-                logger.info(f"SPRINT3 already executed today ({today_et}); waiting for next day")
-                time.sleep(poll_seconds)
-                continue
-
-            next_day = sprint_day + 1
-            print(f"\nExecuting SPRINT3 Day {next_day} automatically...\n")
-
-            bot = None
-            try:
-                bot = StockTrakBot()
-                bot.start_browser(headless=False)
-
-                if not bot.login():
-                    raise Exception("Login failed")
-
-                executor = Sprint3Executor(bot, state, dry_run=False)
-                result = executor.execute_sprint_day()
-
-                if result.get('success'):
-                    print(f"SPRINT3 Day {next_day} complete. Trades: {result.get('trades_executed', 0)}")
-                else:
-                    err = result.get('error', 'Unknown sprint execution error')
-                    print(f"SPRINT3 Day {next_day} failed: {err}")
-                    state.update_sprint3_state(last_error=err)
-
-            except Exception as e:
-                logger.error(f"SPRINT3 auto execution error: {e}")
-                state.update_sprint3_state(last_error=str(e))
-            finally:
-                if bot:
-                    try:
-                        bot.close()
-                    except Exception:
-                        pass
-
-            # Give website/broker UI a short cooldown after an execution attempt
-            time.sleep(max(60, poll_seconds))
-
-        except KeyboardInterrupt:
-            print("\nSPRINT3 auto mode stopped by user.")
-            return
-        except Exception as e:
-            logger.error(f"SPRINT3 auto loop error: {e}")
-            time.sleep(poll_seconds)
-
-
 def queue_mode(audit_only: bool = False, cancel_duplicates: bool = False):
     """
     Queue management mode - audit and organize pending orders.
@@ -1019,6 +918,184 @@ def hold_test_mode():
             os.remove(backup)
 
 
+def sprint3_auto_mode(force_day: int = None):
+    """
+    SPRINT3 Autonomous Multi-Day Execution.
+
+    Hands-free mode that:
+    1. Checks for market holidays before entering the wait loop
+    2. Waits for the execution window (09:40-10:05 ET)
+    3. Executes the next sprint3 day
+    4. Sleeps and repeats the next trading day
+    5. Only marks a day complete if trades actually succeeded
+
+    Uses longer sleep intervals outside market hours to reduce resource usage.
+    """
+    import time as _time
+    from sprint3_strategy import (
+        Sprint3Executor, is_market_open, is_in_execution_window,
+        is_market_holiday, SPRINT3_SATELLITE_UNIVERSE, SPRINT3_CORE
+    )
+    from stocktrak_bot import StockTrakBot
+    from state_manager import StateManager
+    import pytz
+
+    logger = logging.getLogger('stocktrak_bot')
+
+    print("\n" + "!" * 70)
+    print("SPRINT3 AUTO MODE - Hands-Free Multi-Day Execution")
+    print("!" * 70)
+    print("The bot will automatically:")
+    print("  1. Wait for execution window (09:40-10:05 ET)")
+    print("  2. Execute the next sprint3 day")
+    print("  3. Sleep and repeat for remaining sprint days")
+    print("  4. Skip weekends and market holidays")
+    print("Press Ctrl+C to stop.\n")
+
+    state = StateManager()
+
+    # Initialize sprint if not already active
+    if not state.is_sprint3_active():
+        print("Initializing SPRINT3 mode...")
+        state.start_sprint3()
+
+    et = pytz.timezone('US/Eastern')
+    last_execution_date = None
+
+    while True:
+        try:
+            now_et = datetime.now(et)
+            today_str = now_et.strftime('%Y-%m-%d')
+
+            # Reload state from disk (in case another process updated it)
+            state = StateManager()
+            sprint3 = state.get_sprint3_state()
+
+            # Check if sprint is complete
+            if sprint3.get('sprint_day', 0) >= 3:
+                logger.info("SPRINT3 complete (all 3 days executed). Exiting auto mode.")
+                print("\nSPRINT3 COMPLETE - All 3 days executed!")
+                break
+
+            # Check if already executed today (with successful trades)
+            last_run = sprint3.get('last_run_day')
+            if last_run == today_str and last_execution_date == today_str:
+                # Sleep longer - wait for next day
+                next_check = now_et.replace(hour=9, minute=35, second=0, microsecond=0)
+                if now_et >= next_check:
+                    # After market open today - sleep until tomorrow
+                    logger.info(f"SPRINT3 already executed today ({today_str}); waiting for next day")
+                    _time.sleep(300)  # 5 min check interval
+                    continue
+                else:
+                    _time.sleep(60)
+                    continue
+
+            # Check market holiday BEFORE entering wait loop
+            is_holiday, holiday_name = is_market_holiday(now_et)
+            if is_holiday:
+                logger.info(f"Market holiday: {holiday_name}. Sleeping until tomorrow.")
+                print(f"\nMarket holiday: {holiday_name}. Sleeping...")
+                _time.sleep(300)  # Check every 5 min
+                continue
+
+            # Check if weekend
+            if now_et.weekday() > 4:
+                logger.info(f"Weekend (day {now_et.weekday()}). Sleeping...")
+                _time.sleep(300)
+                continue
+
+            # Check market status and execution window
+            market_open, market_reason = is_market_open()
+            in_window, window_reason = is_in_execution_window()
+
+            if not market_open:
+                # Before market open - use adaptive sleep interval
+                market_open_time = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                if now_et < market_open_time:
+                    seconds_until_open = (market_open_time - now_et).total_seconds()
+                    if seconds_until_open > 3600:
+                        sleep_time = 300  # 5 min when > 1 hour away
+                    elif seconds_until_open > 600:
+                        sleep_time = 60  # 1 min when > 10 min away
+                    else:
+                        sleep_time = 30  # 30s when close
+                else:
+                    sleep_time = 300  # After hours
+                logger.debug(f"Market closed: {market_reason}. Sleeping {sleep_time}s...")
+                _time.sleep(sleep_time)
+                continue
+
+            if not in_window:
+                logger.debug(f"Outside execution window: {window_reason}. Sleeping 30s...")
+                _time.sleep(30)
+                continue
+
+            # === IN EXECUTION WINDOW - EXECUTE SPRINT DAY ===
+            logger.info("=" * 70)
+            logger.info("SPRINT3 AUTO: Entering execution window")
+            logger.info("=" * 70)
+
+            bot = None
+            try:
+                bot = StockTrakBot()
+                bot.start_browser(headless=True)
+
+                if not bot.login():
+                    logger.error("Login failed - will retry in 60s")
+                    _time.sleep(60)
+                    continue
+
+                executor = Sprint3Executor(bot, state, dry_run=False)
+                result = executor.execute_sprint_day(force_day=force_day)
+
+                trades_done = result.get('trades_executed', 0)
+
+                if result['success'] and trades_done > 0:
+                    logger.info(f"SPRINT3 Day completed: {trades_done} trades executed")
+                    last_execution_date = today_str
+                    force_day = None  # Clear force_day after first use
+                elif result['success'] and trades_done == 0:
+                    logger.warning("SPRINT3 Day had 0 successful trades - will retry in 5 min")
+                    _time.sleep(300)
+                    continue
+                else:
+                    logger.error(f"SPRINT3 Day failed: {result.get('error')}")
+                    _time.sleep(300)
+                    continue
+
+                # Print status
+                executor.print_status()
+
+            except Exception as e:
+                logger.error(f"SPRINT3 AUTO execution error: {e}")
+                import traceback
+                traceback.print_exc()
+                _time.sleep(300)
+                continue
+
+            finally:
+                if bot:
+                    try:
+                        bot.close()
+                    except:
+                        pass
+
+            # After successful execution, sleep until next day
+            logger.info("Waiting for next trading day...")
+            _time.sleep(300)
+
+        except KeyboardInterrupt:
+            logger.info("SPRINT3 AUTO stopped by user")
+            print("\nStopped.")
+            break
+        except Exception as e:
+            logger.error(f"SPRINT3 AUTO loop error: {e}")
+            import traceback
+            traceback.print_exc()
+            _time.sleep(60)
+
+
 def scheduler_mode():
     """Start the continuous scheduler."""
     from scheduler import run_with_auto_restart
@@ -1140,7 +1217,7 @@ Examples:
         elif args.sprint3_reset:
             sprint3_reset_mode()
         elif args.sprint3_auto:
-            sprint3_auto_mode()
+            sprint3_auto_mode(force_day=args.sprint3_day)
         elif args.queue:
             queue_mode(audit_only=False, cancel_duplicates=False)
         elif args.queue_audit:
