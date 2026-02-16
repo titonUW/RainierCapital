@@ -1193,7 +1193,7 @@ class StateManager:
         sprint3 = self.get_sprint3_state()
         if sprint3.get('mode') == 'SPRINT3':
             print("\nSPRINT3 STATUS:")
-            print(f"  Sprint Day: {sprint3.get('sprint_day', 0)}/3")
+            print(f"  Sprint Day: {sprint3.get('sprint_day', 0)}/4")
             print(f"  Sprint Trades Used: {sprint3.get('trades_used_sprint', 0)}")
             print(f"  Sprint Trades Remaining: {self.get_sprint3_trades_remaining()}")
             print(f"  Satellites: {len(sprint3.get('satellites_held', []))}")
