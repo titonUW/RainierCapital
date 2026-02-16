@@ -1550,52 +1550,119 @@ class StockTrakBot:
         logger.info(f"Trade KPIs screenshot: {screenshot_path}")
 
         try:
-            # Get ALL text from the page body
+            # =====================================================================
+            # STRATEGY 1: Extract labeled values from KPI strip via JavaScript
+            # This is the most reliable approach - finds the label text ("Portfolio
+            # Value", "Cash Balance", "Buying Power") and reads the adjacent value.
+            # =====================================================================
+            labeled_values = self.page.evaluate("""
+            () => {
+                const result = {portfolio: null, cash: null, buying_power: null};
+                const labels = {
+                    'portfolio value': 'portfolio',
+                    'account value': 'portfolio',
+                    'cash balance': 'cash',
+                    'cash available': 'cash',
+                    'buying power': 'buying_power',
+                    'purchasing power': 'buying_power'
+                };
+
+                // Walk all elements looking for KPI labels
+                const allElements = document.querySelectorAll('*');
+                for (const el of allElements) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    for (const [labelText, key] of Object.entries(labels)) {
+                        if (text === labelText || text.startsWith(labelText)) {
+                            // Found a label - look for money value in parent/sibling
+                            const parent = el.parentElement;
+                            if (!parent) continue;
+                            const parentText = parent.textContent || '';
+                            const moneyMatch = parentText.match(/\\$?\\s*([\\d,]+\\.\\d{2})/);
+                            if (moneyMatch) {
+                                const val = parseFloat(moneyMatch[1].replace(/,/g, ''));
+                                if (val > 0 && result[key] === null) {
+                                    result[key] = val;
+                                }
+                            }
+                        }
+                    }
+                }
+                return result;
+            }
+            """)
+
+            logger.info(f"Labeled KPI extraction: {labeled_values}")
+
+            if (labeled_values.get('portfolio') and
+                labeled_values.get('buying_power')):
+                portfolio_value = labeled_values['portfolio']
+                cash_balance = labeled_values.get('cash') or labeled_values['buying_power']
+                buying_power = labeled_values['buying_power']
+
+                logger.info(f"Capital from labeled KPIs: Portfolio=${portfolio_value:,.2f}, "
+                           f"Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
+                return portfolio_value, cash_balance, buying_power
+
+            logger.warning("Labeled KPI extraction incomplete, falling back to regex parsing")
+
+            # =====================================================================
+            # STRATEGY 2 (FALLBACK): Regex-based extraction from page text
+            # Parse ALL money values and use the THREE LARGEST as Portfolio, Cash,
+            # Buying Power (sorted descending). This avoids the old >= $100k filter
+            # that broke when buying power dropped below $100k.
+            # =====================================================================
             body_text = self.page.locator('body').inner_text()
             logger.debug(f"Body text length: {len(body_text)}")
 
             # Regex that matches money values WITH OR WITHOUT $
-            # Matches: $500,315.16 OR 500,315.16
-            # Pattern: optional $, optional whitespace, 1-3 digits, then groups of comma+3 digits, then decimal+2 digits
             money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})+\.\d{2})'
             matches = re.findall(money_pattern, body_text)
 
-            logger.info(f"Raw money matches: {matches[:20]}")  # Log first 20 matches
+            logger.info(f"Raw money matches: {matches[:20]}")
 
-            # Parse and filter to CAPITAL-SIZED values only (>= $100,000)
-            # This filters out stock prices, order totals, etc.
-            capital_values = []
+            # Parse all values >= $1,000 (filters out stock prices under $1k)
+            all_values = []
             for match in matches:
                 try:
-                    # Remove commas and parse
                     value = float(match.replace(',', ''))
-                    # Capital-sized: between $100k and $50M
-                    if 100_000 <= value <= 50_000_000:
-                        capital_values.append(value)
+                    if 1_000 <= value <= 50_000_000:
+                        all_values.append(value)
                 except ValueError:
                     continue
 
-            logger.info(f"Capital-sized values (>=$100k): {capital_values}")
+            logger.info(f"Parsed values (>=$1k): {all_values}")
 
-            # Take the first 3 capital-sized values (portfolio, cash, buying_power)
-            if len(capital_values) >= 3:
-                portfolio_value = capital_values[0]
-                cash_balance = capital_values[1]
-                buying_power = capital_values[2]
-            elif len(capital_values) == 2:
-                portfolio_value = capital_values[0]
-                cash_balance = capital_values[1]
-                buying_power = capital_values[1]
-                logger.warning("Only 2 capital values found, using second for both cash and buying power")
-            elif len(capital_values) == 1:
-                # All three are likely the same (common at competition start)
-                portfolio_value = capital_values[0]
-                cash_balance = capital_values[0]
-                buying_power = capital_values[0]
-                logger.warning("Only 1 capital value found, using it for all three")
+            # Deduplicate adjacent identical values (the same KPI appearing twice)
+            deduped = []
+            for v in all_values:
+                if not deduped or abs(v - deduped[-1]) > 0.01:
+                    deduped.append(v)
+
+            logger.info(f"Deduped values: {deduped}")
+
+            # The KPI strip shows: Portfolio Value (largest), Cash Balance, Buying Power
+            # Portfolio >= Cash >= Buying Power (always)
+            # Sort descending and take first 3 distinct values
+            unique_sorted = sorted(set(deduped), reverse=True)
+            logger.info(f"Unique sorted values: {unique_sorted}")
+
+            if len(unique_sorted) >= 3:
+                portfolio_value = unique_sorted[0]
+                cash_balance = unique_sorted[1]
+                buying_power = unique_sorted[2]
+            elif len(unique_sorted) == 2:
+                portfolio_value = unique_sorted[0]
+                cash_balance = unique_sorted[1]
+                buying_power = unique_sorted[1]
+                logger.warning("Only 2 distinct values found, using smaller for both cash and buying power")
+            elif len(unique_sorted) == 1:
+                portfolio_value = unique_sorted[0]
+                cash_balance = unique_sorted[0]
+                buying_power = unique_sorted[0]
+                logger.warning("Only 1 distinct value found, using it for all three")
             else:
                 raise RuntimeError(
-                    f"No capital-sized values found (>=$100k). "
+                    f"No capital values found (>=$1k). "
                     f"Raw matches: {matches[:10]}. Screenshot: {screenshot_path}"
                 )
 
