@@ -53,6 +53,7 @@ SPRINT3_SATELLITE_SIZE = 0.025  # 2.5% per slot
 # Trade budget
 SPRINT3_TRADE_CAP = 65  # Leave 5 trade buffer
 SPRINT3_BUFFER_TRADES = 5
+SPRINT3_TOTAL_DAYS = 4  # Extended final-week push
 
 # Price safety
 SPRINT3_MIN_PRICE = 6.00  # Only buy if price >= $6
@@ -501,7 +502,7 @@ class Sprint3Executor:
         print("SPRINT3 STATUS")
         print("=" * 70)
         print(f"Mode:              {sprint['mode']}")
-        print(f"Sprint Day:        {sprint['sprint_day']}/3")
+        print(f"Sprint Day:        {sprint['sprint_day']}/{SPRINT3_TOTAL_DAYS}")
         print(f"Last Run:          {sprint['last_run_time'] or 'Never'}")
         print("-" * 70)
         print(f"Total Trades Used: {budget['total_used']}/80")
@@ -586,7 +587,7 @@ class Sprint3Executor:
             next_day = force_day
         elif current_day == 0:
             next_day = 1
-        elif current_day < 3:
+        elif current_day < SPRINT3_TOTAL_DAYS:
             # Check if we already ran today
             last_run = sprint_state.get('last_run_day')
             today = datetime.now().date().isoformat()
@@ -600,7 +601,7 @@ class Sprint3Executor:
         else:
             return {
                 'success': False,
-                'error': "Sprint complete (day 3 already executed)",
+                'error': f"Sprint complete (day {SPRINT3_TOTAL_DAYS} already executed)",
                 'trades_executed': 0
             }
 
@@ -611,8 +612,10 @@ class Sprint3Executor:
             result = self._execute_day1()
         elif next_day == 2:
             result = self._execute_day2()
-        else:
+        elif next_day == 3:
             result = self._execute_day3()
+        else:
+            result = self._execute_day4()
 
         # Update sprint state
         if result['success']:
@@ -800,16 +803,29 @@ class Sprint3Executor:
 
         logger.info(f"Sells complete: {len(sells_executed)}")
 
-        # Get new top candidates (excluding just-sold)
+        # Buy only as many replacements as we successfully sold
+        buy_slots = len(sells_executed)
+        if buy_slots == 0:
+            self.update_sprint_state(satellites_held=satellites_held)
+            logger.warning("No satellites sold on Day 2; skipping replacement buys")
+            return {
+                'success': True,
+                'trades_executed': trades_executed,
+                'sells': sells_executed,
+                'buys': buys_executed,
+                'errors': errors
+            }
+
+        # Get new top candidates (excluding anything still held and just sold)
         candidates = get_top_sprint3_candidates(
             market_data,
-            n=SPRINT3_SATELLITE_COUNT,
-            exclude_tickers=sells_executed + list(SPRINT3_CORE.keys()),
+            n=buy_slots,
+            exclude_tickers=list(positions.keys()) + sells_executed,
             require_eligible=True
         )
 
         # Buy new satellites
-        for candidate in candidates:
+        for candidate in candidates[:buy_slots]:
             budget = self.get_trades_budget()
             if budget['sprint_remaining'] <= 0:
                 logger.warning("Sprint budget exhausted")
@@ -853,14 +869,23 @@ class Sprint3Executor:
             'errors': errors
         }
 
-    def _execute_day3(self) -> Dict:
+    def _execute_day4(self) -> Dict:
         """
-        Day 3: Rotate remaining trades to hit cap.
+        Day 4: Overtime rotation with remaining budget.
+
+        Same mechanic as Day 3 (rotate worst current satellites), but with
+        the remaining sprint trade budget for one final momentum refresh.
+        """
+        return self._execute_day3(day_label=4)
+
+    def _execute_day3(self, day_label: int = 3) -> Dict:
+        """
+        Day 3/4: Rotate remaining trades to hit cap.
 
         Rotations = floor((SprintCap - TradesUsed) / 2)
         """
         logger.info("=" * 70)
-        logger.info("SPRINT3 DAY 3: Final rotation")
+        logger.info(f"SPRINT3 DAY {day_label}: Final rotation")
         logger.info("=" * 70)
 
         trades_executed = 0
@@ -977,8 +1002,9 @@ class Sprint3Executor:
         new_satellites = [t for t in satellites_held if t not in sells_executed] + buys_executed
         self.update_sprint_state(satellites_held=new_satellites)
 
-        logger.info(f"Day 3 complete: {trades_executed} trades ({len(sells_executed)} sells, {len(buys_executed)} buys)")
-        logger.info("SPRINT3 COMPLETE!")
+        logger.info(f"Day {day_label} complete: {trades_executed} trades ({len(sells_executed)} sells, {len(buys_executed)} buys)")
+        if day_label >= SPRINT3_TOTAL_DAYS:
+            logger.info("SPRINT3 COMPLETE!")
 
         return {
             'success': True,
@@ -1054,7 +1080,7 @@ def plan_sprint3(market_data: Dict, positions: Dict, sprint_day: int = 1) -> Dic
     Args:
         market_data: Market data dict
         positions: Current positions
-        sprint_day: Which day to plan (1, 2, or 3)
+        sprint_day: Which day to plan (1, 2, 3, or 4)
 
     Returns:
         Plan dict with proposed trades
@@ -1069,6 +1095,7 @@ def plan_sprint3(market_data: Dict, positions: Dict, sprint_day: int = 1) -> Dic
     voo_data = market_data.get('VOO')
     if not voo_data:
         plan['errors'].append('VOO data missing')
+        plan['total_trades'] = 0
         return plan
 
     if sprint_day == 1:
@@ -1130,7 +1157,7 @@ def plan_sprint3(market_data: Dict, positions: Dict, sprint_day: int = 1) -> Dic
                 'price': c.price
             })
 
-    elif sprint_day == 3:
+    elif sprint_day in (3, 4):
         # Score current satellites
         satellites = [t for t in positions if t not in SPRINT3_CORE]
         scores = []
