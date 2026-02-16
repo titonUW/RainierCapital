@@ -45,6 +45,7 @@ python main.py
 | `python main.py --sprint3-status` | Show SPRINT3 status |
 | `python main.py --sprint3-dry-run` | Plan SPRINT3 trades without executing |
 | `python main.py --sprint3-reset` | Reset SPRINT3 state |
+| `python main.py --sprint3-auto` | Run all sprint days automatically (resume-safe) |
 
 ## Competition Rules (Hard Constraints)
 
@@ -129,7 +130,7 @@ stocktrak_bot/
 
 ## SPRINT3 Mode - End-of-Competition Catch-Up Strategy
 
-SPRINT3 is a high-intensity 3-day trading mode designed for end-of-competition catch-up scenarios. It uses up to 65 trades to aggressively rotate a momentum-based satellite portfolio.
+SPRINT3 is a high-intensity 4-day trading mode designed for end-of-competition catch-up scenarios. It uses up to 65 trades to aggressively rotate a momentum-based satellite portfolio.
 
 ### SPRINT3 Strategy
 
@@ -150,8 +151,9 @@ SPRINT3 is a high-intensity 3-day trading mode designed for end-of-competition c
 | Day | Action | Trades |
 |-----|--------|--------|
 | Day 1 | Build core + 16 satellites | ~19 trades |
-| Day 2 | Rotate ALL 16 satellites | 32 trades |
-| Day 3 | Rotate remaining budget | Up to 14 trades |
+| Day 2 | Rotate eligible satellites (24h-compliant) | Up to 32 trades |
+| Day 3 | Rotate worst current satellites | Up to budget |
+| Day 4 | Final overtime momentum rotation | Remaining budget |
 
 **CRITICAL: Execute only in the 9:40-10:05 AM ET window!**
 
@@ -206,6 +208,32 @@ python main.py --sprint3
 
 # Type "SPRINT3" to confirm
 ```
+
+**Day 4 (Overtime Final Push):**
+```bash
+# At 9:45 AM ET (24h+ after Day 3)
+python main.py --sprint3
+
+# Type "SPRINT4" to confirm
+```
+
+
+### SPRINT3 Auto Mode (Recommended)
+
+To run the final sprint hands-free across all remaining sprint days:
+
+```bash
+python main.py --sprint3-auto
+```
+
+Auto mode behavior:
+- Initializes sprint state if needed
+- Reads persisted sprint state on each loop (restart-safe)
+- Executes at most one sprint day per ET calendar day
+- Waits for market open + execution window before placing trades
+- Automatically exits when sprint is complete
+
+If the process restarts, run the same command again and it resumes from the saved sprint day.
 
 ### SPRINT3 Safety Checks
 

@@ -350,18 +350,19 @@ def sprint3_mode(dry_run: bool = False, force_day: int = None):
     """
     Execute SPRINT3 trading mode.
 
-    Sprint3 is a high-intensity 3-day trading strategy for end-of-competition catch-up:
+    Sprint3 is a high-intensity 4-day trading strategy for end-of-competition catch-up:
     - Day 1: Build core positions (60%) + 16 satellite positions (40%)
-    - Day 2: Rotate all 16 satellites
-    - Day 3: Rotate remaining budget trades
+    - Day 2: Rotate satellites that have cleared hold constraints
+    - Day 3: Rotate worst remaining satellites
+    - Day 4: Final overtime rotation
 
     Args:
         dry_run: If True, print planned trades without executing
-        force_day: Force a specific sprint day (1, 2, or 3)
+        force_day: Force a specific sprint day (1, 2, 3, or 4)
     """
     from sprint3_strategy import (
         Sprint3Executor, plan_sprint3, print_sprint3_plan, print_sprint3_scoring_report,
-        is_market_open, is_in_execution_window, SPRINT3_SATELLITE_UNIVERSE, SPRINT3_CORE
+        is_market_open, is_in_execution_window, SPRINT3_SATELLITE_UNIVERSE, SPRINT3_CORE, SPRINT3_TOTAL_DAYS
     )
     from market_data import MarketDataCollector
     from stocktrak_bot import StockTrakBot
@@ -383,13 +384,13 @@ def sprint3_mode(dry_run: bool = False, force_day: int = None):
     print(f"Execution Window: {window_reason}")
 
     if not market_open and not dry_run:
-        print("\nERROR: Market is closed. Sprint3 must be run during market hours (3:55-4:00 PM ET).")
+        print("\nERROR: Market is closed. Sprint3 must be run during market hours.")
         print("Use --sprint3-dry-run to test without executing trades.")
         return
 
     if not in_window and not dry_run:
-        print("\nWARNING: Outside optimal execution window (3:55-4:00 PM ET).")
-        print("Trading outside this window may cause 24h hold violations.")
+        print("\nWARNING: Outside configured execution window (09:40-10:05 AM ET).")
+        print("Trading outside this window may reduce execution consistency.")
         confirm = input("Continue anyway? (yes/no): ")
         if confirm.lower() != 'yes':
             print("Cancelled.")
@@ -412,7 +413,7 @@ def sprint3_mode(dry_run: bool = False, force_day: int = None):
         sprint_state = state.get_sprint3_state()
         current_day = sprint_state.get('sprint_day', 0)
 
-        plan_day = force_day or (current_day + 1 if current_day < 3 else 1)
+        plan_day = force_day or (current_day + 1 if current_day < SPRINT3_TOTAL_DAYS else 1)
         plan = plan_sprint3(market_data, positions, sprint_day=plan_day)
         print_sprint3_plan(plan)
 
@@ -427,8 +428,8 @@ def sprint3_mode(dry_run: bool = False, force_day: int = None):
     sprint_state = state.get_sprint3_state()
     next_day = force_day or (sprint_state.get('sprint_day', 0) + 1)
 
-    if next_day > 3:
-        print("\nSPRINT3 already complete (all 3 days executed).")
+    if next_day > SPRINT3_TOTAL_DAYS:
+        print(f"\nSPRINT3 already complete (all {SPRINT3_TOTAL_DAYS} days executed).")
         print("Use --sprint3-reset to start a new sprint.")
         return
 
@@ -479,7 +480,7 @@ def sprint3_mode(dry_run: bool = False, force_day: int = None):
 
 def sprint3_status_mode():
     """Show current SPRINT3 status."""
-    from sprint3_strategy import is_market_open, is_in_execution_window
+    from sprint3_strategy import is_market_open, is_in_execution_window, SPRINT3_TOTAL_DAYS
     from state_manager import StateManager
 
     state = StateManager()
@@ -495,7 +496,7 @@ def sprint3_status_mode():
     else:
         print(f"Mode:              Not active")
 
-    print(f"Sprint Day:        {sprint3.get('sprint_day', 0)}/3")
+    print(f"Sprint Day:        {sprint3.get('sprint_day', 0)}/{SPRINT3_TOTAL_DAYS}")
     print(f"Sprint Trades Used: {sprint3.get('trades_used_sprint', 0)}")
     print(f"Sprint Remaining:  {state.get_sprint3_trades_remaining()}")
     print(f"Last Run:          {sprint3.get('last_run_time') or 'Never'}")
@@ -545,6 +546,107 @@ def sprint3_reset_mode():
 
     state.reset_sprint3()
     print("Sprint3 state reset successfully.")
+
+
+def sprint3_auto_mode(poll_seconds: int = 30):
+    """
+    Run SPRINT3 automatically across all days with restart-safe state tracking.
+
+    Behavior:
+    - Initializes sprint state if not active
+    - Polls continuously during runtime
+    - Executes at most one sprint day per calendar day (ET)
+    - Resumes from persisted state after restart
+    - Stops automatically when sprint is complete
+
+    Args:
+        poll_seconds: Loop interval in seconds
+    """
+    import time
+    from sprint3_strategy import Sprint3Executor, is_market_open, is_in_execution_window, SPRINT3_TOTAL_DAYS
+    from stocktrak_bot import StockTrakBot
+    from state_manager import StateManager
+
+    logger = logging.getLogger('stocktrak_bot')
+
+    print("\n" + "!" * 70)
+    print("SPRINT3 AUTO MODE - Hands-Free Multi-Day Execution")
+    print("!" * 70)
+    print(f"Polling every {poll_seconds}s. Press Ctrl+C to stop.\n")
+
+    state = StateManager()
+    if not state.is_sprint3_active():
+        print("Initializing SPRINT3 state...")
+        state.start_sprint3()
+
+    while True:
+        try:
+            # Reload state each loop so restarts/manual edits are respected
+            state = StateManager()
+            sprint_state = state.get_sprint3_state()
+            sprint_day = sprint_state.get('sprint_day', 0)
+            last_run_day = sprint_state.get('last_run_day')
+
+            if sprint_day >= SPRINT3_TOTAL_DAYS:
+                print(f"SPRINT3 already complete ({sprint_day}/{SPRINT3_TOTAL_DAYS}). Exiting auto mode.")
+                return
+
+            market_open, market_reason = is_market_open()
+            in_window, window_reason = is_in_execution_window()
+
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[{now}] Day {sprint_day}/{SPRINT3_TOTAL_DAYS} | Market: {market_reason} | Window: {window_reason}")
+
+            if not market_open or not in_window:
+                time.sleep(poll_seconds)
+                continue
+
+            today_et = datetime.now().date().isoformat()
+            if last_run_day == today_et:
+                logger.info(f"SPRINT3 already executed today ({today_et}); waiting for next day")
+                time.sleep(poll_seconds)
+                continue
+
+            next_day = sprint_day + 1
+            print(f"\nExecuting SPRINT3 Day {next_day} automatically...\n")
+
+            bot = None
+            try:
+                bot = StockTrakBot()
+                bot.start_browser(headless=False)
+
+                if not bot.login():
+                    raise Exception("Login failed")
+
+                executor = Sprint3Executor(bot, state, dry_run=False)
+                result = executor.execute_sprint_day()
+
+                if result.get('success'):
+                    print(f"SPRINT3 Day {next_day} complete. Trades: {result.get('trades_executed', 0)}")
+                else:
+                    err = result.get('error', 'Unknown sprint execution error')
+                    print(f"SPRINT3 Day {next_day} failed: {err}")
+                    state.update_sprint3_state(last_error=err)
+
+            except Exception as e:
+                logger.error(f"SPRINT3 auto execution error: {e}")
+                state.update_sprint3_state(last_error=str(e))
+            finally:
+                if bot:
+                    try:
+                        bot.close()
+                    except Exception:
+                        pass
+
+            # Give website/broker UI a short cooldown after an execution attempt
+            time.sleep(max(60, poll_seconds))
+
+        except KeyboardInterrupt:
+            print("\nSPRINT3 auto mode stopped by user.")
+            return
+        except Exception as e:
+            logger.error(f"SPRINT3 auto loop error: {e}")
+            time.sleep(poll_seconds)
 
 
 def queue_mode(audit_only: bool = False, cancel_duplicates: bool = False):
@@ -949,9 +1051,10 @@ Examples:
     python main.py --queue          Audit and clean up pending order queue
     python main.py --queue-audit    Audit pending orders (no changes)
     python main.py --queue-auto     Auto-cancel duplicate orders (no confirmation)
-    python main.py --sprint3        Execute SPRINT3 mode (3-day high-intensity trading)
+    python main.py --sprint3        Execute SPRINT3 mode (4-day high-intensity trading)
     python main.py --sprint3-status Show SPRINT3 status
     python main.py --sprint3-dry-run Plan SPRINT3 trades without executing
+    python main.py --sprint3-auto   Run all sprint days automatically (restart-safe)
     python main.py                  Start continuous scheduler
         """
     )
@@ -973,15 +1076,17 @@ Examples:
 
     # SPRINT3 options
     parser.add_argument('--sprint3', action='store_true',
-                        help='Execute SPRINT3 mode (3-day high-intensity trading)')
+                        help='Execute SPRINT3 mode (4-day high-intensity trading)')
     parser.add_argument('--sprint3-status', action='store_true',
                         help='Show SPRINT3 status')
     parser.add_argument('--sprint3-dry-run', action='store_true',
                         help='Plan SPRINT3 trades without executing')
     parser.add_argument('--sprint3-reset', action='store_true',
                         help='Reset SPRINT3 state')
-    parser.add_argument('--sprint3-day', type=int, choices=[1, 2, 3],
-                        help='Force specific sprint day (1, 2, or 3)')
+    parser.add_argument('--sprint3-auto', action='store_true',
+                        help='Run all sprint days automatically with state resume')
+    parser.add_argument('--sprint3-day', type=int, choices=[1, 2, 3, 4],
+                        help='Force specific sprint day (1, 2, 3, or 4)')
 
     # Queue management options
     parser.add_argument('--queue', action='store_true',
@@ -1034,6 +1139,8 @@ Examples:
             sprint3_mode(dry_run=True, force_day=args.sprint3_day)
         elif args.sprint3_reset:
             sprint3_reset_mode()
+        elif args.sprint3_auto:
+            sprint3_auto_mode()
         elif args.queue:
             queue_mode(audit_only=False, cancel_duplicates=False)
         elif args.queue_audit:
@@ -1078,6 +1185,8 @@ def get_mode_name(args):
         return "SPRINT3-DRY-RUN"
     elif args.sprint3_reset:
         return "SPRINT3-RESET"
+    elif args.sprint3_auto:
+        return "SPRINT3-AUTO"
     elif args.queue:
         return "QUEUE"
     elif args.queue_audit:
