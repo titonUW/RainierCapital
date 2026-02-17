@@ -787,13 +787,15 @@ class Sprint3Executor:
         if not market_data.get('VOO'):
             return {'success': False, 'error': 'Could not fetch market data', 'trades_executed': 0}
 
-        # Get portfolio value
+        # Get portfolio value and buying power
         try:
             portfolio_value, cash, buying_power = self.bot.get_capital_from_trade_kpis("VOO")
         except Exception as e:
             return {'success': False, 'error': f'Could not get capital: {e}', 'trades_executed': 0}
 
-        logger.info(f"Portfolio: ${portfolio_value:,.2f}, Cash: ${cash:,.2f}, Buying Power: ${buying_power:,.2f}")
+        # Use buying_power for allocation when portfolio_value is near zero
+        effective_capital = portfolio_value if portfolio_value > 1000 else buying_power
+        logger.info(f"Portfolio: ${portfolio_value:,.2f}, Cash: ${cash:,.2f}, Buying Power: ${buying_power:,.2f}, Effective: ${effective_capital:,.2f}")
 
         positions = self.state.get_positions()
 
@@ -810,10 +812,10 @@ class Sprint3Executor:
                 logger.warning(f"CORE {ticker}: No price data")
                 continue
 
-            shares = calculate_shares_for_allocation(portfolio_value, target_pct, price)
+            shares = calculate_shares_for_allocation(effective_capital, target_pct, price)
 
             if shares < 1:
-                logger.warning(f"CORE {ticker}: Position too small")
+                logger.warning(f"CORE {ticker}: Position too small (capital=${effective_capital:,.2f})")
                 continue
 
             result = self._execute_buy(ticker, shares, f"SPRINT3_D1_CORE_{target_pct*100:.0f}PCT", price)
@@ -841,7 +843,7 @@ class Sprint3Executor:
                 break
 
             shares = calculate_shares_for_allocation(
-                portfolio_value, SPRINT3_SATELLITE_SIZE, candidate.price
+                effective_capital, SPRINT3_SATELLITE_SIZE, candidate.price
             )
 
             if shares < 1:
@@ -883,6 +885,8 @@ class Sprint3Executor:
         Day 2: Rotate ALL 16 satellites.
 
         Expected trades: 16 sells + 16 buys = 32 trades
+        If positions are missing (already liquidated), treat them as sold
+        and proceed directly to buying fresh satellites.
         """
         logger.info("=" * 70)
         logger.info("SPRINT3 DAY 2: Full satellite rotation")
@@ -901,22 +905,30 @@ class Sprint3Executor:
         if not market_data.get('VOO'):
             return {'success': False, 'error': 'Could not fetch market data', 'trades_executed': 0}
 
-        # Get portfolio value
+        # Get portfolio value and buying power
         try:
             portfolio_value, cash, buying_power = self.bot.get_capital_from_trade_kpis("VOO")
         except Exception as e:
             return {'success': False, 'error': f'Could not get capital: {e}', 'trades_executed': 0}
 
+        # Use buying_power for allocation when portfolio_value is near zero
+        # (positions may have been sold externally or state was reset)
+        effective_capital = portfolio_value if portfolio_value > 1000 else buying_power
+        logger.info(f"Capital: Portfolio=${portfolio_value:,.2f}, Buying Power=${buying_power:,.2f}, Effective=${effective_capital:,.2f}")
+
         positions = self.state.get_positions()
         sprint_state = self.get_sprint_state()
         satellites_held = sprint_state.get('satellites_held', [])
 
-        # Sell all satellites (if 24h elapsed)
-        for ticker in satellites_held:
-            if ticker not in positions:
-                logger.debug(f"SELL {ticker}: Not in positions")
-                continue
+        # Detect how many satellites are actually in positions vs missing
+        satellites_in_positions = [t for t in satellites_held if t in positions]
+        satellites_missing = [t for t in satellites_held if t not in positions]
 
+        if satellites_missing:
+            logger.warning(f"{len(satellites_missing)} satellites not in positions (already liquidated): {satellites_missing}")
+
+        # Sell satellites that are still in positions (if 24h elapsed)
+        for ticker in satellites_in_positions:
             position = positions[ticker]
             can_sell, reason = can_sell_sprint3(position)
 
@@ -941,18 +953,29 @@ class Sprint3Executor:
 
         logger.info(f"Sells complete: {len(sells_executed)}")
 
-        # Buy only as many replacements as we successfully sold
-        buy_slots = len(sells_executed)
+        # Buy slots = satellites sold + satellites that were already missing
+        # Missing satellites are treated as "already sold" (cash is available)
+        buy_slots = len(sells_executed) + len(satellites_missing)
+
         if buy_slots == 0:
-            self.update_sprint_state(satellites_held=satellites_held)
-            logger.warning("No satellites sold on Day 2; skipping replacement buys")
-            return {
-                'success': True,
-                'trades_executed': trades_executed,
-                'sells': sells_executed,
-                'buys': buys_executed,
-                'errors': errors
-            }
+            # No satellites were held AND none were missing - nothing to rotate
+            # Fall back to buying a full set of 16 fresh satellites
+            if len(satellites_held) == 0:
+                logger.warning("No satellites tracked at all; buying fresh set of 16")
+                buy_slots = SPRINT3_SATELLITE_COUNT
+            else:
+                # All satellites still held but can't sell yet (hold period)
+                self.update_sprint_state(satellites_held=satellites_held)
+                logger.warning("No satellites sold on Day 2 (hold period not met); will retry")
+                return {
+                    'success': True,
+                    'trades_executed': trades_executed,
+                    'sells': sells_executed,
+                    'buys': buys_executed,
+                    'errors': errors
+                }
+
+        logger.info(f"Buy slots available: {buy_slots} ({len(sells_executed)} sold + {len(satellites_missing)} missing)")
 
         # Get new top candidates (excluding anything still held and just sold)
         candidates = get_top_sprint3_candidates(
@@ -970,10 +993,11 @@ class Sprint3Executor:
                 break
 
             shares = calculate_shares_for_allocation(
-                portfolio_value, SPRINT3_SATELLITE_SIZE, candidate.price
+                effective_capital, SPRINT3_SATELLITE_SIZE, candidate.price
             )
 
             if shares < 1:
+                logger.warning(f"BUY {candidate.ticker}: 0 shares calculated (capital=${effective_capital:,.2f}, size={SPRINT3_SATELLITE_SIZE}, price=${candidate.price:.2f})")
                 continue
 
             result = self._execute_buy(
@@ -994,8 +1018,9 @@ class Sprint3Executor:
 
             time.sleep(3)
 
-        # Update satellites held
-        self.update_sprint_state(satellites_held=buys_executed)
+        # Update satellites held: keep unsold + add newly bought
+        remaining_held = [t for t in satellites_held if t in positions and t not in sells_executed]
+        self.update_sprint_state(satellites_held=remaining_held + buys_executed)
 
         logger.info(f"Day 2 complete: {trades_executed} trades ({len(sells_executed)} sells, {len(buys_executed)} buys)")
 
@@ -1021,6 +1046,7 @@ class Sprint3Executor:
         Day 3/4: Rotate remaining trades to hit cap.
 
         Rotations = floor((SprintCap - TradesUsed) / 2)
+        If portfolio is empty (positions missing), buy fresh satellites instead.
         """
         logger.info("=" * 70)
         logger.info(f"SPRINT3 DAY {day_label}: Final rotation")
@@ -1051,21 +1077,30 @@ class Sprint3Executor:
         if not market_data.get('VOO'):
             return {'success': False, 'error': 'Could not fetch market data', 'trades_executed': 0}
 
-        # Get portfolio value
+        # Get portfolio value and buying power
         try:
             portfolio_value, cash, buying_power = self.bot.get_capital_from_trade_kpis("VOO")
         except Exception as e:
             return {'success': False, 'error': f'Could not get capital: {e}', 'trades_executed': 0}
 
+        # Use buying_power for allocation when portfolio_value is near zero
+        effective_capital = portfolio_value if portfolio_value > 1000 else buying_power
+        logger.info(f"Capital: Portfolio=${portfolio_value:,.2f}, Buying Power=${buying_power:,.2f}, Effective=${effective_capital:,.2f}")
+
         positions = self.state.get_positions()
         sprint_state = self.get_sprint_state()
         satellites_held = sprint_state.get('satellites_held', [])
 
+        # Detect missing positions
+        satellites_in_positions = [t for t in satellites_held if t in positions]
+        satellites_missing = [t for t in satellites_held if t not in positions]
+
+        if satellites_missing:
+            logger.warning(f"{len(satellites_missing)} satellites not in positions (already liquidated): {satellites_missing}")
+
         # Score current satellites to find worst ones to rotate
         current_scores = []
-        for ticker in satellites_held:
-            if ticker not in positions:
-                continue
+        for ticker in satellites_in_positions:
             ticker_data = market_data.get(ticker, {})
             if ticker_data:
                 ticker_data['ticker'] = ticker
@@ -1101,21 +1136,33 @@ class Sprint3Executor:
             time.sleep(3)
             rotations_done += 1
 
+        # Buy slots: sold positions + missing positions (already liquidated)
+        # Cap by available budget (each buy uses 1 trade)
+        buy_slots = min(len(sells_executed) + len(satellites_missing), budget['sprint_remaining'] - len(sells_executed))
+        if buy_slots < 0:
+            buy_slots = 0
+
+        # If portfolio is completely empty, buy fresh satellites up to budget
+        if len(satellites_in_positions) == 0 and len(satellites_held) > 0 and buy_slots == 0:
+            buy_slots = min(SPRINT3_SATELLITE_COUNT, budget['sprint_remaining'])
+            logger.warning(f"Portfolio empty - buying {buy_slots} fresh satellites")
+
         # Get new candidates
         candidates = get_top_sprint3_candidates(
             market_data,
-            n=len(sells_executed),
+            n=max(len(sells_executed), buy_slots),
             exclude_tickers=list(positions.keys()) + sells_executed,
             require_eligible=True
         )
 
         # Buy replacements
-        for candidate in candidates[:len(sells_executed)]:
+        for candidate in candidates[:buy_slots]:
             shares = calculate_shares_for_allocation(
-                portfolio_value, SPRINT3_SATELLITE_SIZE, candidate.price
+                effective_capital, SPRINT3_SATELLITE_SIZE, candidate.price
             )
 
             if shares < 1:
+                logger.warning(f"BUY {candidate.ticker}: 0 shares (capital=${effective_capital:,.2f}, price=${candidate.price:.2f})")
                 continue
 
             result = self._execute_buy(
@@ -1136,8 +1183,8 @@ class Sprint3Executor:
 
             time.sleep(3)
 
-        # Update satellites held
-        new_satellites = [t for t in satellites_held if t not in sells_executed] + buys_executed
+        # Update satellites held: keep unsold + add newly bought
+        new_satellites = [t for t in satellites_held if t in positions and t not in sells_executed] + buys_executed
         self.update_sprint_state(satellites_held=new_satellites)
 
         logger.info(f"Day {day_label} complete: {trades_executed} trades ({len(sells_executed)} sells, {len(buys_executed)} buys)")
