@@ -115,21 +115,69 @@ class QueueManager:
             self.bot.page.wait_for_load_state("networkidle")
 
             # Dismiss any overlays
-            from stocktrak_bot import dismiss_stocktrak_overlays
+            from stocktrak_bot import dismiss_stocktrak_overlays, take_debug_screenshot
             dismiss_stocktrak_overlays(self.bot.page, total_ms=5000)
 
-            time.sleep(1)
+            # Wait longer for table to load (UI can be slow)
+            time.sleep(3)
 
-            # Find the orders table
-            # StockTrak typically has a table with columns:
-            # Symbol, Action, Quantity, Order Type, Price, Status, Date, etc.
-            table = self.bot.page.locator("table").first
-            if not table.is_visible(timeout=5000):
-                logger.warning("Order History table not found")
+            # Find the orders table with multi-selector strategy
+            # StockTrak may use <table>, role="grid", or role="table"
+            table = None
+            selectors = [
+                "table",
+                "[role='grid']",
+                "[role='table']",
+                "div:has-text('Order History') table",
+                ".order-history table",
+                "#orderHistory table",
+            ]
+
+            for selector in selectors:
+                try:
+                    loc = self.bot.page.locator(selector).first
+                    if loc.count() > 0 and loc.is_visible(timeout=2000):
+                        table = loc
+                        logger.debug(f"Found Order History table with selector: {selector}")
+                        break
+                except Exception:
+                    continue
+
+            if table is None:
+                # Dump debug info for selector debugging
+                current_url = self.bot.page.url
+                logger.warning(f"Order History table not found at URL: {current_url}")
+                take_debug_screenshot(self.bot.page, 'order_history_table_not_found')
+                # Also save HTML for selector debugging
+                try:
+                    html_content = self.bot.page.content()[:5000]  # First 5k chars
+                    logger.debug(f"Page HTML (first 5k): {html_content}")
+                except Exception:
+                    pass
                 return orders
 
-            # Get all rows (skip header)
-            rows = self.bot.page.locator("table tbody tr")
+            # Get all rows from the found table (skip header)
+            # Try multiple row selectors since structure varies
+            rows = None
+            row_selectors = [
+                "tbody tr",  # Standard table
+                "tr",        # Table without tbody
+                "[role='row']",  # Grid/accessibility pattern
+            ]
+
+            for row_sel in row_selectors:
+                try:
+                    rows_loc = table.locator(row_sel)
+                    if rows_loc.count() > 0:
+                        rows = rows_loc
+                        break
+                except Exception:
+                    continue
+
+            if rows is None:
+                logger.warning("Could not find rows in Order History table")
+                return orders
+
             row_count = rows.count()
             logger.info(f"Found {row_count} rows in Order History")
 

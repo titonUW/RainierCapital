@@ -746,8 +746,11 @@ class Sprint3Executor:
             result = self._execute_day4()
 
         # Update sprint state - only advance day if trades actually executed
-        # FIX: Previously marked day complete even with 0 trades, blocking retries
+        # OR if day was marked complete (e.g., hold period blocking sells is not a failure)
         trades_done = result.get('trades_executed', 0)
+        day_marked_complete = result.get('day_complete', False)
+        hold_period_pending = result.get('hold_period_pending', False)
+
         if result['success'] and trades_done > 0:
             self.update_sprint_state(
                 sprint_day=next_day,
@@ -756,7 +759,23 @@ class Sprint3Executor:
                 last_run_day=datetime.now().date().isoformat()
             )
             logger.info(f"Sprint day {next_day} marked complete: {trades_done} trades executed")
+        elif result['success'] and trades_done == 0 and day_marked_complete:
+            # Day was explicitly marked complete (e.g., hold period blocking - not a failure)
+            # Advance to next day to prevent infinite retries
+            self.update_sprint_state(
+                sprint_day=next_day,
+                last_run_time=datetime.now().isoformat(),
+                last_run_day=datetime.now().date().isoformat()
+            )
+            if hold_period_pending:
+                logger.info(
+                    f"Sprint day {next_day} marked complete with 0 trades "
+                    f"(hold period not yet elapsed). Will proceed to day {next_day + 1} tomorrow."
+                )
+            else:
+                logger.info(f"Sprint day {next_day} marked complete with 0 trades (no rotation needed)")
         elif result['success'] and trades_done == 0:
+            # Actual execution issue - allow retry
             logger.warning(f"Sprint day {next_day} had 0 successful trades - NOT marking as complete (will retry)")
             # Update last_run_time but NOT last_run_day, so the bot can retry today
             self.update_sprint_state(
@@ -963,16 +982,35 @@ class Sprint3Executor:
             if len(satellites_held) == 0:
                 logger.warning("No satellites tracked at all; buying fresh set of 16")
                 buy_slots = SPRINT3_SATELLITE_COUNT
+            elif len(satellites_in_positions) < SPRINT3_SATELLITE_COUNT:
+                # BOOTSTRAP PATH: We have fewer satellites than target
+                # This can happen if positions were liquidated externally or state was reset
+                # Buy enough to reach target (don't wait for sells)
+                slots_to_fill = SPRINT3_SATELLITE_COUNT - len(satellites_in_positions)
+                logger.warning(
+                    f"Only {len(satellites_in_positions)} satellites in positions "
+                    f"(target {SPRINT3_SATELLITE_COUNT}). Bootstrap buying {slots_to_fill} slots."
+                )
+                buy_slots = slots_to_fill
             else:
                 # All satellites still held but can't sell yet (hold period)
+                # This is NOT a failure - it means hold period hasn't elapsed
+                # Mark day as complete to avoid infinite retry loop
                 self.update_sprint_state(satellites_held=satellites_held)
-                logger.warning("No satellites sold on Day 2 (hold period not met); will retry")
+                logger.info(
+                    "No satellites sold on Day 2 (24h hold period not met for any position). "
+                    "This is expected if Day 1 was recent. Marking day as complete."
+                )
                 return {
                     'success': True,
                     'trades_executed': trades_executed,
                     'sells': sells_executed,
                     'buys': buys_executed,
-                    'errors': errors
+                    'errors': errors,
+                    # Flag to tell caller this was hold-period blocked, not a failure
+                    'hold_period_pending': True,
+                    # Mark as day_complete to prevent infinite retries
+                    'day_complete': True
                 }
 
         logger.info(f"Buy slots available: {buy_slots} ({len(sells_executed)} sold + {len(satellites_missing)} missing)")

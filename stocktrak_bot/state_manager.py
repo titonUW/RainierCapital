@@ -83,7 +83,8 @@ class StateManager:
                 if os.path.exists(self.state_file):
                     with open(self.state_file, 'r') as f:
                         state = json.load(f)
-                    logger.info(f"Loaded state from {self.state_file}")
+                    # Use DEBUG to avoid log spam (state is loaded every loop iteration)
+                    logger.debug(f"Loaded state from {self.state_file}")
                     return state
                 else:
                     logger.info("No existing state file, initializing fresh state")
@@ -148,6 +149,9 @@ class StateManager:
                 'last_result': None,
                 'last_error': None,
                 'last_screenshot': None,
+                # Retry tracking (persisted to survive restarts)
+                'retry_count_today': 0,
+                'retry_date': None,  # Date (YYYY-MM-DD) the retry counter is for
             },
         }
 

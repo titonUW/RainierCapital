@@ -1599,9 +1599,29 @@ class StockTrakBot:
                 cash_balance = labeled_values.get('cash') or labeled_values['buying_power']
                 buying_power = labeled_values['buying_power']
 
-                logger.info(f"Capital from labeled KPIs: Portfolio=${portfolio_value:,.2f}, "
-                           f"Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
-                return portfolio_value, cash_balance, buying_power
+                # SANITY CHECK: portfolio_value should be reasonable (>$1000)
+                # If portfolio_value is suspiciously low but cash/buying_power are high,
+                # the parser grabbed the wrong value (e.g., P/L or daily change)
+                if portfolio_value < 1000 and buying_power > 10000:
+                    logger.warning(
+                        f"Portfolio value ${portfolio_value:,.2f} is suspiciously low "
+                        f"compared to buying_power ${buying_power:,.2f}. "
+                        f"Likely parser grabbed wrong field (P/L?). Using fallback."
+                    )
+                    # Fall through to regex parsing
+                elif portfolio_value < cash_balance * 0.5:
+                    logger.warning(
+                        f"Portfolio value ${portfolio_value:,.2f} is < 50% of cash ${cash_balance:,.2f}. "
+                        f"This is abnormal. Using cash as portfolio_value fallback."
+                    )
+                    portfolio_value = cash_balance
+                    logger.info(f"Capital from labeled KPIs (adjusted): Portfolio=${portfolio_value:,.2f}, "
+                               f"Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
+                    return portfolio_value, cash_balance, buying_power
+                else:
+                    logger.info(f"Capital from labeled KPIs: Portfolio=${portfolio_value:,.2f}, "
+                               f"Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")
+                    return portfolio_value, cash_balance, buying_power
 
             logger.warning("Labeled KPI extraction incomplete, falling back to regex parsing")
 
@@ -1665,6 +1685,23 @@ class StockTrakBot:
                     f"No capital values found (>=$1k). "
                     f"Raw matches: {matches[:10]}. Screenshot: {screenshot_path}"
                 )
+
+            # FINAL SANITY CHECK: Ensure portfolio_value is reasonable
+            # If portfolio is vastly below cash, something is wrong with extraction
+            if portfolio_value < cash_balance * 0.90:
+                logger.warning(
+                    f"Portfolio ${portfolio_value:,.2f} < 90% of cash ${cash_balance:,.2f}. "
+                    f"Adjusting portfolio to cash value (likely extraction error)."
+                )
+                portfolio_value = cash_balance
+
+            # If portfolio is absurdly low but buying_power is high, use buying_power
+            if portfolio_value < 1000 and buying_power > 10000:
+                logger.warning(
+                    f"Portfolio ${portfolio_value:,.2f} is too low vs buying_power ${buying_power:,.2f}. "
+                    f"Using buying_power as portfolio fallback."
+                )
+                portfolio_value = buying_power
 
             logger.info(f"Capital from KPIs: Portfolio=${portfolio_value:,.2f}, "
                        f"Cash=${cash_balance:,.2f}, Buying Power=${buying_power:,.2f}")

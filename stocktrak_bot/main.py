@@ -961,23 +961,27 @@ def sprint3_auto_mode(force_day: int = None):
 
     et = pytz.timezone('US/Eastern')
     last_execution_date = None
-    retry_count_today = 0
     MAX_RETRIES_PER_DAY = 8  # Max retries before giving up for the day
-    retry_date = None  # Track which date the retry counter is for
 
     while True:
         try:
             now_et = datetime.now(et)
             today_str = now_et.strftime('%Y-%m-%d')
 
+            # Reload state from disk (in case another process updated it)
+            state = StateManager()
+            sprint3 = state.get_sprint3_state()
+
+            # Load persisted retry state (survives restarts)
+            retry_date = sprint3.get('retry_date')
+            retry_count_today = sprint3.get('retry_count_today', 0)
+
             # Reset retry counter on new day
             if retry_date != today_str:
                 retry_count_today = 0
                 retry_date = today_str
-
-            # Reload state from disk (in case another process updated it)
-            state = StateManager()
-            sprint3 = state.get_sprint3_state()
+                # Persist the reset
+                state.update_sprint3_state(retry_count_today=0, retry_date=today_str)
 
             # Check if sprint is complete
             if sprint3.get('sprint_day', 0) >= 3:
@@ -1070,6 +1074,7 @@ def sprint3_auto_mode(force_day: int = None):
                 if not bot.login():
                     logger.error("Login failed - will retry in 60s")
                     retry_count_today += 1
+                    state.update_sprint3_state(retry_count_today=retry_count_today, retry_date=today_str)
                     _time.sleep(60)
                     continue
 
@@ -1083,13 +1088,30 @@ def sprint3_auto_mode(force_day: int = None):
                     last_execution_date = today_str
                     force_day = None  # Clear force_day after first use
                     retry_count_today = 0  # Reset retries on success
+                    state.update_sprint3_state(retry_count_today=0, retry_date=today_str)
                 elif result['success'] and trades_done == 0:
-                    retry_count_today += 1
-                    logger.warning(f"SPRINT3 Day had 0 successful trades (retry {retry_count_today}/{MAX_RETRIES_PER_DAY}) - will retry in 5 min")
-                    _time.sleep(300)
-                    continue
+                    # Check if this was a hold-period block (not a failure, just need to wait)
+                    if result.get('day_complete') or result.get('hold_period_pending'):
+                        logger.info(
+                            "SPRINT3 Day marked complete with 0 trades "
+                            "(hold period not met or no rotation needed). "
+                            "NOT retrying - will advance to next day."
+                        )
+                        last_execution_date = today_str
+                        force_day = None
+                        retry_count_today = 0
+                        state.update_sprint3_state(retry_count_today=0, retry_date=today_str)
+                        # Fall through to success path - wait for next day
+                    else:
+                        # Actual execution issue - retry
+                        retry_count_today += 1
+                        state.update_sprint3_state(retry_count_today=retry_count_today, retry_date=today_str)
+                        logger.warning(f"SPRINT3 Day had 0 successful trades (retry {retry_count_today}/{MAX_RETRIES_PER_DAY}) - will retry in 5 min")
+                        _time.sleep(300)
+                        continue
                 else:
                     retry_count_today += 1
+                    state.update_sprint3_state(retry_count_today=retry_count_today, retry_date=today_str)
                     logger.error(f"SPRINT3 Day failed (retry {retry_count_today}/{MAX_RETRIES_PER_DAY}): {result.get('error')}")
                     _time.sleep(300)
                     continue
@@ -1099,6 +1121,7 @@ def sprint3_auto_mode(force_day: int = None):
 
             except Exception as e:
                 retry_count_today += 1
+                state.update_sprint3_state(retry_count_today=retry_count_today, retry_date=today_str)
                 logger.error(f"SPRINT3 AUTO execution error (retry {retry_count_today}/{MAX_RETRIES_PER_DAY}): {e}")
                 import traceback
                 traceback.print_exc()
