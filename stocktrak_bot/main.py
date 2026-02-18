@@ -961,11 +961,19 @@ def sprint3_auto_mode(force_day: int = None):
 
     et = pytz.timezone('US/Eastern')
     last_execution_date = None
+    retry_count_today = 0
+    MAX_RETRIES_PER_DAY = 8  # Max retries before giving up for the day
+    retry_date = None  # Track which date the retry counter is for
 
     while True:
         try:
             now_et = datetime.now(et)
             today_str = now_et.strftime('%Y-%m-%d')
+
+            # Reset retry counter on new day
+            if retry_date != today_str:
+                retry_count_today = 0
+                retry_date = today_str
 
             # Reload state from disk (in case another process updated it)
             state = StateManager()
@@ -990,6 +998,12 @@ def sprint3_auto_mode(force_day: int = None):
                 else:
                     _time.sleep(60)
                     continue
+
+            # Check if max retries exhausted for today
+            if retry_count_today >= MAX_RETRIES_PER_DAY:
+                logger.warning(f"Max retries ({MAX_RETRIES_PER_DAY}) exhausted for {today_str}; waiting for next day")
+                _time.sleep(300)
+                continue
 
             # Check market holiday BEFORE entering wait loop
             is_holiday, holiday_name = is_market_holiday(now_et)
@@ -1027,9 +1041,21 @@ def sprint3_auto_mode(force_day: int = None):
                 continue
 
             if not in_window:
-                logger.debug(f"Outside execution window: {window_reason}. Sleeping 30s...")
-                _time.sleep(30)
-                continue
+                # If we've already retried and window closed, extend window
+                # to allow retries during market hours (up to 3:30 PM ET)
+                if retry_count_today > 0 and market_open:
+                    extended_end = now_et.replace(hour=15, minute=30, second=0, microsecond=0)
+                    if now_et < extended_end:
+                        logger.info(f"Extended window active (retry {retry_count_today}/{MAX_RETRIES_PER_DAY})")
+                        # Fall through to execution below
+                    else:
+                        logger.debug(f"Past extended window. Sleeping 300s...")
+                        _time.sleep(300)
+                        continue
+                else:
+                    logger.debug(f"Outside execution window: {window_reason}. Sleeping 30s...")
+                    _time.sleep(30)
+                    continue
 
             # === IN EXECUTION WINDOW - EXECUTE SPRINT DAY ===
             logger.info("=" * 70)
@@ -1043,6 +1069,7 @@ def sprint3_auto_mode(force_day: int = None):
 
                 if not bot.login():
                     logger.error("Login failed - will retry in 60s")
+                    retry_count_today += 1
                     _time.sleep(60)
                     continue
 
@@ -1055,12 +1082,15 @@ def sprint3_auto_mode(force_day: int = None):
                     logger.info(f"SPRINT3 Day completed: {trades_done} trades executed")
                     last_execution_date = today_str
                     force_day = None  # Clear force_day after first use
+                    retry_count_today = 0  # Reset retries on success
                 elif result['success'] and trades_done == 0:
-                    logger.warning("SPRINT3 Day had 0 successful trades - will retry in 5 min")
+                    retry_count_today += 1
+                    logger.warning(f"SPRINT3 Day had 0 successful trades (retry {retry_count_today}/{MAX_RETRIES_PER_DAY}) - will retry in 5 min")
                     _time.sleep(300)
                     continue
                 else:
-                    logger.error(f"SPRINT3 Day failed: {result.get('error')}")
+                    retry_count_today += 1
+                    logger.error(f"SPRINT3 Day failed (retry {retry_count_today}/{MAX_RETRIES_PER_DAY}): {result.get('error')}")
                     _time.sleep(300)
                     continue
 
@@ -1068,7 +1098,8 @@ def sprint3_auto_mode(force_day: int = None):
                 executor.print_status()
 
             except Exception as e:
-                logger.error(f"SPRINT3 AUTO execution error: {e}")
+                retry_count_today += 1
+                logger.error(f"SPRINT3 AUTO execution error (retry {retry_count_today}/{MAX_RETRIES_PER_DAY}): {e}")
                 import traceback
                 traceback.print_exc()
                 _time.sleep(300)
