@@ -918,6 +918,203 @@ def hold_test_mode():
             os.remove(backup)
 
 
+def final_day_mode(dry_run: bool = False, sell_cores: bool = False,
+                   auto: bool = False):
+    """
+    FINAL DAY BLITZ - Maximum profit strategy for the last trading day.
+
+    This mode:
+    1. Scans an expanded universe of 100+ tickers for 1-day momentum
+    2. Sells all eligible (24h+) satellite positions to free cash
+    3. Buys top-scoring picks for the final 24-hour hold
+    4. Positions held through competition end (Feb 20 market close)
+
+    Args:
+        dry_run: If True, print plan without executing
+        sell_cores: If True, also sell core positions (VOO, VTI, VEA)
+        auto: If True, skip confirmation prompts
+    """
+    from final_day_strategy import (
+        FinalDayExecutor, plan_final_day, print_final_day_plan,
+        print_final_day_scoring_report, FINAL_DAY_UNIVERSE
+    )
+    from market_data import MarketDataCollector
+    from stocktrak_bot import StockTrakBot
+    from state_manager import StateManager
+
+    logger = logging.getLogger('stocktrak_bot')
+
+    print("\n" + "!" * 70)
+    print("FINAL DAY BLITZ - Maximum Profit Strategy")
+    print("Last trading day before competition ends!")
+    print("!" * 70)
+
+    state = StateManager()
+
+    # Show current status
+    budget_used = state.get_trades_used()
+    budget_remaining = state.get_trades_remaining()
+    positions = state.get_positions()
+
+    print(f"\nTrades used: {budget_used}/80")
+    print(f"Trades remaining: {budget_remaining}")
+    print(f"Current positions: {len(positions)}")
+    if positions:
+        for t, p in positions.items():
+            print(f"  {t}: {p.get('shares', 0)} shares @ ${p.get('entry_price', 0):.2f}")
+
+    if dry_run:
+        print("\n--- DRY RUN MODE ---")
+        print("Will print planned trades without executing.\n")
+
+        # Fetch market data
+        collector = MarketDataCollector()
+        all_tickers = list(set(
+            FINAL_DAY_UNIVERSE + list(positions.keys())
+        ))
+        print(f"Fetching data for {len(all_tickers)} tickers...")
+        market_data = collector.get_all_data(all_tickers)
+
+        # Print scoring report
+        print_final_day_scoring_report(market_data)
+
+        # Print plan
+        plan = plan_final_day(market_data, positions, sell_cores=sell_cores)
+        print_final_day_plan(plan)
+
+        return
+
+    # Live execution
+    if not auto:
+        print(f"\nAbout to execute FINAL DAY BLITZ")
+        print(f"  - Will sell eligible satellite positions")
+        if sell_cores:
+            print(f"  - Will also sell core positions (VOO, VTI, VEA)")
+        else:
+            print(f"  - Will KEEP core positions (use --sell-cores to sell)")
+        print(f"  - Will buy top {min(25, budget_remaining)} momentum picks")
+
+        confirm = input("\nType 'BLITZ' to execute: ")
+        if confirm != 'BLITZ':
+            print("Cancelled.")
+            return
+
+    # Execute
+    bot = None
+    try:
+        bot = StockTrakBot()
+        bot.start_browser(headless=True)
+
+        if not bot.login():
+            raise Exception("Login failed")
+
+        executor = FinalDayExecutor(bot, state, dry_run=False)
+        result = executor.execute(sell_cores=sell_cores)
+
+        print("\n" + "=" * 70)
+        if result['success']:
+            print("FINAL DAY BLITZ COMPLETED!")
+            print(f"Trades executed: {result.get('trades_executed', 0)}")
+            print(f"Sells: {len(result.get('sells', []))}")
+            print(f"Buys: {len(result.get('buys', []))}")
+            print(f"Budget remaining: {result.get('budget_remaining', 0)}")
+        else:
+            print("FINAL DAY BLITZ FAILED!")
+            print(f"Error: {result.get('error')}")
+        print("=" * 70)
+
+        # Print final status
+        state = StateManager()  # Reload
+        state.print_status()
+
+    except Exception as e:
+        logger.critical(f"FINAL DAY ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        if bot:
+            if not auto:
+                input("\nPress Enter to close browser...")
+            bot.close()
+
+
+def final_day_auto_mode(sell_cores: bool = False):
+    """
+    FINAL DAY BLITZ - Automatic execution (no confirmation).
+
+    Runs the final-day blitz strategy automatically:
+    1. Waits for market to open
+    2. Executes the blitz (sell + buy)
+    3. Exits when complete
+
+    For maximum hands-free operation on the last trading day.
+    """
+    import time as _time
+    from sprint3_strategy import is_market_open
+    import pytz
+
+    logger = logging.getLogger('stocktrak_bot')
+
+    print("\n" + "!" * 70)
+    print("FINAL DAY BLITZ AUTO MODE")
+    print("Will automatically execute when market opens")
+    print("!" * 70)
+
+    et = pytz.timezone('US/Eastern')
+
+    while True:
+        try:
+            now_et = datetime.now(et)
+
+            # Check if weekend
+            if now_et.weekday() > 4:
+                logger.info("Weekend - sleeping 300s")
+                _time.sleep(300)
+                continue
+
+            # Check market
+            market_open, reason = is_market_open()
+
+            if not market_open:
+                # Wait for market to open
+                market_open_time = now_et.replace(
+                    hour=9, minute=35, second=0, microsecond=0
+                )
+                if now_et < market_open_time:
+                    seconds_until = (market_open_time - now_et).total_seconds()
+                    if seconds_until > 600:
+                        sleep_time = 60
+                    else:
+                        sleep_time = 10
+                    logger.debug(f"Market closed: {reason}. Sleeping {sleep_time}s")
+                    _time.sleep(sleep_time)
+                    continue
+                else:
+                    # After hours
+                    logger.info("After market hours. Exiting.")
+                    break
+
+            # Market is open - execute!
+            logger.info("Market open! Starting FINAL DAY BLITZ...")
+            _time.sleep(5)  # Brief settle
+
+            final_day_mode(dry_run=False, sell_cores=sell_cores, auto=True)
+
+            logger.info("FINAL DAY BLITZ complete. Exiting auto mode.")
+            break
+
+        except KeyboardInterrupt:
+            logger.info("Stopped by user")
+            print("\nStopped.")
+            break
+        except Exception as e:
+            logger.error(f"Auto mode error: {e}")
+            import traceback
+            traceback.print_exc()
+            _time.sleep(60)
+
+
 def sprint3_auto_mode(force_day: int = None):
     """
     SPRINT3 Autonomous Multi-Day Execution.
@@ -1163,6 +1360,10 @@ Examples:
     python main.py --sprint3-status Show SPRINT3 status
     python main.py --sprint3-dry-run Plan SPRINT3 trades without executing
     python main.py --sprint3-auto   Run all sprint days automatically (restart-safe)
+    python main.py --final-day      Execute FINAL DAY BLITZ (max profit, last day)
+    python main.py --final-day-dry-run  Plan final day without executing
+    python main.py --final-day-auto     Auto-execute final day (no confirmation)
+    python main.py --final-day --sell-cores  Also sell core positions
     python main.py                  Start continuous scheduler
         """
     )
@@ -1203,6 +1404,16 @@ Examples:
                         help='Audit pending orders without making changes')
     parser.add_argument('--queue-auto', action='store_true',
                         help='Automatically clean up duplicate orders (no confirmation)')
+
+    # Final Day Blitz options
+    parser.add_argument('--final-day', action='store_true',
+                        help='Execute FINAL DAY BLITZ - max profit strategy for last day')
+    parser.add_argument('--final-day-dry-run', action='store_true',
+                        help='Plan FINAL DAY BLITZ without executing')
+    parser.add_argument('--final-day-auto', action='store_true',
+                        help='Auto-execute FINAL DAY BLITZ (no confirmation)')
+    parser.add_argument('--sell-cores', action='store_true',
+                        help='Also sell core positions (VOO, VTI, VEA) during final day')
 
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -1255,6 +1466,12 @@ Examples:
             queue_mode(audit_only=True, cancel_duplicates=False)
         elif args.queue_auto:
             queue_mode(audit_only=False, cancel_duplicates=True)
+        elif args.final_day:
+            final_day_mode(dry_run=False, sell_cores=args.sell_cores)
+        elif args.final_day_dry_run:
+            final_day_mode(dry_run=True, sell_cores=args.sell_cores)
+        elif args.final_day_auto:
+            final_day_auto_mode(sell_cores=args.sell_cores)
         else:
             scheduler_mode()
 
@@ -1301,6 +1518,12 @@ def get_mode_name(args):
         return "QUEUE-AUDIT"
     elif args.queue_auto:
         return "QUEUE-AUTO"
+    elif args.final_day:
+        return "FINAL-DAY"
+    elif args.final_day_dry_run:
+        return "FINAL-DAY-DRY-RUN"
+    elif args.final_day_auto:
+        return "FINAL-DAY-AUTO"
     else:
         return "SCHEDULER"
 

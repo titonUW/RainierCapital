@@ -58,7 +58,7 @@ STARTING_CAPITAL = 1000000  # $1,000,000
 MAX_SINGLE_POSITION_PCT = 0.25  # 25% max per position at purchase time
 MIN_HOLDINGS = 4                 # Must hold at least 4 securities
 MAX_TRADES_TOTAL = 80           # Lifetime trade limit
-HARD_STOP_TRADES = 70           # Stop new trades after 70
+HARD_STOP_TRADES = 78           # Stop new trades after 78 (final day: use all budget)
 MIN_PRICE_AT_BUY = 5.00         # Cannot buy stocks below $5
 SAFETY_BUFFER_PRICE = 6.00      # Only buy if price >= $6 (safety margin)
 COMMISSION_PER_TRADE = 5.00     # $5 per trade
